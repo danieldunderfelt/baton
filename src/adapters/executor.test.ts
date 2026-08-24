@@ -2,8 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeAdapter, isAdmissionFailure, killProcessGroup } from "./executor.ts";
-import type { AdapterSpec, Autonomy, ExecRequest, ExtractSpec, InvokeSpec } from "./types.ts";
+import {
+  classifyFailure,
+  executeAdapter,
+  isAdmissionFailure,
+  killProcessGroup,
+} from "./executor.ts";
+import type {
+  AdapterSpec,
+  Autonomy,
+  ExecRequest,
+  ExecResult,
+  ExtractSpec,
+  InvokeSpec,
+} from "./types.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-cli.ts");
 
@@ -19,6 +31,7 @@ interface Opts {
   sessionRef?: ExtractSpec;
   onSpawn?: (pid: number) => void;
   patterns?: string[];
+  workStarted?: string[];
   env?: Record<string, string>;
   timeoutMs?: number;
   maxOutputBytes?: number;
@@ -42,6 +55,7 @@ function request(o: Opts): ExecRequest {
     defaultAutonomy: "full",
     defaultTimeoutMs: 5_000,
     admissionFailurePatterns: o.patterns ?? [],
+    ...(o.workStarted ? { workStartedPatterns: o.workStarted } : {}),
   };
   return {
     spec,
@@ -503,41 +517,154 @@ describe("output cap", () => {
   });
 });
 
-describe("isAdmissionFailure", () => {
-  const spec = request({ mode: "text", patterns: ["Usage limit reached", "429 too many"] }).spec;
+describe("classifyFailure", () => {
+  const PATTERNS = ["Usage limit reached", "429 too many"];
+  const WORK_STARTED = ['"type":"tool"', '"type":"text"'];
+  const spec = request({ mode: "text", patterns: PATTERNS, workStarted: WORK_STARTED }).spec;
+  const failed = (over: Partial<ExecResult>): ExecResult => ({
+    ok: false,
+    started: true,
+    exitCode: 1,
+    timedOut: false,
+    rawTail: "",
+    durationMs: 1,
+    ...over,
+  });
 
-  test("matches case-insensitively against rawTail", () => {
-    const res = {
-      ok: false,
-      exitCode: 1,
-      timedOut: false,
-      rawTail: "stderr: usage LIMIT reached for your plan",
-      durationMs: 1,
-    };
+  test("admission text alone is an admission failure, matched case-insensitively", () => {
+    const res = failed({ rawTail: "stderr: usage LIMIT reached for your plan" });
+    expect(classifyFailure(spec, res)).toBe("admission");
     expect(isAdmissionFailure(spec, res)).toBe(true);
   });
 
   test("matches against the error string too", () => {
-    const res = {
-      ok: false,
-      exitCode: 1,
-      timedOut: false,
-      rawTail: "",
-      error: "exited with code 1: HTTP 429 Too Many Requests",
-      durationMs: 1,
-    };
-    expect(isAdmissionFailure(spec, res)).toBe(true);
+    const res = failed({ error: "exited with code 1: HTTP 429 Too Many Requests" });
+    expect(classifyFailure(spec, res)).toBe("admission");
+  });
+
+  test("the same text after a work-started marker is a plain failure", () => {
+    const res = failed({
+      rawTail: '{"type":"tool","name":"edit"}\nError: usage limit reached for your plan',
+    });
+    // Failing over here would replay a prompt whose edits already landed.
+    expect(classifyFailure(spec, res)).toBe("failure");
+    expect(isAdmissionFailure(spec, res)).toBe(false);
   });
 
   test("does not match unrelated failures, and never with no patterns", () => {
-    const res = {
-      ok: false,
-      exitCode: 1,
-      timedOut: false,
-      rawTail: "TypeError: undefined is not a function",
-      durationMs: 1,
-    };
-    expect(isAdmissionFailure(spec, res)).toBe(false);
-    expect(isAdmissionFailure({ ...spec, admissionFailurePatterns: [] }, res)).toBe(false);
+    const res = failed({ rawTail: "TypeError: undefined is not a function" });
+    expect(classifyFailure(spec, res)).toBe("failure");
+    expect(classifyFailure({ ...spec, admissionFailurePatterns: [] }, res)).toBe("failure");
+  });
+
+  test("an adapter with no work-started evidence relies on its patterns alone", () => {
+    const bare = { ...spec, workStartedPatterns: undefined };
+    expect(classifyFailure(bare, failed({ rawTail: "usage limit reached" }))).toBe("admission");
+  });
+
+  test("a live run that worked and then hit the limit is not an admission failure", async () => {
+    const req = request({ mode: "work-then-limit", patterns: PATTERNS, workStarted: WORK_STARTED });
+    const res = await executeAdapter(req);
+    expect(res.ok).toBe(false);
+    expect(res.rawTail).toContain("usage limit reached");
+    expect(classifyFailure(req.spec, res)).toBe("failure");
+  });
+
+  test("the same limit hit at the door, with nothing done, is one", async () => {
+    const req = request({
+      mode: "fail",
+      patterns: PATTERNS,
+      workStarted: WORK_STARTED,
+      env: { BATON_FAKE_STDERR: "Error: usage limit reached, retry after 5pm" },
+    });
+    const res = await executeAdapter(req);
+    expect(res.ok).toBe(false);
+    expect(classifyFailure(req.spec, res)).toBe("admission");
+  });
+});
+
+describe("started", () => {
+  test("is true for a process that ran, whatever its outcome", async () => {
+    expect((await executeAdapter(request({ mode: "text" }))).started).toBe(true);
+    const failure = await executeAdapter(request({ mode: "fail" }));
+    expect(failure.ok).toBe(false);
+    expect(failure.started).toBe(true);
+  });
+
+  test("is false when the binary is missing", async () => {
+    const res = await executeAdapter(
+      request({ mode: "text", binary: "/nonexistent/baton-fake-binary" }),
+    );
+    expect(res.ok).toBe(false);
+    // Nothing ran, so no reliability may be charged to the target.
+    expect(res.started).toBe(false);
+  });
+
+  test("is false when autonomy is refused before spawning", async () => {
+    const res = await executeAdapter(
+      request({ mode: "text", autonomy: "edits", autonomyFlags: { full: [] } }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.started).toBe(false);
+  });
+
+  test("is true for a timeout: the callee had the budget and used it", async () => {
+    const res = await executeAdapter(
+      request({ mode: "sleep", timeoutMs: 300, env: { BATON_FAKE_SLEEP_MS: "30000" } }),
+    );
+    expect(res.timedOut).toBe(true);
+    expect(res.started).toBe(true);
+  }, 20_000);
+});
+
+describe("errorWhen", () => {
+  const extract: ExtractSpec = {
+    kind: "jsonl",
+    where: { path: "type", equals: "text" },
+    errorWhen: { path: "type", equals: "error" },
+    path: "part.text",
+    take: "last",
+  };
+
+  test("a terminal error event beats the text that preceded it", async () => {
+    const res = await executeAdapter(request({ mode: "text-then-error", extract }));
+    expect(res.exitCode).toBe(0); // the failure is only visible in the stream
+    expect(res.ok).toBe(false);
+    expect(res.output).toBeUndefined();
+    expect(res.error).toContain("Upstream request failed");
+    expect(res.error).toContain('"statusCode":503');
+  });
+
+  test("without the clause the partial answer would pass as the result", async () => {
+    const res = await executeAdapter(
+      request({
+        mode: "text-then-error",
+        extract: {
+          kind: "jsonl",
+          where: { path: "type", equals: "text" },
+          path: "part.text",
+          take: "last",
+        },
+      }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.output).toBe("partial answer");
+  });
+
+  test("a clean stream is unaffected", async () => {
+    const res = await executeAdapter(
+      request({
+        mode: "jsonl",
+        extract: {
+          kind: "jsonl",
+          where: { path: "type", equals: "message" },
+          errorWhen: { path: "type", equals: "error" },
+          path: "text",
+          take: "last",
+        },
+      }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.output).toBe("last message");
   });
 });

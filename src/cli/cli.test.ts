@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+import { newId, nowIso, openStore } from "../store/store.ts";
 
 /**
  * The CLI is tested as a subprocess: exit codes and the two streams are its
@@ -49,7 +51,10 @@ describe("status", () => {
 
   test("marks absent identity vars as (unset) and hop depth as 0", async () => {
     const res = await baton(tmp("unset"), "status");
-    expect(res.stdout).toMatch(/OPENCODE_CONFIG_DIR\s+\(unset\)/);
+    expect(res.stdout).toMatch(/CODEX_HOME\s+\(unset\)/);
+    // opencode has no identity var to report; claiming one would invite a
+    // scope separation that does not exist.
+    expect(res.stdout).not.toContain("OPENCODE_CONFIG_DIR");
     expect(res.stdout).toContain("0 (BATON_HOPS=unset)");
   });
 });
@@ -122,6 +127,56 @@ describe("instance", () => {
     expect(gone.stderr).toContain("no instance kimi:work");
   });
 
+  test("rejects an app with no identity env var, and an overlay that ignores it", async () => {
+    const scope = tmp("inst-identity");
+    // opencode's credentials follow neither a config-dir var nor HOME, so a
+    // second 'instance' of it is the same account under another name.
+    const noIdentity = await baton(
+      scope,
+      "instance",
+      "add",
+      "opencode",
+      "work",
+      "--env",
+      "OPENCODE_CONFIG_DIR=/tmp/oc",
+    );
+    expect(noIdentity.code).toBe(2);
+    expect(noIdentity.stderr).toContain("no identity env var");
+
+    // An overlay that does not relocate the identity is two names, one account.
+    const wrongVar = await baton(
+      scope,
+      "instance",
+      "add",
+      "kimi",
+      "work",
+      "--env",
+      "KIMI_THEME=dark",
+    );
+    expect(wrongVar.code).toBe(2);
+    expect(wrongVar.stderr).toContain("must set KIMI_CODE_HOME");
+    expect((await baton(scope, "instance", "list")).stdout).toContain("No instances");
+  });
+
+  test("removing an instance removes it from the pool too, and says so", async () => {
+    const scope = tmp("inst-pool");
+    await baton(scope, "instance", "add", "kimi", "work", "--env", "KIMI_CODE_HOME=/tmp/kimi-work");
+    await baton(scope, "instance", "add", "kimi", "spare", "--env", "KIMI_CODE_HOME=/tmp/kimi-2");
+    expect((await baton(scope, "pool", "set", "kimi", "work", "spare")).code).toBe(0);
+
+    const removed = await baton(scope, "instance", "remove", "kimi", "work");
+    expect(removed.code).toBe(0);
+    expect(removed.stderr).toContain("also removed 'work' from the kimi pool");
+    // A dangling member would fail selection closed; the pool is fixed instead.
+    expect((await baton(scope, "pool", "list")).stdout).not.toContain("work");
+    expect((await baton(scope, "pool", "list")).stdout).toContain("spare");
+
+    // Removing the last member clears the pool rather than emptying it.
+    const last = await baton(scope, "instance", "remove", "kimi", "spare");
+    expect(last.stderr).toContain("no pool");
+    expect((await baton(scope, "pool", "list")).stdout).toContain("No pools defined");
+  });
+
   test("rejects an unknown app and a malformed --env", async () => {
     const scope = tmp("inst-bad");
     const badApp = await baton(scope, "instance", "add", "vim", "x", "--env", "A=B");
@@ -188,6 +243,509 @@ describe("install claude-code", () => {
     const res = await baton(tmp("install-host"), "install", "emacs");
     expect(res.code).toBe(2);
     expect(res.stderr).toContain("unsupported host 'emacs'");
+    expect(res.stderr).toContain("codex");
+  });
+
+  test("--with-eval appends grading and the onboarding interview", async () => {
+    const plain = tmp("install-plain");
+    await baton(tmp("install-plain-scope"), "install", "claude-code", "--dir", plain);
+    const without = readFileSync(join(plain, ".claude", "skills", "baton", "SKILL.md"), "utf8");
+    expect(without).not.toContain("report_result");
+
+    const target = tmp("install-eval");
+    const res = await baton(
+      tmp("install-eval-scope"),
+      "install",
+      "claude-code",
+      "--dir",
+      target,
+      "--with-eval",
+    );
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("grading + onboarding");
+    const skill = readFileSync(join(target, ".claude", "skills", "baton", "SKILL.md"), "utf8");
+    expect(skill).toContain("report_result(run_id, grade, notes?)");
+    // Consumer grades, the interview, and the honest phase-3 note on duels.
+    expect(skill).toContain("after you have used its result");
+    expect(skill).toContain("seed_ratings");
+    expect(skill).toContain("Echo the normalized entries back");
+    expect(skill).toContain("phase 3");
+  });
+});
+
+describe("install codex", () => {
+  test("merges [mcp_servers.baton] into an existing config.toml, keeping everything else", async () => {
+    const target = tmp("codex-target");
+    const configPath = join(target, ".codex", "config.toml");
+    writeFileSync(
+      join(target, "AGENTS.md"),
+      "# House rules\n\nAlways run the tests before you commit.\n",
+    );
+    mkdirSync(join(target, ".codex"));
+    writeFileSync(
+      configPath,
+      `model = "gpt-5.6-sol"
+
+[mcp_servers.other]
+command = "other-server"
+args = ["--stdio"]
+
+[tui]
+theme = "dark"
+`,
+    );
+
+    const res = await baton(tmp("codex-scope"), "install", "codex", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("kept: other");
+    expect(res.stdout).toContain("trusted");
+
+    const toml = readFileSync(configPath, "utf8");
+    expect(toml).toContain('model = "gpt-5.6-sol"');
+    expect(toml).toContain("[mcp_servers.other]");
+    expect(toml).toContain('theme = "dark"');
+    expect(toml).toContain("[mcp_servers.baton]");
+    expect(toml).toMatch(/args = \["mcp"\]/);
+
+    // The instruction block is appended, the user's own AGENTS.md content stays.
+    const agents = readFileSync(join(target, "AGENTS.md"), "utf8");
+    expect(agents).toContain("Always run the tests before you commit.");
+    expect(agents).toContain("<!-- baton:begin -->");
+    expect(agents).toContain("run_model");
+  });
+
+  test("re-running replaces the block instead of stacking copies", async () => {
+    const target = tmp("codex-twice");
+    const scope = tmp("codex-twice-scope");
+    await baton(scope, "install", "codex", "--dir", target);
+    const second = await baton(scope, "install", "codex", "--dir", target, "--with-eval");
+    expect(second.code).toBe(0);
+
+    const toml = readFileSync(join(target, ".codex", "config.toml"), "utf8");
+    expect(occurrences(toml, "[mcp_servers.baton]")).toBe(1);
+    const agents = readFileSync(join(target, "AGENTS.md"), "utf8");
+    expect(occurrences(agents, "<!-- baton:begin -->")).toBe(1);
+    expect(occurrences(agents, "<!-- baton:end -->")).toBe(1);
+    expect(agents).toContain("report_result");
+  });
+
+  // Appending our table beside any of these produces a config codex refuses to
+  // load at all, and there is no TOML parser here to rewrite them safely.
+  const unmergeable: [string, string][] = [
+    ["a dotted-key baton entry", 'mcp_servers.baton.command = "old-baton"\n'],
+    ["an inline-table baton entry", 'mcp_servers.baton = { command = "old-baton" }\n'],
+    ["a dotted key under [mcp_servers]", '[mcp_servers]\nbaton.command = "old-baton"\n'],
+    ["mcp_servers as one inline table", 'mcp_servers = { baton = { command = "x" } }\n'],
+    ["another server declared with dotted keys", 'mcp_servers.other.command = "other"\n'],
+  ];
+
+  for (const [what, body] of unmergeable) {
+    test(`refuses ${what} instead of writing duplicate TOML`, async () => {
+      const target = tmp("codex-dotted");
+      const configPath = join(target, ".codex", "config.toml");
+      mkdirSync(join(target, ".codex"));
+      const before = `model = "gpt-5.6-sol"\n${body}`;
+      writeFileSync(configPath, before);
+
+      const res = await baton(tmp("codex-dotted-scope"), "install", "codex", "--dir", target);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toContain("twice");
+      expect(res.stderr).toContain("[mcp_servers.<name>]");
+      // Nothing written: not the TOML, not the instruction block.
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+      expect(existsSync(join(target, "AGENTS.md"))).toBe(false);
+    });
+  }
+
+  test("keeps a sibling server declared inline under [mcp_servers]", async () => {
+    const target = tmp("codex-sibling");
+    const configPath = join(target, ".codex", "config.toml");
+    mkdirSync(join(target, ".codex"));
+    writeFileSync(configPath, '[mcp_servers]\nother = { command = "other-server" }\n');
+
+    const res = await baton(tmp("codex-sibling-scope"), "install", "codex", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("kept: other");
+
+    const toml = readFileSync(configPath, "utf8");
+    expect(toml).toContain('other = { command = "other-server" }');
+    expect(occurrences(toml, "[mcp_servers.baton]")).toBe(1);
+  });
+});
+
+describe("install into a damaged AGENTS.md", () => {
+  test("refuses a begin marker with no end marker instead of guessing", async () => {
+    const target = tmp("agents-broken");
+    const agents = "# Rules\n\n<!-- baton:begin -->\nhalf a block\n";
+    writeFileSync(join(target, "AGENTS.md"), agents);
+
+    const res = await baton(tmp("agents-broken-scope"), "install", "kimi", "--dir", target);
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("refusing to guess");
+    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toBe(agents);
+  });
+});
+
+describe("install opencode", () => {
+  test("merges mcp.baton as a local server and preserves other entries", async () => {
+    const target = tmp("opencode-target");
+    writeFileSync(
+      join(target, "opencode.json"),
+      JSON.stringify({ model: "opencode/x", mcp: { other: { type: "remote", url: "http://x" } } }),
+    );
+
+    const res = await baton(tmp("opencode-scope"), "install", "opencode", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("kept: other");
+
+    const doc = JSON.parse(readFileSync(join(target, "opencode.json"), "utf8")) as {
+      model: string;
+      mcp: Record<string, { type: string; url?: string; command?: string[]; enabled?: boolean }>;
+    };
+    expect(doc.model).toBe("opencode/x");
+    expect(doc.mcp.other?.url).toBe("http://x");
+    expect(doc.mcp.baton?.type).toBe("local");
+    expect(doc.mcp.baton?.command?.at(-1)).toBe("mcp");
+    expect(doc.mcp.baton?.enabled).toBe(true);
+    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain("<!-- baton:begin -->");
+  });
+});
+
+describe("install kimi", () => {
+  // Kimi resolves the Claude-compatible file at the *repository* root (nearest
+  // .git above the session's cwd), so where the registration belongs depends on
+  // whether the target directory is that root.
+  test("registers in the project .mcp.json at a repository root", async () => {
+    const target = tmp("kimi-target");
+    mkdirSync(join(target, ".git"));
+    const res = await baton(tmp("kimi-scope"), "install", "kimi", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain(".mcp.json");
+    expect(res.stdout).toContain("Claude-compatible");
+
+    const doc = JSON.parse(readFileSync(join(target, ".mcp.json"), "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
+    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain("Delegating with Baton");
+  });
+
+  test("registers in .kimi-code/mcp.json where a root .mcp.json would never be read", async () => {
+    const target = tmp("kimi-subdir");
+    const res = await baton(tmp("kimi-subdir-scope"), "install", "kimi", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain(join(".kimi-code", "mcp.json"));
+    expect(res.stdout).toContain("not a repository root");
+    expect(existsSync(join(target, ".mcp.json"))).toBe(false);
+
+    const doc = JSON.parse(readFileSync(join(target, ".kimi-code", "mcp.json"), "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
+  });
+
+  test("merges into an existing .kimi-code/mcp.json instead of replacing it", async () => {
+    const target = tmp("kimi-merge");
+    mkdirSync(join(target, ".kimi-code"));
+    writeFileSync(
+      join(target, ".kimi-code", "mcp.json"),
+      JSON.stringify({ mcpServers: { other: { command: "other-server" } } }),
+    );
+
+    const res = await baton(tmp("kimi-merge-scope"), "install", "kimi", "--dir", target);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("kept: other");
+
+    const doc = JSON.parse(readFileSync(join(target, ".kimi-code", "mcp.json"), "utf8")) as {
+      mcpServers: Record<string, { command: string }>;
+    };
+    expect(Object.keys(doc.mcpServers).sort()).toEqual(["baton", "other"]);
+  });
+});
+
+function occurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+describe("pool", () => {
+  test("set, list and clear round-trip", async () => {
+    const scope = tmp("pool");
+    expect((await baton(scope, "pool", "list")).stdout).toContain("No pools defined");
+
+    await baton(scope, "instance", "add", "kimi", "work", "--env", "KIMI_CODE_HOME=/tmp/kimi-work");
+    const set = await baton(scope, "pool", "set", "kimi", "default", "work");
+    expect(set.code).toBe(0);
+    expect(set.stdout).toContain("Pool kimi: default, work");
+
+    const list = await baton(scope, "pool", "list");
+    expect(list.stdout).toMatch(/kimi\s+default\s+burn\s+1/);
+    expect(list.stdout).toMatch(/kimi\s+work\s+burn\s+1/);
+
+    expect((await baton(scope, "pool", "clear", "kimi")).code).toBe(0);
+    expect((await baton(scope, "pool", "list")).stdout).toContain("No pools defined");
+    const gone = await baton(scope, "pool", "clear", "kimi");
+    expect(gone.code).toBe(1);
+    expect(gone.stderr).toContain("no pool for app 'kimi'");
+  });
+
+  test("rejects an unknown app and an instance this scope never defined", async () => {
+    const scope = tmp("pool-bad");
+    const badApp = await baton(scope, "pool", "set", "vim", "default");
+    expect(badApp.code).toBe(2);
+    expect(badApp.stderr).toContain("unknown app 'vim'");
+
+    const badMember = await baton(scope, "pool", "set", "kimi", "default", "ghost");
+    expect(badMember.code).toBe(1);
+    expect(badMember.stderr).toContain("Unknown instance 'ghost'");
+  });
+});
+
+describe("set (phase-2 keys)", () => {
+  test("preciousness lands on the pool member it names", async () => {
+    const scope = tmp("precious");
+    await baton(scope, "instance", "add", "kimi", "work", "--env", "KIMI_CODE_HOME=/tmp/kimi-work");
+    await baton(scope, "pool", "set", "kimi", "default", "work");
+
+    const ok = await baton(scope, "set", "preciousness:kimi:work", "conserve");
+    expect(ok.code).toBe(0);
+    expect(ok.stdout).toContain("preciousness:kimi:work = conserve");
+
+    const list = await baton(scope, "pool", "list");
+    expect(list.stdout).toMatch(/kimi\s+work\s+conserve/);
+    expect(list.stdout).toMatch(/kimi\s+default\s+burn/);
+  });
+
+  test("rejects an unknown app, an unknown level, and a missing instance", async () => {
+    const scope = tmp("precious-bad");
+    const app = await baton(scope, "set", "preciousness:vim:default", "burn");
+    expect(app.code).toBe(2);
+    expect(app.stderr).toContain("unknown app 'vim'");
+
+    const level = await baton(scope, "set", "preciousness:kimi:default", "hoard");
+    expect(level.code).toBe(2);
+    expect(level.stderr).toContain("invalid preciousness 'hoard'");
+    expect(level.stderr).toContain("emergency");
+
+    const shape = await baton(scope, "set", "preciousness:kimi", "burn");
+    expect(shape.code).toBe(2);
+    expect(shape.stderr).toContain("<app>:<instance>");
+  });
+
+  test("half_life_days and profile_weight take numbers and reject the rest", async () => {
+    const scope = tmp("evalkeys");
+    expect((await baton(scope, "set", "half_life_days", "30")).stdout).toContain(
+      "half_life_days = 30",
+    );
+    expect((await baton(scope, "set", "half_life_days", "0")).code).toBe(2);
+    expect((await baton(scope, "set", "half_life_days", "1.5")).code).toBe(2);
+
+    expect((await baton(scope, "set", "profile_weight", "0.5")).stdout).toContain(
+      "profile_weight = 0.5",
+    );
+    expect((await baton(scope, "set", "profile_weight", "-1")).code).toBe(2);
+  });
+
+  test("a setting that changes what ratings.yaml says reaches the projection", async () => {
+    const scope = tmp("evalpublish");
+    await baton(scope, "ratings", "publish");
+    const before = readFileSync(join(scope, "ratings.yaml"), "utf8");
+    expect(before).toContain("source_revision: 0");
+    expect(before).toContain("profile_weight: 1");
+
+    // These settings mutate no eval table, so without a revision bump in the
+    // same commit the publisher would discard the refreshed render as stale.
+    expect((await baton(scope, "set", "profile_weight", "0.25")).code).toBe(0);
+    const after = readFileSync(join(scope, "ratings.yaml"), "utf8");
+    expect(after).toContain("source_revision: 1");
+    expect(after).toContain("profile_weight: 0.25");
+  });
+
+  test("active_profile only accepts a profile this scope actually has", async () => {
+    const scope = tmp("activeprofile");
+    const res = await baton(scope, "set", "active_profile", "team");
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("no profiles yet");
+  });
+
+  test("the phase-2 keys are advertised among the valid ones", async () => {
+    const res = await baton(tmp("keys2"), "set", "nonsense", "1");
+    expect(res.stderr).toContain("half_life_days");
+    expect(res.stderr).toContain("profile_weight");
+    expect(res.stderr).toContain("active_profile");
+    expect(res.stderr).toContain("preciousness:<app>:<instance>");
+  });
+});
+
+/**
+ * Seeds a run and the attempt that answered it, so grading has something real
+ * to attach to without spawning a callee. Mirrors what the supervisor writes.
+ */
+function seedRun(scope: string, opts: { succeeded: boolean }): string {
+  mkdirSync(join(scope, "state"), { recursive: true, mode: 0o700 });
+  const db = openStore(join(scope, "state", "baton.db"));
+  const runId = newId("run");
+  const at = nowIso();
+  db.query(
+    `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+     VALUES (?, 'kimi-k3', 'kimi', 'kimi-code/k3', 'default', 'do a thing', '/tmp', ?, ?, ?)`,
+  ).run(runId, opts.succeeded ? "succeeded" : "failed", at, at);
+  db.query(
+    `INSERT INTO attempts (id, run_id, seq, target, status, started_at, finished_at)
+     VALUES (?, ?, 1, 'kimi:default/kimi-code/k3@a1', ?, ?, ?)`,
+  ).run(newId("att"), runId, opts.succeeded ? "succeeded" : "failed", at, at);
+  db.close();
+  return runId;
+}
+
+describe("grade and ratings", () => {
+  test("a graded run shows up in ratings and in the published projection", async () => {
+    const scope = tmp("grade");
+    const runId = seedRun(scope, { succeeded: true });
+
+    const graded = await baton(scope, "grade", runId, "4", "solid", "but", "verbose");
+    expect(graded.code).toBe(0);
+    expect(graded.stdout).toContain("kimi:default/kimi-code/k3@a1");
+
+    const ratings = await baton(scope, "ratings");
+    expect(ratings.code).toBe(0);
+    expect(ratings.stdout).toMatch(/kimi-k3\s+-\s+4(\.00)? \(1\)/);
+    expect(ratings.stdout).toContain("revision");
+
+    const yaml = readFileSync(join(scope, "ratings.yaml"), "utf8");
+    expect(yaml).toContain("source_revision: 1");
+    expect(yaml).toContain("kimi-k3");
+    expect(yaml).toContain("mean: 4");
+
+    // Upsert: re-grading replaces rather than adding a second observation.
+    expect((await baton(scope, "grade", runId, "2")).code).toBe(0);
+    const after = await baton(scope, "ratings");
+    expect(after.stdout).toMatch(/kimi-k3\s+-\s+2(\.00)? \(1\)/);
+  });
+
+  test("refuses a run that never produced an answer, and an unknown one", async () => {
+    const scope = tmp("grade-bad");
+    const runId = seedRun(scope, { succeeded: false });
+
+    const failed = await baton(scope, "grade", runId, "3");
+    expect(failed.code).toBe(1);
+    expect(failed.stderr).toContain("produced no answer");
+
+    const unknown = await baton(scope, "grade", "run_nope", "3");
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("unknown run 'run_nope'");
+
+    const outOfRange = await baton(scope, "grade", runId, "9");
+    expect(outOfRange.code).toBe(2);
+    expect(outOfRange.stderr).toContain("between 1 and 5");
+  });
+
+  test("ratings publish refreshes the projection after a weight change", async () => {
+    const scope = tmp("publish");
+    const runId = seedRun(scope, { succeeded: true });
+    await baton(scope, "grade", runId, "5");
+
+    const already = await baton(scope, "ratings", "publish");
+    expect(already.code).toBe(0);
+    expect(already.stdout).toContain("already at revision");
+
+    await baton(scope, "set", "profile_weight", "2");
+    const yaml = readFileSync(join(scope, "ratings.yaml"), "utf8");
+    expect(yaml).toContain("profile_weight: 2");
+  });
+});
+
+const PROFILE_FILE = `name: team
+exported_at: 2026-08-01T00:00:00.000Z
+entries:
+  - model: kimi-k3
+    category: ""
+    mean: 4.5
+    weight: 5
+  - model: gpt-5.6-sol
+    category: review
+    mean: 4
+    weight: 5
+`;
+
+describe("profile import", () => {
+  test("shows the diff, writes nothing without --yes, then commits with it", async () => {
+    const scope = tmp("import");
+    const file = join(tmp("import-file"), "team.yaml");
+    writeFileSync(file, PROFILE_FILE);
+
+    const dry = await baton(scope, "profile", "import", file);
+    expect(dry.code).toBe(0);
+    expect(dry.stdout).toContain("Profile 'team' → local profile 'team'");
+    expect(dry.stdout).toContain("+ kimi-k3 mean 4.50 weight 5");
+    expect(dry.stdout).toContain("+ gpt-5.6-sol [review] mean 4 weight 5");
+    expect(dry.stdout).toContain("2 added, 0 changed, 0 unchanged");
+    expect(dry.stdout).toContain("Nothing was written");
+    expect((await baton(scope, "ratings")).stdout).toContain("No ratings yet");
+
+    const committed = await baton(scope, "profile", "import", file, "--yes", "--activate");
+    expect(committed.code).toBe(0);
+    expect(committed.stdout).toContain("2 added");
+    expect(committed.stdout).toContain("Active profile is now 'team'");
+
+    const ratings = await baton(scope, "ratings");
+    expect(ratings.stdout).toContain("team");
+    expect(ratings.stdout).toMatch(/kimi-k3\s+-\s+-\s+4\.50 \(imported:team\)/);
+
+    // Re-importing the same file is a no-op the diff states as such.
+    const again = await baton(scope, "profile", "import", file, "--yes");
+    expect(again.stdout).toContain("0 added, 0 changed, 2 unchanged");
+  });
+
+  test("the dry run reports an as_of-only refresh, and says which date it was", async () => {
+    const scope = tmp("import-as-of");
+    const dir = tmp("import-as-of-file");
+    const older = join(dir, "old.yaml");
+    const newer = join(dir, "new.yaml");
+    const entries = (asOf: string) =>
+      `name: team\nexported_at: ${asOf}\nentries:\n  - model: kimi-k3\n    category: ""\n    mean: 4.5\n    weight: 5\n    as_of: ${asOf}\n`;
+    writeFileSync(older, entries("2025-01-01T00:00:00.000Z"));
+    writeFileSync(newer, entries("2026-08-01T00:00:00.000Z"));
+
+    expect((await baton(scope, "profile", "import", older, "--yes")).stdout).toContain("1 added");
+
+    // Same mean and weight, a year and a half newer: the prior's precision is
+    // restored, so this is a change — and the preview has to show why.
+    const dry = await baton(scope, "profile", "import", newer);
+    expect(dry.stdout).toContain("0 added, 1 changed, 0 unchanged");
+    expect(dry.stdout).toContain("as_of 2025-01-01");
+    // The preview must match what committing then reports.
+    expect((await baton(scope, "profile", "import", newer, "--yes")).stdout).toContain(
+      "0 added, 1 changed, 0 unchanged",
+    );
+  });
+
+  test("--name renames locally while provenance keeps the file's name", async () => {
+    const scope = tmp("import-name");
+    const file = join(tmp("import-name-file"), "team.yaml");
+    writeFileSync(file, PROFILE_FILE);
+
+    const res = await baton(scope, "profile", "import", file, "--name", "mine", "--yes");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("Profile 'team' → local profile 'mine'");
+    expect(res.stdout).toContain("Not activated");
+
+    const activated = await baton(scope, "set", "active_profile", "mine");
+    expect(activated.code).toBe(0);
+    expect((await baton(scope, "ratings")).stdout).toContain("imported:team");
+
+    const unknown = await baton(scope, "set", "active_profile", "team");
+    expect(unknown.code).toBe(2);
+    expect(unknown.stderr).toContain("Known profiles: mine");
+  });
+
+  test("a malformed profile file is rejected before anything is written", async () => {
+    const scope = tmp("import-bad");
+    const file = join(tmp("import-bad-file"), "bad.yaml");
+    writeFileSync(file, "name: team\nentries:\n  - model: kimi:default/k3\n    mean: 4\n");
+    const res = await baton(scope, "profile", "import", file, "--yes");
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("canonical model id");
+    expect((await baton(scope, "ratings")).stdout).toContain("No ratings yet");
   });
 });
 

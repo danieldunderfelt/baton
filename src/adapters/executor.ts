@@ -18,6 +18,8 @@ const KILL_POLL_MS = 100;
 /** Head of stdout kept beside the tail, so a first-line session id survives the cap. */
 const SESSION_HEAD_BYTES = 64 * 1024;
 const STDERR_IN_ERROR_CHARS = 500;
+/** How much of a terminal error event is quoted in the extraction error. */
+const ERROR_EVENT_CHARS = 500;
 
 export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
   const started = Date.now();
@@ -32,6 +34,7 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
     // which is exactly the ceiling violation the autonomy contract forbids.
     return {
       ok: false,
+      started: false,
       exitCode: null,
       timedOut: false,
       rawTail: "",
@@ -53,6 +56,7 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
   } catch (err) {
     return {
       ok: false,
+      started: false,
       exitCode: null,
       timedOut: false,
       rawTail: "",
@@ -132,12 +136,30 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
   });
 }
 
-/** Did this failure look like a rate-limit/auth rejection (pool cooldown signal)? */
-export function isAdmissionFailure(spec: AdapterSpec, res: ExecResult): boolean {
+export type FailureClass = "admission" | "failure";
+
+/**
+ * How a failed attempt may be treated. "admission" is the only class that
+ * earns a cooldown and a replay of the prompt on another instance, so it
+ * demands two things at once: an admission pattern matched AND nothing in the
+ * output says the callee already started working. A rate-limit notice printed
+ * after four minutes of edits reads exactly like one printed at the door —
+ * only the surrounding stream tells them apart, and when in doubt the run
+ * fails instead of failing over (PLAN.md §Failover on admission failure only).
+ */
+export function classifyFailure(spec: AdapterSpec, res: ExecResult): FailureClass {
   const haystack = `${res.rawTail}\n${res.error ?? ""}`.toLowerCase();
-  return spec.admissionFailurePatterns.some(
-    (pattern) => pattern.length > 0 && haystack.includes(pattern.toLowerCase()),
-  );
+  const matches = (patterns: string[] | undefined): boolean =>
+    (patterns ?? []).some(
+      (pattern) => pattern.length > 0 && haystack.includes(pattern.toLowerCase()),
+    );
+  if (!matches(spec.admissionFailurePatterns)) return "failure";
+  return matches(spec.workStartedPatterns) ? "failure" : "admission";
+}
+
+/** Did this failure look like a rejection *before any work started*? */
+export function isAdmissionFailure(spec: AdapterSpec, res: ExecResult): boolean {
+  return classifyFailure(spec, res) === "admission";
 }
 
 function buildArgv(req: ExecRequest, flags: string[]): string[] {
@@ -185,6 +207,8 @@ function buildResult(o: Outcome): ExecResult {
   const sessionSource = o.stdoutTruncated ? `${o.stdoutHead}\n${o.stdout}` : o.stdout;
   const session = o.req.spec.sessionRef && extract(o.req.spec.sessionRef, sessionSource);
   const base = {
+    // A spawn error means the process never ran; anything else got that far.
+    started: !o.spawnError,
     exitCode: o.exitCode,
     timedOut: o.timedOut,
     rawTail,
@@ -234,6 +258,18 @@ function extract(spec: ExtractSpec, stdout: string): Extracted {
     case "jsonl": {
       const records = parseJsonl(stdout);
       if (records.length === 0) return { ok: false, why: "no parseable JSON lines in stdout" };
+      if (spec.errorWhen) {
+        // Checked before the answer is picked: apps that stream text and then
+        // fail upstream exit 0 with a usable-looking last text part.
+        const { path, equals } = spec.errorWhen;
+        const failed = records.find((r) => {
+          const v = dotPath(r, path);
+          return v !== undefined && String(v) === equals;
+        });
+        if (failed !== undefined) {
+          return { ok: false, why: `error event: ${clip(stringify(failed), ERROR_EVENT_CHARS)}` };
+        }
+      }
       let matches = records;
       if (spec.where) {
         const { path, equals } = spec.where;
@@ -289,6 +325,10 @@ function dotPath(root: unknown, path: string): unknown {
 
 function stringify(value: unknown): string {
   return typeof value === "string" ? value : (JSON.stringify(value) ?? "");
+}
+
+function clip(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}…`;
 }
 
 function finalize(value: string): Extracted {

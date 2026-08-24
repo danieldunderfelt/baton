@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { executeAdapter } from "../adapters/executor.ts";
 import type { AdapterSpec } from "../adapters/types.ts";
+import { recordAdmissionFailure } from "../quota/quota.ts";
 import type { Target } from "../registry/registry.ts";
 import { newId, nowIso, openStore } from "../store/store.ts";
 import {
@@ -63,6 +64,26 @@ function target(spec: AdapterSpec, instance = "default"): Target {
 
 function resolverFor(t: Target): TargetResolver {
   return { resolve: () => t };
+}
+
+/**
+ * A stand-in for the pool policy: hands out targets in order, honouring the
+ * `exclude` keys the supervisor passes, and refusing once they are spent —
+ * exactly what selectTarget does when every candidate is used up.
+ */
+function poolResolver(targets: Target[]): TargetResolver {
+  return {
+    resolve: (_model, opts) => {
+      const tried = new Set(opts.exclude ?? []);
+      const next = targets.find(
+        (t) =>
+          (opts.instance === undefined || t.instance === opts.instance) &&
+          !tried.has(`${t.spec.app}:${t.instance}`),
+      );
+      if (!next) throw new Error("No usable route: every pool candidate is spent.");
+      return next;
+    },
+  };
 }
 
 /** A callee that runs `code` in a child Bun and prints whatever it prints. */
@@ -147,7 +168,7 @@ describe("startRun", () => {
       .get(view.runId)!;
     expect(run.category).toBe("impl");
     expect(JSON.parse(run.options)).toMatchObject({ autonomy: "full" });
-    expect(run.policy_version).toBe(1);
+    expect(run.policy_version).toBe(2);
   }, 20_000);
 
   test("a nonzero exit becomes a failed run carrying the error", async () => {
@@ -175,6 +196,300 @@ describe("startRun", () => {
     });
     await settled;
     expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
+  }, 20_000);
+});
+
+describe("failover on admission failure", () => {
+  /** The one string this fake app's adapter calls an admission refusal. */
+  const REFUSAL = "usage limit reached";
+
+  function poolTarget(instance: string, code: string): Target {
+    return target(fakeSpec(["-e", code], { admissionFailurePatterns: [REFUSAL] }), instance);
+  }
+
+  const refusing = (instance: string): Target =>
+    poolTarget(instance, `process.stderr.write('${REFUSAL} for this account\\n');process.exit(1)`);
+  const answering = (instance: string, text: string): Target =>
+    poolTarget(instance, `process.stdout.write('${text}')`);
+
+  function poolSupervisor(db: Database, targets: Target[], init: Partial<SupervisorInit> = {}) {
+    return new Supervisor({
+      env: { ...process.env },
+      hostCwd: import.meta.dir,
+      resolver: poolResolver(targets),
+      pollMs: 25,
+      db,
+      ...init,
+    });
+  }
+
+  interface EventRow {
+    instance: string;
+    kind: string;
+  }
+  const events = (db: Database): EventRow[] =>
+    db
+      .query<EventRow, []>("SELECT instance, kind FROM quota_events ORDER BY id")
+      .all();
+  const cooling = (db: Database): string[] =>
+    db
+      .query<{ instance: string }, []>("SELECT instance FROM cooldowns ORDER BY instance")
+      .all()
+      .map((r) => r.instance);
+
+  test("a refused instance cools down and the next one answers under the same run", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [refusing("acct-a"), answering("acct-b", "answer from b")]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("succeeded");
+    expect(final.output).toBe("answer from b");
+    expect(final.error).toBeUndefined();
+    expect(final.attempts.map((a) => [a.seq, a.status])).toEqual([
+      [1, "failed"],
+      [2, "succeeded"],
+    ]);
+    // Session affinity: each attempt row names the instance that ran it, and
+    // the run itself now belongs to the one that answered.
+    expect(final.attempts[0]!.target).toBe("fake:acct-a/fake/slug@a1+full");
+    expect(final.attempts[1]!.target).toBe("fake:acct-b/fake/slug@a1+full");
+    expect(final.instance).toBe("acct-b");
+    expect(attempts(db, view.runId)).toHaveLength(2);
+
+    // The refusal spent no quota but cooled the account; the answer spent one.
+    expect(cooling(db)).toEqual(["acct-a"]);
+    expect(events(db)).toEqual([
+      { instance: "acct-a", kind: "admission_failure" },
+      { instance: "acct-b", kind: "run" },
+    ]);
+  }, 30_000);
+
+  test("a non-admission failure fails the run instead of replaying it elsewhere", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [
+      poolTarget("acct-a", "process.stderr.write('boom\\n');process.exit(3)"),
+      answering("acct-b", "never reached"),
+    ]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("failed");
+    expect(final.error).toContain("exited with code 3");
+    expect(final.attempts).toHaveLength(1);
+    // Work may already have happened: nothing is cooled, the run counts.
+    expect(cooling(db)).toEqual([]);
+    expect(events(db)).toEqual([{ instance: "acct-a", kind: "run" }]);
+  }, 30_000);
+
+  test("exhausted candidates fail the run with an error that says why", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [refusing("acct-a"), refusing("acct-b")]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("failed");
+    expect(final.attempts.map((a) => a.status)).toEqual(["failed", "failed"]);
+    expect(final.error).toContain(REFUSAL);
+    expect(final.error).toContain("no other instance was eligible");
+    // The first refusal's error stays a plain one: it did fail over.
+    expect(final.attempts[0]!.error).not.toContain("no other instance");
+    expect(cooling(db)).toEqual(["acct-a", "acct-b"]);
+  }, 30_000);
+
+  test("an explicitly requested instance is a pin: it never fails over", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [refusing("acct-a"), answering("acct-b", "answer from b")]);
+
+    const { view, settled } = await sup.startRun({
+      model: "fake-model",
+      prompt: "hi",
+      instance: "acct-a",
+    });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("failed");
+    expect(final.attempts).toHaveLength(1);
+    expect(final.instance).toBe("acct-a");
+  }, 30_000);
+
+  test("success ends the strike chain: an earlier cooldown on that instance is cleared", async () => {
+    const db = newDb();
+    recordAdmissionFailure(db, "fake", "acct-b", nowIso(), "stale refusal");
+    expect(cooling(db)).toEqual(["acct-b"]);
+
+    const sup = poolSupervisor(db, [answering("acct-b", "fine now")]);
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    expect(sup.getRun(view.runId)!.status).toBe("succeeded");
+    expect(cooling(db)).toEqual([]);
+  }, 30_000);
+
+  test("every completed attempt records reliability against its own target", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [refusing("acct-a"), answering("acct-b", "ok")]);
+    const { settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    const rows = db
+      .query<{ target: string; sum_w_ok: number; sum_w_fail: number }, []>(
+        "SELECT target, sum_w_ok, sum_w_fail FROM reliability ORDER BY target",
+      )
+      .all();
+    expect(rows).toEqual([
+      { target: "fake:acct-a/fake/slug@a1+full", sum_w_ok: 0, sum_w_fail: 1 },
+      { target: "fake:acct-b/fake/slug@a1+full", sum_w_ok: 1, sum_w_fail: 0 },
+    ]);
+  }, 30_000);
+
+  test("a failover attempt inherits the finished attempt's concurrency slot", async () => {
+    const db = newDb();
+    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
+    const sup = poolSupervisor(db, [refusing("acct-a"), answering("acct-b", "answer from b")]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+    expect(sup.getRun(view.runId)!.status).toBe("succeeded");
+    expect(sup.getRun(view.runId)!.attempts).toHaveLength(2);
+  }, 30_000);
+
+  test("an admission pattern printed after work started fails the run, never replays it", async () => {
+    const db = newDb();
+    const STARTED = "<<tool call>>";
+    const workedThenRefused = target(
+      fakeSpec(
+        ["-e", `process.stdout.write('${STARTED}\\n');process.stderr.write('${REFUSAL}\\n');process.exit(1)`],
+        { admissionFailurePatterns: [REFUSAL], workStartedPatterns: [STARTED] },
+      ),
+      "acct-a",
+    );
+    const sup = poolSupervisor(db, [workedThenRefused, answering("acct-b", "must not run")]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    // The callee had already begun: replaying the prompt elsewhere could
+    // duplicate whatever side effects it produced before the limit hit.
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("failed");
+    expect(final.attempts).toHaveLength(1);
+    expect(final.instance).toBe("acct-a");
+    expect(cooling(db)).toEqual([]);
+    // It also spent a window slot, unlike a genuine refusal.
+    expect(events(db)).toEqual([{ instance: "acct-a", kind: "run" }]);
+  }, 30_000);
+
+  test("a cancelled attempt never fails over", async () => {
+    const db = newDb();
+    const sup = poolSupervisor(db, [
+      poolTarget(
+        "acct-a",
+        `setTimeout(() => {process.stderr.write('${REFUSAL}');process.exit(1)}, 60_000)`,
+      ),
+      answering("acct-b", "must not run"),
+    ]);
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    for (let i = 0; i < 100 && attempts(db, view.runId)[0]?.pid == null; i++) await sleep(20);
+    sup.cancelRun(view.runId);
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("cancelled");
+    expect(final.attempts).toHaveLength(1);
+    expect(cooling(db)).toEqual([]);
+  }, 30_000);
+});
+
+describe("evidence", () => {
+  const quotaEvents = (db: Database): { instance: string; kind: string }[] =>
+    db
+      .query<{ instance: string; kind: string }, []>(
+        "SELECT instance, kind FROM quota_events ORDER BY id",
+      )
+      .all();
+
+  const reliability = (db: Database) =>
+    db
+      .query<{ target: string; sum_w_ok: number; sum_w_fail: number }, []>(
+        "SELECT target, sum_w_ok, sum_w_fail FROM reliability ORDER BY target",
+      )
+      .all();
+
+  test("the window slot is claimed at admission, while the callee is still running", async () => {
+    const db = newDb();
+    const sup = supervisorFor(evalTarget("setTimeout(() => process.stdout.write('slow'), 800)"), {
+      db,
+    });
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    for (let i = 0; i < 100 && attempts(db, view.runId)[0]?.pid == null; i++) await sleep(20);
+
+    // Mid-flight: a selection happening right now already sees the slot taken,
+    // instead of piling onto an instance that looks untouched.
+    expect(sup.getRun(view.runId)!.status).toBe("running");
+    expect(quotaEvents(db)).toEqual([{ instance: "default", kind: "run" }]);
+
+    await settled;
+    expect(sup.getRun(view.runId)!.status).toBe("succeeded");
+    // ...and completion does not count it a second time.
+    expect(quotaEvents(db)).toEqual([{ instance: "default", kind: "run" }]);
+  }, 30_000);
+
+  test("a failure before the callee ran is neither quota nor reliability", async () => {
+    const db = newDb();
+    const sup = supervisorFor(evalTarget("process.stdout.write('never')"), {
+      db,
+      exec: () =>
+        Promise.resolve({
+          ok: false,
+          started: false,
+          exitCode: null,
+          timedOut: false,
+          rawTail: "",
+          error: "spawn failed: ENOENT",
+          durationMs: 0,
+        }),
+    });
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    // Baton-side facts are Baton's: charging them to the target would teach the
+    // ratings that a model is unreliable because a binary moved.
+    expect(sup.getRun(view.runId)!.status).toBe("failed");
+    expect(quotaEvents(db)).toEqual([]);
+    expect(reliability(db)).toEqual([]);
+  }, 20_000);
+
+  test("a failure the callee actually produced is reliability against its target", async () => {
+    const db = newDb();
+    const sup = supervisorFor(evalTarget("process.exit(3)"), { db });
+    const { settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+    expect(reliability(db)).toEqual([
+      { target: "fake:default/fake/slug@a1+full", sum_w_ok: 0, sum_w_fail: 1 },
+    ]);
+  }, 20_000);
+
+  test("a plain failure does not clear an existing cooldown — only a success does", async () => {
+    const db = newDb();
+    recordAdmissionFailure(db, "fake", "default", nowIso(), "429");
+    const sup = supervisorFor(evalTarget("process.exit(3)"), { db });
+    const { settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    await settled;
+
+    // A nonzero exit is not proof the account is healthy — a CLI that dies on
+    // a quota page mid-run looks exactly like this. Only an answer is proof.
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM cooldowns").get()!.n).toBe(1);
   }, 20_000);
 });
 
@@ -297,6 +612,28 @@ describe("concurrency cap", () => {
     await second.settled;
     expect(sup.getRun(second.view.runId)!.status).toBe("succeeded");
   }, 30_000);
+
+  test("a queued attempt already holds a slot, so a racing launch is refused", async () => {
+    const db = newDb();
+    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
+    const sup = supervisorFor(evalTarget("process.stdout.write('ok')"), { db });
+
+    // Another process, caught between its insert and its flip to 'running'.
+    const runId = newId("run");
+    const now = nowIso();
+    db.query(
+      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+       VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', 'queued', ?, ?)`,
+    ).run(runId, now, now);
+    db.query(
+      "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'queued')",
+    ).run(newId("att"), runId);
+
+    await expect(sup.startRun({ model: "fake-model", prompt: "two" })).rejects.toThrow(
+      /concurrency cap.*is 1/s,
+    );
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(1);
+  }, 20_000);
 
   test("the default cap admits several concurrent runs", async () => {
     const db = newDb();
@@ -442,6 +779,50 @@ describe("cancelRun", () => {
     expect(sup.getRun(view.runId)!.status).toBe("cancelled");
     expect(attempts(db, view.runId)[0]?.status).toBe("cancelled");
   }, 30_000);
+
+  test("a cancellation landing between the outcome and the commit stands", async () => {
+    const db = newDb();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sup = supervisorFor(evalTarget("unused"), {
+      db,
+      exec: async () => {
+        await gate;
+        return {
+          ok: true,
+          started: true,
+          output: "answer",
+          exitCode: 0,
+          timedOut: false,
+          rawTail: "answer",
+          durationMs: 5,
+        };
+      },
+    });
+
+    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
+    // Exactly the writes another process's cancelRun makes — this supervisor's
+    // live entry never sees them, so it is still about to commit 'succeeded'.
+    const now = nowIso();
+    db.query(
+      "UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE run_id = ? AND status IN ('queued','running')",
+    ).run(now, view.runId);
+    db.query(
+      "UPDATE runs SET status = 'cancelled', updated_at = ? WHERE id = ? AND status IN ('queued','running')",
+    ).run(now, view.runId);
+    release();
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("cancelled");
+    expect(final.attempts[0]!.status).toBe("cancelled");
+    // The outcome is still recorded against the attempt — just not as a status
+    // that resurrects a run the caller stopped.
+    expect(attempts(db, view.runId)[0]!.exit_code).toBe(0);
+    expect(attempts(db, view.runId)[0]!.output).toBe("answer");
+  }, 20_000);
 
   test("cancelling a finished run is a no-op", async () => {
     const db = newDb();

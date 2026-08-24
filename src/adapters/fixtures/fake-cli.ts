@@ -82,6 +82,28 @@ switch (mode) {
     break;
   }
 
+  // A run that worked for a while — tool events, a message part — and only
+  // then hit a rate limit. The admission text is real but arrives too late to
+  // be an admission failure.
+  case "work-then-limit":
+    await write(`${JSON.stringify({ type: "step_start" })}\n`);
+    await write(`${JSON.stringify({ type: "tool", name: "edit", path: "src/a.ts" })}\n`);
+    await write(`${JSON.stringify({ type: "text", part: { text: "edited three files" } })}\n`);
+    await writeErr(`${Bun.env.BATON_FAKE_STDERR ?? "usage limit reached, retry after 5pm"}\n`);
+    process.exit(num("BATON_FAKE_EXIT", 1));
+
+  // Streams a usable answer and then a terminal error event, exiting 0 — the
+  // shape that made a partial answer look successful.
+  case "text-then-error":
+    await write(`${JSON.stringify({ type: "text", part: { text: "partial answer" } })}\n`);
+    await write(
+      `${JSON.stringify({
+        type: "error",
+        error: { name: "APIError", data: { message: "Upstream request failed", statusCode: 503 } },
+      })}\n`,
+    );
+    break;
+
   case "fail":
     await writeErr(`${Bun.env.BATON_FAKE_STDERR ?? "rate limit exceeded, retry later"}\n`);
     process.exit(num("BATON_FAKE_EXIT", 3));

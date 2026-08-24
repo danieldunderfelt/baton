@@ -55,4 +55,10 @@ export const kimiAdapter: AdapterSpec = {
   // Treating it as an admission failure is the safe read: an instance whose
   // config dir has no credentials produces exactly this.
   admissionFailurePatterns: ["is not configured in config.toml"],
+  // The assistant role marker is the one work-started signal this stream is
+  // known to emit (it is the same line the extractor reads the answer from);
+  // nothing was captured about kimi's tool events during the probe, so nothing
+  // is claimed here. The admission pattern above is a startup config error
+  // that cannot appear once a turn is under way, so the pair is still tight.
+  workStartedPatterns: ['"role":"assistant"'],
 };

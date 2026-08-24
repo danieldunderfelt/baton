@@ -1,13 +1,22 @@
 import type { Database } from "bun:sqlite";
 
-import { executeAdapter } from "../adapters/executor.ts";
+import { classifyFailure, executeAdapter } from "../adapters/executor.ts";
 import type { Autonomy, ExecRequest, ExecResult } from "../adapters/types.ts";
+import { recordReliability } from "../eval/evalStore.ts";
+import {
+  clearCooldown,
+  dropRunEvent,
+  recordAdmissionFailure,
+  recordRun,
+} from "../quota/quota.ts";
 import {
   DEFAULT_INSTANCE,
   POLICY_VERSION,
+  candidateKey,
   ceilingFor,
   clampAutonomy,
   selectTarget,
+  type SelectOptions,
   type Target,
 } from "../registry/registry.ts";
 import { newId, nowIso, withBusyRetry } from "../store/store.ts";
@@ -18,6 +27,7 @@ import {
   SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type AttemptView,
+  type RunOptions,
   type RunRequest,
   type RunStatus,
   type RunView,
@@ -25,8 +35,12 @@ import {
 
 /**
  * The run supervisor: runs/attempts state machine over SQLite (the source of
- * truth) with the adapter executor as the only execution path. Phase 1 runs one
- * attempt per run; failover in phase 2 adds attempts under the same run.
+ * truth) with the adapter executor as the only execution path. A run is the
+ * caller's request; each execution is an attempt, and an admission failure —
+ * a rate-limit or auth refusal *before* the callee started work — adds another
+ * attempt on the next pool candidate under the same run (PLAN.md §Instance
+ * pools). Any other failure ends the run: replaying work that may already have
+ * had side effects is the caller's decision, not Baton's.
  */
 
 const POLL_MS = 250;
@@ -56,7 +70,7 @@ export interface ExecHooks {
 export type AdapterExec = (req: ExecRequest, hooks?: ExecHooks) => Promise<ExecResult>;
 
 export interface TargetResolver {
-  resolve(model: string, opts: { instance?: string }): Target;
+  resolve(model: string, opts: SelectOptions): Target;
 }
 
 export interface SupervisorInit {
@@ -73,6 +87,31 @@ interface Live {
   runId: string;
   pid: number | null;
   cancelled: boolean;
+  /** quota_events row claimed at admission; dropped again if it was refused. */
+  quotaEventId: number | null;
+}
+
+/** Everything one attempt needs, plus what its successor would need. */
+interface AttemptCtx {
+  runId: string;
+  attemptId: string;
+  seq: number;
+  model: string;
+  prompt: string;
+  cwd: string;
+  depth: number;
+  options?: RunOptions;
+  /** The caller's category, if any: selection ranks per category. */
+  category?: string;
+  /** Set only when the caller pinned an instance — pins never fail over. */
+  requestedInstance?: string;
+  target: Target;
+  /** attempts.target: the execution-target fingerprint incl. resolved autonomy. */
+  fingerprint: string;
+  autonomy: Autonomy;
+  timeoutMs: number;
+  /** `<app>:<instance>` keys this run has used; the cap on a failover chain. */
+  tried: string[];
 }
 
 export class Supervisor {
@@ -124,16 +163,14 @@ export class Supervisor {
       if (existing) return deduped(existing);
     }
 
-    const target = this.resolver.resolve(req.model, { instance: req.instance });
-    const autonomy = clampAutonomy(
-      req.options?.autonomy,
-      ceilingFor(this.db, target.spec.app),
-      target.spec.defaultAutonomy,
-    );
-    // Autonomy is part of the execution-target identity: the same model at a
-    // different authority level is not interchangeable evidence.
-    const fingerprint = `${target.targetFingerprint}+${autonomy}`;
-    const timeoutMs = req.options?.timeoutMs ?? target.spec.defaultTimeoutMs;
+    const target = this.resolver.resolve(req.model, {
+      instance: req.instance,
+      exclude: [],
+      // Ratings are per (target, category), so ranking is judged on the kind of
+      // work this run actually is.
+      ...(req.category ? { category: req.category } : {}),
+    });
+    const { autonomy, timeoutMs, fingerprint } = this.resolve(target, req.options);
     const runId = newId("run");
     const attemptId = newId("att");
 
@@ -159,17 +196,23 @@ export class Supervisor {
       throw err;
     }
 
-    this.live.set(attemptId, { runId, pid: null, cancelled: false });
     this.markRunning(runId, attemptId);
     const settled = this.execute({
       runId,
       attemptId,
-      target,
-      autonomy,
-      timeoutMs,
+      seq: 1,
+      model: req.model,
+      prompt: req.prompt,
       cwd,
       depth,
-      prompt: req.prompt,
+      ...(req.options ? { options: req.options } : {}),
+      ...(req.category ? { category: req.category } : {}),
+      ...(req.instance ? { requestedInstance: req.instance } : {}),
+      target,
+      fingerprint,
+      autonomy,
+      timeoutMs,
+      tried: [candidateKey(target.spec.app, target.instance)],
     });
 
     return { view: this.getRun(runId)!, settled };
@@ -279,19 +322,23 @@ export class Supervisor {
     }
   }
 
-  private async execute(ctx: {
-    runId: string;
-    attemptId: string;
-    target: Target;
-    autonomy: Autonomy;
-    timeoutMs: number;
-    cwd: string;
-    depth: number;
-    prompt: string;
-  }): Promise<void> {
-    let res: ExecResult;
+  /** Runs attempts until one settles the run — the failover chain lives here. */
+  private async execute(first: AttemptCtx): Promise<void> {
+    for (let ctx: AttemptCtx | undefined = first; ctx; ) {
+      const res = await this.invoke(ctx);
+      ctx = this.settle(ctx, res);
+    }
+  }
+
+  private async invoke(ctx: AttemptCtx): Promise<ExecResult> {
+    this.live.set(ctx.attemptId, {
+      runId: ctx.runId,
+      pid: null,
+      cancelled: false,
+      quotaEventId: null,
+    });
     try {
-      res = await this.exec(
+      return await this.exec(
         {
           spec: ctx.target.spec,
           // The registry already verified this path; spawning the bare name
@@ -304,11 +351,18 @@ export class Supervisor {
           autonomy: ctx.autonomy,
           timeoutMs: ctx.timeoutMs,
         },
-        { onSpawn: (pid) => this.notePid(ctx.attemptId, pid) },
+        {
+          onSpawn: (pid) => {
+            this.notePid(ctx.attemptId, pid);
+            this.noteAdmitted(ctx);
+          },
+        },
       );
     } catch (err) {
-      res = {
+      return {
         ok: false,
+        // The callee never ran: a Baton-side failure is not the target's.
+        started: false,
         exitCode: null,
         timedOut: false,
         rawTail: "",
@@ -316,8 +370,35 @@ export class Supervisor {
         durationMs: 0,
       };
     }
+  }
 
-    const cancelled = this.live.get(ctx.attemptId)?.cancelled ?? false;
+  /**
+   * The callee is running, so its window slot is spent NOW — not when it
+   * finishes. A long run recorded at completion lands in the wrong 5-hour
+   * window, and every selection made while it runs sees headroom it no longer
+   * has and piles onto the same instance (PLAN.md §Proactive spreading).
+   * `settle` gives the slot back if the spawn turned out to be a refusal.
+   */
+  private noteAdmitted(ctx: AttemptCtx): void {
+    try {
+      const id = withBusyRetry(() =>
+        recordRun(this.db, ctx.target.spec.app, ctx.target.instance, nowIso()),
+      );
+      const live = this.live.get(ctx.attemptId);
+      if (live) live.quotaEventId = id;
+    } catch {
+      // Evidence is not run state: losing it must never fail the run.
+    }
+  }
+
+  /**
+   * Records an attempt's outcome and its evidence, and returns the next attempt
+   * when this one was refused admission and another candidate is left.
+   */
+  private settle(ctx: AttemptCtx, res: ExecResult): AttemptCtx | undefined {
+    const live = this.live.get(ctx.attemptId);
+    const cancelled = live?.cancelled ?? false;
+    const quotaEventId = live?.quotaEventId ?? null;
     this.live.delete(ctx.attemptId);
     const status: RunStatus = cancelled
       ? "cancelled"
@@ -326,34 +407,174 @@ export class Supervisor {
         : res.ok
           ? "succeeded"
           : "failed";
+    // A timeout is deliberately not an admission failure however its output
+    // reads: the callee had the whole budget to act, so re-running it could
+    // duplicate side effects (PLAN.md §Failover on admission failure only).
+    // classifyFailure applies the same rule to the output itself: a rejection
+    // printed *after* work-started evidence is a failure, never a replay.
+    const refused =
+      !cancelled &&
+      !res.ok &&
+      !res.timedOut &&
+      classifyFailure(ctx.target.spec, res) === "admission";
+    this.observe(ctx, res, { status, cancelled, refused, quotaEventId });
 
+    const next = refused ? this.nextCandidate(ctx) : undefined;
+    const error = failureText(res, { refused, failedOver: next !== undefined });
     try {
-      const now = nowIso();
-      withBusyRetry(() =>
-        this.db.transaction(() => {
-          this.db
-            .query(
-              "UPDATE attempts SET status = ?, exit_code = ?, output = ?, raw_tail = ?, error = ?, session_ref = ?, finished_at = ? WHERE id = ?",
-            )
-            .run(
-              status,
-              res.exitCode ?? null,
-              res.output === undefined ? null : head(res.output, MAX_OUTPUT_CHARS),
-              res.rawTail ? tail(res.rawTail, MAX_RAW_TAIL_CHARS) : null,
-              res.error ?? null,
-              res.sessionRef ?? null,
-              now,
-              ctx.attemptId,
-            );
-          this.db
-            .query("UPDATE runs SET status = ?, updated_at = ? WHERE id = ?")
-            .run(status, now, ctx.runId);
-        })(),
-      );
+      return this.commit(ctx, res, { status, error, next });
     } catch {
       // A run whose outcome cannot be written is worse than useless to retry
       // here; recoverOrphans() reconciles it on the next start.
+      return undefined;
     }
+  }
+
+  /**
+   * Quota and reliability evidence for one completed attempt. The window slot
+   * was already claimed at admission (`noteAdmitted`); an admission failure
+   * spent nothing after all, so its claim is given back and the instance cools
+   * down instead. Only a success proves admission works again, so only a
+   * success ends the strike chain. Extraction and spawn failures are
+   * reliability against the target, never quality against the model
+   * (PLAN.md §Layering and sharing) — and an attempt whose callee never ran is
+   * neither: it is a Baton-side fact.
+   */
+  private observe(
+    ctx: AttemptCtx,
+    res: ExecResult,
+    o: { status: RunStatus; cancelled: boolean; refused: boolean; quotaEventId: number | null },
+  ): void {
+    const app = ctx.target.spec.app;
+    const now = nowIso();
+    try {
+      if (o.refused) {
+        if (o.quotaEventId !== null) dropRunEvent(this.db, o.quotaEventId);
+        // No adapter's live probe produced a parseable reset time, so the
+        // backoff decides; pass one here the moment an adapter can extract it.
+        recordAdmissionFailure(this.db, app, ctx.target.instance, now, res.error);
+      } else if (o.status === "succeeded") {
+        clearCooldown(this.db, app, ctx.target.instance);
+      }
+      // A cancelled attempt says nothing about the target: the user stopped it.
+      if (!o.cancelled && res.started) {
+        recordReliability(this.db, ctx.fingerprint, o.status === "succeeded");
+      }
+    } catch {
+      // Evidence is not run state: losing it must never fail the run.
+    }
+  }
+
+  /** The next pool candidate for a refused attempt, or undefined when spent. */
+  private nextCandidate(ctx: AttemptCtx): AttemptCtx | undefined {
+    let target: Target;
+    try {
+      target = this.resolver.resolve(ctx.model, {
+        // An explicitly requested instance is a pin, not a preference: it is
+        // already in `tried`, so selection finds nothing and the run fails.
+        ...(ctx.requestedInstance ? { instance: ctx.requestedInstance } : {}),
+        ...(ctx.category ? { category: ctx.category } : {}),
+        exclude: ctx.tried,
+      });
+    } catch {
+      return undefined;
+    }
+    const key = candidateKey(target.spec.app, target.instance);
+    // Belt and braces: a resolver that ignores `exclude` must not loop forever.
+    if (ctx.tried.includes(key)) return undefined;
+    const { autonomy, timeoutMs, fingerprint } = this.resolve(target, ctx.options);
+    return {
+      ...ctx,
+      attemptId: newId("att"),
+      seq: ctx.seq + 1,
+      target,
+      fingerprint,
+      autonomy,
+      timeoutMs,
+      tried: [...ctx.tried, key],
+    };
+  }
+
+  /** Authority and budget for one target: options may narrow the ceiling only. */
+  private resolve(
+    target: Target,
+    options: RunOptions | undefined,
+  ): { autonomy: Autonomy; timeoutMs: number; fingerprint: string } {
+    const autonomy = clampAutonomy(
+      options?.autonomy,
+      ceilingFor(this.db, target.spec.app),
+      target.spec.defaultAutonomy,
+    );
+    return {
+      autonomy,
+      timeoutMs: options?.timeoutMs ?? target.spec.defaultTimeoutMs,
+      // Autonomy is part of the execution-target identity: the same model at a
+      // different authority level is not interchangeable evidence.
+      fingerprint: `${target.targetFingerprint}+${autonomy}`,
+    };
+  }
+
+  /**
+   * One transaction: the finished attempt, and either the run's terminal status
+   * or the failover attempt that continues it. The successor is inserted
+   * already `running` so the run is never momentarily idle, and it inherits the
+   * concurrency slot the finished attempt just released.
+   */
+  private commit(
+    ctx: AttemptCtx,
+    res: ExecResult,
+    o: { status: RunStatus; error: string | null; next: AttemptCtx | undefined },
+  ): AttemptCtx | undefined {
+    const now = nowIso();
+    return withBusyRetry(() =>
+      this.db.transaction(() => {
+        // The outcome is recorded either way, but a cancellation that landed
+        // while this attempt was finishing stands: the caller stopped the run,
+        // and 'succeeded' would overwrite that with a lie.
+        this.db
+          .query(
+            `UPDATE attempts SET
+               status = CASE WHEN status IN ('queued','running') THEN ? ELSE status END,
+               exit_code = ?, output = ?, raw_tail = ?, error = ?, session_ref = ?, finished_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            o.status,
+            res.exitCode ?? null,
+            res.output === undefined ? null : head(res.output, MAX_OUTPUT_CHARS),
+            res.rawTail ? tail(res.rawTail, MAX_RAW_TAIL_CHARS) : null,
+            o.error,
+            res.sessionRef ?? null,
+            now,
+            ctx.attemptId,
+          );
+        // Cancellation lands between the attempt finishing and this commit:
+        // failing over would resurrect a run the caller already stopped.
+        const live =
+          this.db
+            .query<{ status: RunStatus }, [string]>("SELECT status FROM runs WHERE id = ?")
+            .get(ctx.runId)?.status === "running";
+        if (!o.next || !live) {
+          this.db
+            .query(
+              "UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status IN ('queued','running')",
+            )
+            .run(o.status, now, ctx.runId);
+          return undefined;
+        }
+        this.db
+          .query(
+            "INSERT INTO attempts (id, run_id, seq, target, status, started_at) VALUES (?, ?, ?, ?, 'running', ?)",
+          )
+          .run(o.next.attemptId, ctx.runId, o.next.seq, o.next.fingerprint, now);
+        // The run now belongs to the instance actually carrying it — resumes
+        // and session affinity follow the attempt that answers.
+        this.db
+          .query("UPDATE runs SET app = ?, slug = ?, instance = ?, updated_at = ? WHERE id = ?")
+          .run(o.next.target.spec.app, o.next.target.slug, o.next.target.instance, now, ctx.runId);
+        return o.next;
+      })(),
+    );
   }
 
   /**
@@ -417,9 +638,14 @@ export class Supervisor {
     this.db
       .transaction(() => {
         const cap = this.maxConcurrent();
+        // 'queued' counts too: an attempt is inserted queued and only then
+        // flipped to running, so counting 'running' alone lets two processes
+        // in the gap both pass a cap of one.
         const running =
           this.db
-            .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM attempts WHERE status = 'running'")
+            .query<{ n: number }, []>(
+              "SELECT COUNT(*) AS n FROM attempts WHERE status IN ('queued','running')",
+            )
             .get()?.n ?? 0;
         if (running >= cap) {
           throw new Error(
@@ -575,9 +801,13 @@ interface AttemptRow {
   finished_at: string | null;
 }
 
+/**
+ * The run's answer is the LAST attempt's: a failover chain ends the moment one
+ * succeeds, so any earlier attempt is a refused one whose output would be a
+ * lie. The chain itself stays visible in `attempts`.
+ */
 function toView(run: RunRow, attempts: AttemptRow[]): RunView {
   const last = attempts[attempts.length - 1];
-  const answered = [...attempts].reverse().find((a) => a.status === "succeeded" && a.output);
   return {
     runId: run.id,
     status: run.status,
@@ -585,7 +815,7 @@ function toView(run: RunRow, attempts: AttemptRow[]): RunView {
     app: run.app,
     slug: run.slug,
     instance: run.instance,
-    ...(answered?.output ? { output: answered.output } : {}),
+    ...(last?.status === "succeeded" && last.output ? { output: last.output } : {}),
     ...(run.status !== "succeeded" && last?.error ? { error: last.error } : {}),
     createdAt: run.created_at,
     updatedAt: run.updated_at,
@@ -604,6 +834,19 @@ function toAttemptView(a: AttemptRow): AttemptView {
     ...(a.started_at ? { startedAt: a.started_at } : {}),
     ...(a.finished_at ? { finishedAt: a.finished_at } : {}),
   };
+}
+
+/**
+ * The attempt's error, saying plainly when an admission failure had nowhere
+ * left to go — otherwise "rate limited" reads as the whole story when the real
+ * one is that the pool is spent.
+ */
+function failureText(
+  res: ExecResult,
+  o: { refused: boolean; failedOver: boolean },
+): string | null {
+  if (!o.refused || o.failedOver) return res.error ?? null;
+  return `${res.error ?? "admission failed"} — admission was refused and no other instance was eligible (each one is already attempted or cooling down)`;
 }
 
 function deduped(view: RunView): { view: RunView; settled: Promise<void> } {

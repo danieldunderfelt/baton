@@ -7,9 +7,13 @@ import { join } from "node:path";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
 import type { Autonomy } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths } from "../config/paths.ts";
-import { nowIso, openStore } from "../store/store.ts";
+import { recordGrade, seedPriors } from "../eval/evalStore.ts";
+import { preciousnessKey, setPool } from "../quota/pools.ts";
+import { recordAdmissionFailure, recordRun } from "../quota/quota.ts";
+import { newId, nowIso, openStore } from "../store/store.ts";
 import {
   POLICY_VERSION,
+  candidateKey,
   ceilingFor,
   clampAutonomy,
   detectApps,
@@ -50,10 +54,32 @@ function withFakeBinary<T>(name: string, fn: () => T): T {
 // assertions elsewhere rather than pretend.
 const codexInstalled = Bun.which("codex") !== null;
 
+/** Fixed selection time, so quota windows and cooldowns are deterministic. */
+const NOW = "2026-08-24T12:00:00.000Z";
+const at = (offsetMs: number): string => new Date(Date.parse(NOW) + offsetMs).toISOString();
+
+/** A kimi pool over `members`, each a real instance in this scope. */
+function pooled(db: Database, members: string[]): void {
+  for (const name of members) {
+    db.query("INSERT INTO instances (app, name, env, created_at) VALUES (?, ?, '{}', ?)").run(
+      "kimi",
+      name,
+      nowIso(),
+    );
+  }
+  setPool(db, "kimi", members);
+}
+
+function setting(db: Database, key: string, value: string): void {
+  db.query(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+  ).run(key, value);
+}
+
 describe("detectApps", () => {
   test("reports every builtin app, sorted, without throwing", () => {
     const apps = detectApps({ probeVersion: false });
-    expect(apps.map((a) => a.app)).toEqual(["codex", "kimi"]);
+    expect(apps.map((a) => a.app)).toEqual(["claude-code", "codex", "kimi", "opencode"]);
     expect(apps.length).toBe(builtinAdapters.length);
   });
 
@@ -99,13 +125,26 @@ describe("resolveTargets", () => {
 });
 
 describe("selectTarget", () => {
-  test("policy v1 picks the first available route and mints a fingerprint", () => {
+  test("policy v2 picks an available route on the default instance", () => {
     const db = scopeStore("select");
-    const target = selectTarget(db, "gpt-5.6-sol");
+    const target = withFakeBinary("codex", () => selectTarget(db, "gpt-5.6-sol"));
     expect(target.spec.app).toBe("codex");
     expect(target.instance).toBe("default");
     expect(target.targetFingerprint).toBe("codex:default/gpt-5.6-sol@a1");
-    expect(POLICY_VERSION).toBe(1);
+    // No pool: the sole candidate is the inherited environment, at full headroom.
+    expect(target.considered).toEqual([
+      {
+        app: "codex",
+        slug: "gpt-5.6-sol",
+        instance: "default",
+        quota: 1,
+        rating: 1,
+        headroom: 1,
+        preciousness: "burn",
+        chosen: true,
+      },
+    ]);
+    expect(POLICY_VERSION).toBe(2);
   });
 
   test.if(codexInstalled)("carries the verified absolute binary path", () => {
@@ -145,8 +184,12 @@ describe("selectTarget", () => {
 
   test("rejects an instance the scope does not define", () => {
     const db = scopeStore("badinstance");
-    expect(() => selectTarget(db, "kimi-k3", { instance: "personal-2" })).toThrow(
-      /Unknown instance 'personal-2' for app 'kimi'/,
+    expect(() => withFakeBinary("kimi", () => selectTarget(db, "kimi-k3", { instance: "p2" }))).toThrow(
+      /unknown instance 'p2' in this scope \(known instances: default\)/,
+    );
+    // The fix command is in the message, not just the diagnosis.
+    expect(() => withFakeBinary("kimi", () => selectTarget(db, "kimi-k3", { instance: "p2" }))).toThrow(
+      /baton instance add kimi p2 --env/,
     );
   });
 
@@ -158,7 +201,9 @@ describe("selectTarget", () => {
       JSON.stringify({ KIMI_CODE_HOME: "/tmp/kimi2" }),
       nowIso(),
     );
-    const target = selectTarget(db, "kimi-k3", { instance: "personal-2" });
+    const target = withFakeBinary("kimi", () =>
+      selectTarget(db, "kimi-k3", { instance: "personal-2" }),
+    );
     expect(target.instance).toBe("personal-2");
     expect(target.targetFingerprint).toBe("kimi:personal-2/kimi-code/k3@a1");
   });
@@ -172,15 +217,274 @@ describe("selectTarget", () => {
       "{}",
       nowIso(),
     );
-    expect(selectTarget(a, "kimi-k3", { instance: "personal-2" }).instance).toBe("personal-2");
-    expect(() => selectTarget(b, "kimi-k3", { instance: "personal-2" })).toThrow(
-      /Known instances: default/,
-    );
+    withFakeBinary("kimi", () => {
+      expect(selectTarget(a, "kimi-k3", { instance: "personal-2" }).instance).toBe("personal-2");
+      expect(() => selectTarget(b, "kimi-k3", { instance: "personal-2" })).toThrow(
+        /known instances: default/,
+      );
+    });
   });
 
   test("unknown model errors before anything else", () => {
     const db = scopeStore("unknown");
     expect(() => selectTarget(db, "nope")).toThrow(/Unknown model 'nope'/);
+  });
+});
+
+describe("selectTarget: pool ranking (policy v2)", () => {
+  /** Selection over a kimi pool at the fixed NOW, with kimi the only binary. */
+  function pick(db: Database, opts: Parameters<typeof selectTarget>[2] = {}) {
+    return withFakeBinary("kimi", () => selectTarget(db, "kimi-k3", { nowIso: NOW, ...opts }));
+  }
+
+  test("spreads onto the member with more quota headroom", () => {
+    const db = scopeStore("pool-spread");
+    pooled(db, ["a", "b"]);
+    for (let i = 0; i < 4; i++) recordRun(db, "kimi", "a", at(-60_000 * (i + 1)));
+
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    const quotas = Object.fromEntries(target.considered!.map((c) => [c.instance, c.quota]));
+    expect(quotas.b).toBeGreaterThan(quotas.a!);
+    // Nothing was hidden: the loser is reported with its own headroom.
+    expect(target.considered!.find((c) => c.instance === "a")!.headroom).toBeLessThan(1);
+  });
+
+  test("equal weights break by pool member order, not by name", () => {
+    const db = scopeStore("pool-order");
+    pooled(db, ["b", "a"]);
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    expect(target.considered!.map((c) => c.instance)).toEqual(["b", "a"]);
+  });
+
+  test("preciousness discounts a member without excluding it", () => {
+    const db = scopeStore("pool-conserve");
+    pooled(db, ["a", "b"]);
+    setting(db, preciousnessKey("kimi", "a"), "conserve");
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    expect(target.considered!.find((c) => c.instance === "a")!.quota).toBe(0.5);
+  });
+
+  test("a cooling member is skipped and the reason is reported", () => {
+    const db = scopeStore("pool-cooling");
+    pooled(db, ["a", "b"]);
+    const until = recordAdmissionFailure(db, "kimi", "a", NOW, "rate limited");
+
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    const a = target.considered!.find((c) => c.instance === "a")!;
+    expect(a.coolingUntil).toBe(until);
+    expect(a.excluded).toContain("cooling down until");
+    expect(target.considered!.find((c) => c.instance === "b")!.excluded).toBeUndefined();
+  });
+
+  test("an expired cooldown stops excluding the member", () => {
+    const db = scopeStore("pool-cooled-off");
+    pooled(db, ["a", "b"]);
+    recordAdmissionFailure(db, "kimi", "a", at(-60 * 60 * 1000));
+    // Same instant, a: cooling. An hour later the 5-minute backoff is spent.
+    expect(pick(db, { nowIso: at(-60 * 60 * 1000) }).instance).toBe("b");
+    expect(pick(db).instance).toBe("a");
+  });
+
+  test("emergency members are last resort: used only when nothing else is", () => {
+    const db = scopeStore("pool-emergency");
+    pooled(db, ["a", "b"]);
+    setting(db, preciousnessKey("kimi", "a"), "emergency");
+    expect(pick(db).instance).toBe("b");
+
+    recordAdmissionFailure(db, "kimi", "b", NOW);
+    // Relaxation order: spend the emergency account before disturbing a cooldown.
+    const relaxed = pick(db);
+    expect(relaxed.instance).toBe("a");
+    expect(relaxed.considered!.find((c) => c.chosen)!.excluded).toContain("last resort");
+  });
+
+  test("when every member is cooling, selection fails with the earliest retry", () => {
+    const db = scopeStore("pool-all-cooling");
+    pooled(db, ["a", "b"]);
+    recordAdmissionFailure(db, "kimi", "a", NOW, undefined, at(60 * 60 * 1000));
+    const soonest = at(10 * 60 * 1000);
+    recordAdmissionFailure(db, "kimi", "b", NOW, undefined, soonest);
+
+    // Running a still-cooling instance buys another refusal and a longer
+    // backoff; the caller is told when to come back instead.
+    expect(() => pick(db)).toThrow(/All instances cooling; earliest retry \d\d:\d\d/);
+    expect(() => pick(db)).toThrow(soonest);
+    // Nothing was spent proving it: no new admission failure was recorded.
+    expect(
+      db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM quota_events").get()!.n,
+    ).toBe(2);
+  });
+
+  test("a cooling member is never the last resort, but an emergency one still is", () => {
+    const db = scopeStore("pool-cooling-vs-emergency");
+    pooled(db, ["a", "spare"]);
+    setting(db, preciousnessKey("kimi", "spare"), "emergency");
+    recordAdmissionFailure(db, "kimi", "a", NOW);
+
+    const target = pick(db);
+    expect(target.instance).toBe("spare");
+    expect(target.considered!.find((c) => c.chosen)!.excluded).toContain("last resort");
+  });
+
+  test("excluded candidates are never re-selected, and exhaustion says so", () => {
+    const db = scopeStore("pool-exclude");
+    pooled(db, ["a", "b"]);
+    expect(pick(db, { exclude: [candidateKey("kimi", "a")] }).instance).toBe("b");
+    expect(() =>
+      pick(db, { exclude: [candidateKey("kimi", "a"), candidateKey("kimi", "b")] }),
+    ).toThrow(/already attempted by this run.*Every pool candidate is spent/s);
+  });
+
+  test("a pool member with no instance definition fails closed", () => {
+    const db = scopeStore("pool-dangling");
+    pooled(db, ["a", "b"]);
+    db.query("DELETE FROM instances WHERE app = 'kimi' AND name = 'a'").run();
+
+    // Running it would apply an empty overlay — the inherited account under a
+    // second name — so it is refused, and the healthy member carries the run.
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    expect(target.considered!.find((c) => c.instance === "a")!.excluded).toContain(
+      "no instance definition",
+    );
+
+    db.query("DELETE FROM instances WHERE app = 'kimi' AND name = 'b'").run();
+    expect(() => pick(db)).toThrow(/no instance definition in this scope/);
+  });
+
+  test("an explicit instance outranks the pool", () => {
+    const db = scopeStore("pool-explicit");
+    pooled(db, ["a", "b"]);
+    for (let i = 0; i < 9; i++) recordRun(db, "kimi", "a", at(-60_000 * (i + 1)));
+    const target = pick(db, { instance: "a" });
+    expect(target.instance).toBe("a");
+    expect(target.considered).toHaveLength(1);
+  });
+
+  /** Graded evidence against one member's execution target (grades.run_id is a real FK). */
+  function graded(
+    db: Database,
+    instance: string,
+    grade: number,
+    opts: { category?: string; autonomy?: string } = {},
+  ): void {
+    const runId = newId("run");
+    db.query(
+      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+       VALUES (?, 'kimi-k3', 'kimi', 'kimi-code/k3', ?, 'hi', '/tmp', 'succeeded', ?, ?)`,
+    ).run(runId, instance, NOW, NOW);
+    recordGrade(db, {
+      runId,
+      grade,
+      target: `kimi:${instance}/kimi-code/k3@a1+${opts.autonomy ?? "full"}`,
+      model: "kimi-k3",
+      ...(opts.category === undefined ? {} : { category: opts.category }),
+      runAt: NOW,
+      gradedAt: NOW,
+    });
+  }
+
+  test("evidence is per execution target: the better-graded member wins", () => {
+    const db = scopeStore("pool-target-rating");
+    pooled(db, ["a", "b"]);
+    // Untouched, the two are indistinguishable and member order decides.
+    expect(pick(db).instance).toBe("a");
+
+    graded(db, "a", 1);
+    graded(db, "b", 5);
+    const target = pick(db);
+    expect(target.instance).toBe("b");
+    const ratings = Object.fromEntries(target.considered!.map((c) => [c.instance, c.rating]));
+    expect(ratings.b).toBeGreaterThan(ratings.a!);
+    // Both are still shrunk toward the model's rollup, so one bad run does not
+    // banish a member: the discount stays inside the rating band.
+    expect(ratings.a).toBeGreaterThan(0.6);
+    // Quota is untouched by any of it: the two stages stay separate.
+    expect(target.considered!.every((c) => c.quota === 1)).toBe(true);
+  });
+
+  test("a target's evidence counts whatever autonomy it ran at", () => {
+    const db = scopeStore("pool-target-autonomy");
+    pooled(db, ["a", "b"]);
+    graded(db, "a", 1, { autonomy: "readonly" });
+    graded(db, "b", 5, { autonomy: "full" });
+    // Autonomy resolves after selection, so evidence pools across the levels.
+    expect(pick(db).instance).toBe("b");
+  });
+
+  test("per-category evidence steers only the category it was graded in", () => {
+    const db = scopeStore("pool-category-rating");
+    pooled(db, ["a", "b"]);
+    graded(db, "a", 1, { category: "review" });
+    graded(db, "b", 5, { category: "review" });
+
+    expect(pick(db, { category: "review" }).instance).toBe("b");
+    // Uncategorised work has no evidence of its own: back to member order.
+    expect(pick(db).instance).toBe("a");
+  });
+
+  test("the rating factor is reported separately, and unrated models are not starved", () => {
+    const db = scopeStore("pool-rating");
+    pooled(db, ["a"]);
+    expect(pick(db).considered![0]!.rating).toBe(1);
+
+    seedPriors(db, "onboarding", [{ model: "kimi-k3", mean: 1 }]);
+    expect(pick(db).considered![0]!.rating).toBeCloseTo(0.6, 10);
+
+    seedPriors(db, "onboarding", [{ model: "kimi-k3", mean: 5 }]);
+    expect(pick(db).considered![0]!.rating).toBeCloseTo(1, 10);
+  });
+
+  test("staged ranking: clearly more headroom beats a better rating", () => {
+    const db = scopeStore("pool-staged-quota");
+    pooled(db, ["a", "b"]);
+    for (let i = 0; i < 3; i++) {
+      graded(db, "a", 5);
+      graded(db, "b", 1);
+    }
+    // Three recent runs on a: the quota gap is far wider than the ranking grid.
+    for (let i = 0; i < 3; i++) recordRun(db, "kimi", "a", at(-60_000 * (i + 1)));
+
+    const target = pick(db);
+    const c = Object.fromEntries(target.considered!.map((x) => [x.instance, x]));
+    expect(c.a!.quota).toBeLessThan(c.b!.quota);
+    // Multiplying the two stages together would send this run to a
+    // (0.85 × 0.875 = 0.744 beats 1 × 0.725); staged ranking sends it to the
+    // account that still has room, and lets the rating matter next time.
+    expect(c.a!.quota * c.a!.rating).toBeGreaterThan(c.b!.quota * c.b!.rating);
+    expect(target.instance).toBe("b");
+  });
+
+  test("staged ranking: near-equal headroom lets the rating decide", () => {
+    const db = scopeStore("pool-staged-rating");
+    pooled(db, ["a", "b"]);
+    graded(db, "a", 5);
+    graded(db, "b", 1);
+    // Week-old runs only: b has strictly more headroom than a, but the two
+    // land in the same grid cell, so the difference is noise and rating rules.
+    recordRun(db, "kimi", "a", at(-24 * 60 * 60 * 1000));
+    recordRun(db, "kimi", "a", at(-25 * 60 * 60 * 1000));
+    recordRun(db, "kimi", "b", at(-24 * 60 * 60 * 1000));
+
+    const target = pick(db);
+    const c = Object.fromEntries(target.considered!.map((x) => [x.instance, x]));
+    expect(c.a!.headroom).toBeLessThan(c.b!.headroom);
+    expect(c.a!.quota).toBe(c.b!.quota);
+    expect(target.instance).toBe("a");
+  });
+
+  test("ranking is deterministic: the same state selects the same target", () => {
+    const db = scopeStore("pool-deterministic");
+    pooled(db, ["a", "b", "c"]);
+    recordRun(db, "kimi", "a", at(-1_000));
+    seedPriors(db, "onboarding", [{ model: "kimi-k3", mean: 3 }]);
+    const first = pick(db);
+    expect(pick(db).considered).toEqual(first.considered);
+    expect(pick(db).instance).toBe(first.instance);
   });
 });
 
@@ -255,6 +559,35 @@ describe("listModels", () => {
   test.if(codexInstalled)("installed apps are marked available", () => {
     const db = scopeStore("list-available");
     expect(listModels(db).filter((r) => r.app === "codex").every((r) => r.available)).toBe(true);
+  });
+
+  test("reports prior and observed scores separately, per canonical model", () => {
+    const db = scopeStore("list-scores");
+    expect(listModels(db).find((r) => r.model === "kimi-k3")!).toMatchObject({
+      rating: "unrated",
+      scores: { observed: null, nEff: 0, prior: null, blended: null },
+    });
+
+    seedPriors(db, "onboarding", [{ model: "kimi-k3", mean: 4.5 }]);
+    const rated = listModels(db).find((r) => r.model === "kimi-k3")!;
+    expect(rated.rating).toBe("rated");
+    expect(rated.scores).toMatchObject({ observed: null, prior: 4.5, blended: 4.5 });
+    // A seeded prior must not make an unrelated model look rated.
+    expect(listModels(db).find((r) => r.model === "opus-5")!.rating).toBe("unrated");
+  });
+
+  test("per-instance quota appears only where the app has a pool", () => {
+    const db = scopeStore("list-pool");
+    pooled(db, ["a", "b"]);
+    recordRun(db, "kimi", "a", at(-1_000));
+    const until = recordAdmissionFailure(db, "kimi", "b", NOW);
+
+    const rows = listModels(db, NOW);
+    expect(rows.find((r) => r.app === "kimi")!.pool).toEqual([
+      { instance: "a", headroom: expect.closeTo(0.94, 2) },
+      { instance: "b", headroom: 1, coolingUntil: until },
+    ]);
+    expect(rows.find((r) => r.app === "codex")!.pool).toBeUndefined();
   });
 
   test("maxAutonomy reflects the per-app ceiling", () => {

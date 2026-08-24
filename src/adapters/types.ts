@@ -26,6 +26,13 @@ export type ExtractSpec =
   | {
       kind: "jsonl";
       where?: { path: string; equals: string };
+      /**
+       * Terminal-error line. If any record matches, extraction fails with that
+       * record as the detail — an error event dominates whatever text came
+       * before it, so a stream that answered halfway and then died upstream is
+       * a failure, not a partial success.
+       */
+      errorWhen?: { path: string; equals: string };
       path: string;
       take: "first" | "last";
     };
@@ -67,13 +74,30 @@ export interface AdapterSpec {
    * Case-insensitive substrings identifying an ADMISSION failure
    * (rate limit / auth rejection before work starts) in stderr/stdout —
    * used for pool cooldown (phase 2) and clearer phase-1 errors.
+   * Only ever consulted together with workStartedPatterns: see classifyFailure.
    */
   admissionFailurePatterns: string[];
+  /**
+   * Case-insensitive substrings whose presence in the raw output is positive
+   * evidence the callee BEGAN WORKING (first stream event, tool call, message
+   * part). Failover replays the prompt, so it is reserved for rejections before
+   * any work happened (PLAN.md §Failover on admission failure only); one of
+   * these markers vetoes the admission reading no matter what else matched.
+   * Omitted/empty means "this app gives no such evidence" — which only makes
+   * the classification stricter if its admission patterns cannot appear mid-run.
+   */
+  workStartedPatterns?: string[];
 }
 
 /** Result of running an adapter once. Reliability data lives here. */
 export interface ExecResult {
   ok: boolean;
+  /**
+   * True once the callee process was actually spawned and ran. False for
+   * pre-spawn refusals (unsupported autonomy) and spawn errors (ENOENT), which
+   * are Baton-side facts and must not be charged to the target's reliability.
+   */
+  started: boolean;
   /** Extracted final answer when ok. */
   output?: string;
   exitCode: number | null;

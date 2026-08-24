@@ -42,8 +42,12 @@ Usage:
   baton run <model> <prompt>     Run a one-off delegation from the shell
   baton runs [<run-id>]          Show recent runs / one run's detail
   baton instance <add|list|remove> ...   Manage named app instances
+  baton pool <set|list|clear> ...        Load-balance an app across instances
+  baton ratings [publish]        Show model ratings / refresh ratings.yaml
+  baton grade <run-id> <1-5>     Grade a run after using its result
+  baton profile import <file>    Import a shared priors profile (--yes to commit)
   baton set <key> <value>        Set a scope setting (e.g. max_autonomy:codex full)
-  baton install <host>           Register Baton with a host app (claude-code, ...)
+  baton install <host>           Register Baton with a host app (claude-code, codex, kimi, opencode)
   baton status                   Show scope, resolved identity env vars, DB path
 `);
 }

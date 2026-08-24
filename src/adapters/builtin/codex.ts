@@ -31,6 +31,9 @@ export const codexAdapter: AdapterSpec = {
     extract: {
       kind: "jsonl",
       where: { path: "item.type", equals: "agent_message" },
+      // A turn that ends in "turn.failed" produced no answer, whatever text it
+      // streamed first; exit codes alone were the only guard before.
+      errorWhen: { path: "type", equals: "turn.failed" },
       path: "item.text",
       take: "last",
     },
@@ -57,4 +60,10 @@ export const codexAdapter: AdapterSpec = {
     "unexpected status 401 Unauthorized",
     "Missing bearer or basic authentication in header",
   ],
+  // The turn envelope and any completed item: both prove the exec got past
+  // admission and into the model's turn. If codex prints "turn.started" before
+  // the transport is even tried, a genuine pre-work 401 will read as a plain
+  // failure instead of an admission one — the deliberate direction to err in,
+  // since the other way replays a prompt that may already have edited files.
+  workStartedPatterns: ['"turn.started"', '"type":"item.completed"'],
 };

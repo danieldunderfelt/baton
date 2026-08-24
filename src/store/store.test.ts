@@ -142,8 +142,19 @@ describe("openStore — schema and migrations", () => {
     const paths = scopePaths("upgrade");
     const first = openStore(paths.dbPath);
     insertRun(first, { id: "run_pre_v2" });
-    // Rewind to a genuine v1 database.
+    // Rewind to a genuine v1 database: undo v2's column and v3's tables.
     first.exec("ALTER TABLE runs DROP COLUMN payload_hash");
+    for (const t of [
+      "grades",
+      "accumulator",
+      "reliability",
+      "priors",
+      "quota_events",
+      "cooldowns",
+      "pools",
+    ]) {
+      first.exec(`DROP TABLE ${t}`);
+    }
     first.query("DELETE FROM schema_migrations WHERE version > 1").run();
     first.close();
 
@@ -151,7 +162,7 @@ describe("openStore — schema and migrations", () => {
     expect(runColumns(upgraded)).toContain("payload_hash");
     expect(
       upgraded.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations").get()!.n,
-    ).toBe(2);
+    ).toBe(3);
     expect(countRuns(upgraded)).toBe(1);
     upgraded.close();
   });
@@ -205,6 +216,33 @@ describe("openStore — concurrent fresh opens", () => {
     expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM settings").get()!.n).toBe(8);
     db.close();
   }, 30_000);
+});
+
+describe("openStore — quota event retention", () => {
+  /**
+   * Retention has no background job: every process opens the store, so opening
+   * is where observations no window can still see are dropped.
+   */
+  test("opening drops events older than the retention window and keeps the rest", () => {
+    const paths = scopePaths("quota-retention");
+    const first = openStore(paths.dbPath);
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const insert = (at: string) =>
+      first
+        .query("INSERT INTO quota_events (app, instance, at, kind) VALUES ('kimi', 'a', ?, 'run')")
+        .run(at);
+    insert(ago(30 * 24 * 60 * 60 * 1000));
+    insert(ago(2 * 60 * 60 * 1000));
+    first.close();
+
+    const reopened = openStore(paths.dbPath);
+    const rows = reopened
+      .query<{ at: string }, []>("SELECT at FROM quota_events ORDER BY at")
+      .all();
+    expect(rows).toHaveLength(1);
+    expect(Date.now() - Date.parse(rows[0]!.at)).toBeLessThan(24 * 60 * 60 * 1000);
+    reopened.close();
+  });
 });
 
 describe("pruneRuns — capped ring buffer", () => {

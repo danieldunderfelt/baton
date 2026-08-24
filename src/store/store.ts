@@ -1,5 +1,10 @@
 import { Database } from "bun:sqlite";
 
+// Retention policy for quota observations lives with the windows that define it;
+// only the call site is here, next to the run ring buffer's, because open time is
+// the one moment every process passes through.
+import { pruneQuotaEvents } from "../quota/quota.ts";
+
 /**
  * SQLite is the source of truth for everything mutable (PLAN.md §Architecture).
  * WAL + busy_timeout + retry-on-BUSY; serialized, versioned migrations.
@@ -63,6 +68,76 @@ const MIGRATIONS: string[] = [
   // v2 — payload-bound idempotency: the hash of the request an idempotency_key
   // was minted for, so a reused key with a different payload can be rejected.
   `ALTER TABLE runs ADD COLUMN payload_hash TEXT;`,
+  // v3 — phase 2: eval foundation (grades, decayed accumulator, priors),
+  // quota observation, cooldowns, pools. PLAN.md §Evaluation, §Quota-aware cost.
+  `
+  CREATE TABLE grades (
+    run_id    TEXT PRIMARY KEY REFERENCES runs(id),
+    grade     REAL NOT NULL CHECK (grade >= 1 AND grade <= 5),
+    notes     TEXT,
+    category  TEXT NOT NULL DEFAULT '',
+    target    TEXT NOT NULL,
+    model     TEXT NOT NULL,
+    run_at    TEXT NOT NULL,
+    graded_at TEXT NOT NULL
+  );
+
+  CREATE TABLE accumulator (
+    target   TEXT NOT NULL,
+    model    TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    sum_wg   REAL NOT NULL DEFAULT 0,
+    sum_w    REAL NOT NULL DEFAULT 0,
+    sum_w2   REAL NOT NULL DEFAULT 0,
+    n        INTEGER NOT NULL DEFAULT 0,
+    as_of    TEXT NOT NULL,
+    PRIMARY KEY (target, category)
+  );
+
+  CREATE TABLE reliability (
+    target     TEXT PRIMARY KEY,
+    sum_w_ok   REAL NOT NULL DEFAULT 0,
+    sum_w_fail REAL NOT NULL DEFAULT 0,
+    as_of      TEXT NOT NULL
+  );
+
+  CREATE TABLE priors (
+    profile  TEXT NOT NULL,
+    model    TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    mean     REAL NOT NULL CHECK (mean >= 1 AND mean <= 5),
+    weight   REAL NOT NULL,
+    source   TEXT NOT NULL,
+    as_of    TEXT NOT NULL,
+    PRIMARY KEY (profile, model, category)
+  );
+
+  CREATE TABLE quota_events (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    app      TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    at       TEXT NOT NULL,
+    kind     TEXT NOT NULL CHECK (kind IN ('run','admission_failure','usage')),
+    tokens   INTEGER,
+    detail   TEXT
+  );
+  CREATE INDEX idx_quota_events_key ON quota_events(app, instance, at);
+
+  CREATE TABLE cooldowns (
+    app      TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    until    TEXT NOT NULL,
+    strikes  INTEGER NOT NULL DEFAULT 1,
+    reason   TEXT,
+    PRIMARY KEY (app, instance)
+  );
+
+  CREATE TABLE pools (
+    app        TEXT PRIMARY KEY,
+    members    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  `,
 ];
 
 /** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */
@@ -75,9 +150,11 @@ export function openStore(dbPath: string, cap = RUN_CAP): Database {
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
-  // Every Baton process opens the store, so the ring buffer self-maintains
-  // without a background job (PLAN.md §Evaluation: capped run ring buffer).
+  // Every Baton process opens the store, so retention self-maintains without a
+  // background job: the run ring buffer (PLAN.md §Evaluation) and the quota
+  // observations no window can still see (PLAN.md §Quota-aware cost).
   pruneRuns(db, cap);
+  withBusyRetry(() => pruneQuotaEvents(db, nowIso()));
   return db;
 }
 
