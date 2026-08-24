@@ -1,0 +1,49 @@
+#!/usr/bin/env bun
+/**
+ * baton — pass work between coding agents.
+ * Two faces: `baton mcp` (stdio MCP server) and the CLI subcommands.
+ */
+
+const argv = process.argv.slice(2);
+const command = argv[0];
+
+switch (command) {
+  case "mcp": {
+    const { serveMcp } = await import("./mcp/server.ts");
+    await serveMcp();
+    break;
+  }
+  case undefined:
+  case "help":
+  case "--help":
+  case "-h": {
+    printHelp();
+    break;
+  }
+  case "--version":
+  case "-v": {
+    const pkg = await import("../package.json");
+    console.log(pkg.version);
+    break;
+  }
+  default: {
+    const { runCli } = await import("./cli/cli.ts");
+    process.exitCode = await runCli(command, argv.slice(1));
+  }
+}
+
+function printHelp(): void {
+  console.log(`baton — pass work between coding agents
+
+Usage:
+  baton mcp                      Run the stdio MCP server (register via 'baton install')
+  baton detect                   Detect installed agent CLIs and adapter health
+  baton models                   List available models in this scope
+  baton run <model> <prompt>     Run a one-off delegation from the shell
+  baton runs [<run-id>]          Show recent runs / one run's detail
+  baton instance <add|list|remove> ...   Manage named app instances
+  baton set <key> <value>        Set a scope setting (e.g. max_autonomy:codex full)
+  baton install <host>           Register Baton with a host app (claude-code, ...)
+  baton status                   Show scope, resolved identity env vars, DB path
+`);
+}

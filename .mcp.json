@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "baton": {
+      "command": "/Users/daniel/Work/model-router/dist/baton",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}
