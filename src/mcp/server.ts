@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 
 import { getAdapter } from "../adapters/builtin/index.ts";
@@ -148,7 +148,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Errors (unknown model, no installed app for it, delegation-depth refusal) come back as tool errors, not as a failed run. " +
         "So does hitting this scope's concurrency cap ('max_concurrent'): that one means too many attempts are already running, so let one finish instead of retrying in a loop — launch with wait:false and poll get_run rather than holding calls open.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-      inputSchema: {
+      inputSchema: z.object({
         model: z
           .string()
           .min(1)
@@ -192,7 +192,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
           .string()
           .optional()
           .describe("Retry-safe key: the same key returns the existing run instead of relaunching."),
-      },
+      }),
     },
     async (args) => {
       const req: RunRequest = {
@@ -222,7 +222,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Full state of a run started by run_model: status (queued | running | succeeded | failed | timeout | cancelled | orphaned), the extracted output once it succeeded, the error otherwise, and the per-attempt detail. " +
         "This is the polling half of wait:false. Handles are scope-local: a run_id only resolves in the scope that minted it.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: { run_id: z.string().min(1).describe("Handle returned by run_model.") },
+      inputSchema: z.object({ run_id: z.string().min(1).describe("Handle returned by run_model.") }),
     },
     ({ run_id }) => {
       const view = supervisor.getRun(run_id);
