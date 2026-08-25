@@ -10,12 +10,10 @@ import { dirname, join, resolve } from "node:path";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
 // the source tree, and install must work from any cwd.
+import AGENTS_TEMPLATE from "./templates/agents.md" with { type: "text" };
 import CLAUDE_CODE_TEMPLATE from "./templates/claude-code.md" with { type: "text" };
-import CODEX_TEMPLATE from "./templates/codex.md" with { type: "text" };
 import CORE_TEMPLATE from "./templates/core.md" with { type: "text" };
 import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
-import KIMI_TEMPLATE from "./templates/kimi.md" with { type: "text" };
-import OPENCODE_TEMPLATE from "./templates/opencode.md" with { type: "text" };
 
 /**
  * `baton install <host>` (PLAN.md §Installers): register the MCP server in the
@@ -98,19 +96,19 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
       mcpNote: `Codex applies a project's .codex/config.toml only to trusted projects: accept the trust prompt on first run in ${dir}, or add projects."${dir}".trust_level = "trusted" to ~/.codex/config.toml.`,
     }),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
-    template: CODEX_TEMPLATE,
+    template: AGENTS_TEMPLATE,
     restart: "Start a new codex session in that directory to pick both up.",
   },
   kimi: {
     register: (dir, command, args) => registerKimi(dir, command, args),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
-    template: KIMI_TEMPLATE,
+    template: AGENTS_TEMPLATE,
     restart: "MCP servers load at session start: start a new kimi session in that directory.",
   },
   opencode: {
     register: (dir, command, args) => mergeOpencodeJson(join(dir, "opencode.json"), command, args),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
-    template: OPENCODE_TEMPLATE,
+    template: AGENTS_TEMPLATE,
     restart: "Start a new opencode session in that directory to pick both up.",
   },
 };

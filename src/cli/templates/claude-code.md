@@ -5,7 +5,7 @@ description: Delegate a self-contained task to another model running in a local 
 
 ## Delegating with Baton
 
-`/baton` invokes this skill explicitly; otherwise use it whenever the description above fits the request. If the `baton` tools are not visible, this session started before Baton was registered — say so rather than shelling out to the agent CLIs by hand.
+`/baton` invokes this skill explicitly; otherwise use it whenever the description above fits the request. If the `baton` tools are not visible, this session started before Baton was registered. Say so rather than shelling out to the agent CLIs by hand.
 
 {core}
 
@@ -13,6 +13,6 @@ description: Delegate a self-contained task to another model running in a local 
 
 When you are driving subagents or a multi-stage workflow, the workers should delegate too:
 
-- Give each bulk stage — the mechanical implementation, the migration, the test sweep — to a cheap model through `run_model`, and keep Claude's context for the parts that need the conversation.
-- Route cross-model review through Baton as well: a worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
+- Give each bulk stage (the mechanical implementation, the migration, the test sweep) to a cheap model through `run_model`, and keep Claude's context for the parts that need the conversation.
+- Route cross-model review through Baton as well. A worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
 - Tell workers to grade what they actually used. A workflow that fires off a hundred delegations and grades none leaves routing exactly where it started.

@@ -1,0 +1,4 @@
+[mcp_servers.baton]
+command = "/Users/daniel/Work/model-router/dist/baton"
+args = ["mcp"]
+enabled = true

@@ -1,11 +1,7 @@
----
-name: baton
-description: Delegate a self-contained task to another model running in a local agent CLI (codex, kimi, claude-code, opencode, cursor-agent) through the Baton MCP server. Use when the user says "baton", names a model to hand work to ("ask kimi-k3", "have sol review this", "get grok's take"), wants a second opinion, a cross-model review or a blind A/B comparison, or when bulk, mechanical or long-running work would otherwise burn this session's context.
----
+<!-- baton:begin -->
+## Delegating through Baton
 
-## Delegating with Baton
-
-`/baton` invokes this skill explicitly; otherwise use it whenever the description above fits the request. If the `baton` tools are not visible, this session started before Baton was registered. Say so rather than shelling out to the agent CLIs by hand.
+This block is shared by every agent that reads AGENTS.md here (codex, kimi, opencode). It is always in context; the tools are not. If the `baton` tools are not visible in this session, Baton was registered after it started. Tell the user to start a new session, and never shell out to `claude`, `codex`, `kimi`, `cursor-agent` or `opencode` by hand as a substitute.
 
 Baton hands a self-contained task to a model running in another agent CLI on this machine, on that app's own subscription, with its own tools and a fresh context, and returns its final answer. The tools come from the MCP server `baton`: `list_models`, `run_model`, `get_run`, `report_result`, `run_duel`, `report_duel`.
 
@@ -44,13 +40,10 @@ These are the user's starting priors. `list_models` reports what the evidence sa
 - Grade it once you have used it: `report_result(run_id, grade, notes?)` on the 1-5 scale, scored on how useful the answer turned out to be. Not on how it read when it arrived, and not on the model's reputation. Those grades are the evidence `list_models` routes on; a run nobody grades teaches Baton nothing.
 - When two models are genuinely in contention, `run_duel([a, b], prompt)` runs both on the identical prompt and hands back answers labelled A and B with the models hidden. Judge on the answers alone, then `report_duel(duel_id, "A" | "B" | "tie")`, which reveals which was which. Both sides run in the same directory, so duels are for non-mutating work. Two agents editing one checkout is a race, not a comparison.
 
-### Orchestrating other agents
+### Two more things
 
-When you are driving subagents or a multi-stage workflow, the workers should delegate too:
-
-- Give each bulk stage (the mechanical implementation, the migration, the test sweep) to a cheap model through `run_model`, and keep Claude's context for the parts that need the conversation.
-- Route cross-model review through Baton as well. A worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
-- Tell workers to grade what they actually used. A workflow that fires off a hundred delegations and grades none leaves routing exactly where it started.
+- Send reviews out of the family, and delegate the volume. Whatever model you are, the review of what you wrote belongs on a strong model from a different family, and the mechanical half of your work belongs on a cheap one. Baton is also how you reach subscriptions this session does not have: `run_model` can put work on the user's Claude, codex or kimi quota regardless of which app you are running in.
+- You are often the callee. A prompt that arrives with no conversation behind it is a delegation: answer it standalone, in the shape it asked for, touch only what it asked for, and stop. As a callee under kimi or opencode you run at full autonomy with no readonly mode available.
 
 ### Grading what came back
 
@@ -80,3 +73,4 @@ Before there is local evidence, ratings are whatever the user already believes. 
 5. Seed weight is capped at the worth of roughly 5-10 observations on purpose: a wrong seed fades as real grades arrive instead of steering routing for months.
 
 Ask about preciousness in the same conversation: how freely each account may be spent. Set it from the shell, where the trusted config lives: `baton set preciousness:<app>:<instance> burn|conserve|emergency`.
+<!-- baton:end -->

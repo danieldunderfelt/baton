@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "baton": {
+      "type": "local",
+      "command": [
+        "/Users/daniel/Work/model-router/dist/baton",
+        "mcp"
+      ],
+      "enabled": true
+    }
+  }
+}

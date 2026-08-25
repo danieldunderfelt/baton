@@ -454,7 +454,7 @@ describe("install kimi", () => {
     };
     expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
     expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain(
-      "Baton — delegating to other models",
+      "Delegating through Baton",
     );
   });
 
