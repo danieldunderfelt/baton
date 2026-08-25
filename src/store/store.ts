@@ -142,6 +142,69 @@ const MIGRATIONS: string[] = [
   // scope (a CLI run + a callee's own MCP server), so orphan recovery must know
   // which process owns an in-flight attempt before declaring it abandoned.
   `ALTER TABLE attempts ADD COLUMN owner_pid INTEGER;`,
+  // v5 — phase 3: blind duels + decayed Bradley-Terry edge map, and the
+  // quarantine store for agentically discovered adapters (PLAN.md §Agentic
+  // discovery: approval precedes execution).
+  `
+  CREATE TABLE duels (
+    id          TEXT PRIMARY KEY,
+    category    TEXT NOT NULL DEFAULT '',
+    model_a     TEXT NOT NULL,
+    model_b     TEXT NOT NULL,
+    run_a       TEXT NOT NULL REFERENCES runs(id),
+    run_b       TEXT NOT NULL REFERENCES runs(id),
+    label_map   TEXT NOT NULL,
+    winner      TEXT CHECK (winner IN ('A','B','tie')),
+    created_at  TEXT NOT NULL,
+    reported_at TEXT
+  );
+
+  CREATE TABLE bt_edges (
+    model_a  TEXT NOT NULL,
+    model_b  TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    wins_a   REAL NOT NULL DEFAULT 0,
+    wins_b   REAL NOT NULL DEFAULT 0,
+    ties     REAL NOT NULL DEFAULT 0,
+    as_of    TEXT NOT NULL,
+    PRIMARY KEY (model_a, model_b, category),
+    CHECK (model_a < model_b)
+  );
+
+  CREATE TABLE discovered_adapters (
+    app            TEXT PRIMARY KEY,
+    spec           TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'quarantined'
+                   CHECK (status IN ('quarantined','approved','active','stale','rejected')),
+    submitted_at   TEXT NOT NULL,
+    reviewed_at    TEXT,
+    binary_version TEXT,
+    notes          TEXT
+  );
+  `,
+  // v6 — the duel rows outlive the runs they point at. The ring buffer evicts
+  // runs by age (PLAN.md §Evaluation), and a foreign key to runs(id) turned
+  // that eviction into "FOREIGN KEY constraint failed" inside openStore, i.e.
+  // every process in the scope failing to open the database. A duel whose runs
+  // are gone is void, not judgeable — which is what duelView already reports —
+  // so the reference is advisory and the constraint has to go.
+  `
+  CREATE TABLE duels_v6 (
+    id          TEXT PRIMARY KEY,
+    category    TEXT NOT NULL DEFAULT '',
+    model_a     TEXT NOT NULL,
+    model_b     TEXT NOT NULL,
+    run_a       TEXT NOT NULL,
+    run_b       TEXT NOT NULL,
+    label_map   TEXT NOT NULL,
+    winner      TEXT CHECK (winner IN ('A','B','tie')),
+    created_at  TEXT NOT NULL,
+    reported_at TEXT
+  );
+  INSERT INTO duels_v6 SELECT * FROM duels;
+  DROP TABLE duels;
+  ALTER TABLE duels_v6 RENAME TO duels;
+  `,
 ];
 
 /** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */

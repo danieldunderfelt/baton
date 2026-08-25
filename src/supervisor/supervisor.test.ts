@@ -1019,3 +1019,251 @@ describe("recoverOrphans", () => {
     expect(sup.getRun(view.runId)!.status).toBe("succeeded");
   }, 20_000);
 });
+
+describe("resumeRun", () => {
+  const SESSION = "sess-1";
+  /** First turn: answers, and reports the handle the app minted for it. */
+  const FIRST = `process.stdout.write(JSON.stringify({session_id:'${SESSION}',text:'first answer'}))`;
+  /** Resume turn: echoes the argv and the identity env it was handed. */
+  const RESUMED = `process.stdout.write(JSON.stringify({session_id:'${SESSION}',argv:process.argv.slice(1),account:process.env.FAKE_ACCOUNT ?? null}))`;
+
+  function resumableSpec(over: Partial<AdapterSpec> = {}): AdapterSpec {
+    return fakeSpec(["-e", FIRST], {
+      sessionRef: { kind: "json", path: "session_id" },
+      resume: { argv: ["-e", RESUMED, "{sessionRef}", "{slug}"] },
+      ...over,
+    });
+  }
+
+  function defineInstance(db: Database, name: string, env: Record<string, string>): void {
+    db.query("INSERT INTO instances (app, name, env, created_at) VALUES (?, ?, ?, ?)").run(
+      "fake",
+      name,
+      JSON.stringify(env),
+      nowIso(),
+    );
+  }
+
+  /**
+   * Session affinity's stand-in for the registry: `resolve` is what pool
+   * balancing would answer, `pinned` is the lookup a resume must use instead.
+   */
+  function affinityResolver(
+    balanced: Target,
+    pool: Target[],
+  ): TargetResolver & { balancedCalls: number } {
+    return {
+      balancedCalls: 0,
+      resolve(this: { balancedCalls: number }) {
+        this.balancedCalls += 1;
+        return balanced;
+      },
+      pinned(ref) {
+        const found = pool.find((t) => t.spec.app === ref.app && t.instance === ref.instance);
+        if (!found) throw new Error(`no target for ${ref.app}:${ref.instance}`);
+        return found;
+      },
+    };
+  }
+
+  function affinitySupervisor(db: Database, resolver: TargetResolver): Supervisor {
+    return new Supervisor({
+      env: { ...process.env },
+      hostCwd: import.meta.dir,
+      resolver,
+      pollMs: 25,
+      db,
+    });
+  }
+
+  /** A run on `instance` that finished and left a session handle behind. */
+  async function originRun(
+    db: Database,
+    instance: string,
+    spec = resumableSpec(),
+  ): Promise<{ sup: Supervisor; runId: string }> {
+    const t = target(spec, instance);
+    const sup = affinitySupervisor(db, affinityResolver(t, [t]));
+    const { view, settled } = await sup.startRun({
+      model: "fake-model",
+      prompt: "first prompt",
+      category: "impl",
+    });
+    await settled;
+    return { sup, runId: view.runId };
+  }
+
+  test("pins the original instance even when the pool would pick another", async () => {
+    const db = newDb();
+    defineInstance(db, "acct-a", { FAKE_ACCOUNT: "a" });
+    defineInstance(db, "acct-b", { FAKE_ACCOUNT: "b" });
+    const { runId } = await originRun(db, "acct-a");
+
+    const spec = resumableSpec();
+    const pinned = target(spec, "acct-a");
+    const roomier = target(spec, "acct-b");
+    const resolver = affinityResolver(roomier, [pinned, roomier]);
+    const sup = affinitySupervisor(db, resolver);
+
+    const { view, settled } = await sup.resumeRun({ runId, prompt: "second prompt" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("succeeded");
+    expect(final.instance).toBe("acct-a");
+    expect(final.attempts[0]!.target).toBe("fake:acct-a/fake/slug@a1+full");
+    // Balancing was never consulted: affinity is a lookup, not a preference.
+    expect(resolver.balancedCalls).toBe(0);
+    const echoed = JSON.parse(final.output!);
+    // The resume argv ran, with the handle substituted as its own element, and
+    // the callee saw acct-a's overlay — the config dir holding the session.
+    expect(echoed.argv).toEqual([SESSION, "fake/slug"]);
+    expect(echoed.account).toBe("a");
+  }, 30_000);
+
+  test("the resumed run is a new run that names the one it continues", async () => {
+    const db = newDb();
+    const { sup, runId } = await originRun(db, "default");
+
+    const { view, settled } = await sup.resumeRun({ runId, prompt: "second prompt" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.runId).not.toBe(runId);
+    expect(final.resumedFrom).toBe(runId);
+    expect(final.model).toBe("fake-model");
+    expect(final.app).toBe("fake");
+    expect(final.slug).toBe("fake/slug");
+    expect(final.instance).toBe("default");
+    expect(final.attempts).toHaveLength(1);
+    // The original is untouched and still holds its own answer.
+    const origin = sup.getRun(runId)!;
+    expect(origin.resumedFrom).toBeUndefined();
+    expect(origin.status).toBe("succeeded");
+    expect(origin.output).toContain("first answer");
+    const row = db
+      .query<{ category: string | null; prompt: string; options: string }, [string]>(
+        "SELECT category, prompt, options FROM runs WHERE id = ?",
+      )
+      .get(view.runId)!;
+    expect(row.prompt).toBe("second prompt");
+    expect(row.category).toBe("impl");
+    expect(JSON.parse(row.options).resumed_from).toBe(runId);
+  }, 30_000);
+
+  test("the session handle is visible on both runs' attempts", async () => {
+    const db = newDb();
+    const { sup, runId } = await originRun(db, "default");
+    expect(sup.getRun(runId)!.attempts[0]!.sessionRef).toBe(SESSION);
+
+    const { view, settled } = await sup.resumeRun({ runId, prompt: "second prompt" });
+    await settled;
+    expect(sup.getRun(view.runId)!.attempts[0]!.sessionRef).toBe(SESSION);
+  }, 30_000);
+
+  test("refuses a run whose last attempt reported no session handle", async () => {
+    const db = newDb();
+    // Same app, but nothing to extract a handle from: the answer is plain text.
+    const spec = resumableSpec({ invoke: fakeSpec(["-e", "process.stdout.write('plain')"]).invoke });
+    const { sup, runId } = await originRun(db, "default", spec);
+
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /reported no session handle/,
+    );
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(1);
+  }, 30_000);
+
+  test("refuses an adapter that declares no resume invocation", async () => {
+    const db = newDb();
+    const spec = resumableSpec();
+    delete spec.resume;
+    const { sup, runId } = await originRun(db, "default", spec);
+
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /declares no non-interactive resume/,
+    );
+  }, 30_000);
+
+  test("refuses when the instance holding the session is gone", async () => {
+    const db = newDb();
+    defineInstance(db, "acct-a", { FAKE_ACCOUNT: "a" });
+    const { sup, runId } = await originRun(db, "acct-a");
+    db.query("DELETE FROM instances WHERE app = ? AND name = ?").run("fake", "acct-a");
+
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /instance 'fake:acct-a' is no longer defined/,
+    );
+    // Nothing was launched: the refusal happens before a run row exists.
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(1);
+  }, 30_000);
+
+  test("refuses a run that is still in flight", async () => {
+    const db = newDb();
+    const { sup, runId } = await originRun(db, "default");
+    db.query("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+
+    // The callee still owns that session on disk; a second turn would race it.
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(/still running/);
+  }, 30_000);
+
+  test("refuses an unknown run", async () => {
+    const db = newDb();
+    const t = target(resumableSpec());
+    const sup = affinitySupervisor(db, affinityResolver(t, [t]));
+    await expect(sup.resumeRun({ runId: "run_nope", prompt: "hi" })).rejects.toThrow(
+      /Unknown run 'run_nope'/,
+    );
+  });
+
+  test("an admission refusal ends a resumed run instead of moving it", async () => {
+    const db = newDb();
+    const REFUSAL = "usage limit reached";
+    defineInstance(db, "acct-a", { FAKE_ACCOUNT: "a" });
+    defineInstance(db, "acct-b", { FAKE_ACCOUNT: "b" });
+    const { runId } = await originRun(
+      db,
+      "acct-a",
+      resumableSpec({ admissionFailurePatterns: [REFUSAL] }),
+    );
+
+    const refusing = target(
+      resumableSpec({
+        admissionFailurePatterns: [REFUSAL],
+        resume: {
+          argv: ["-e", `process.stderr.write('${REFUSAL}\\n');process.exit(1)`, "{sessionRef}"],
+        },
+      }),
+      "acct-a",
+    );
+    const roomier = target(resumableSpec({ admissionFailurePatterns: [REFUSAL] }), "acct-b");
+    const sup = affinitySupervisor(db, affinityResolver(roomier, [refusing, roomier]));
+
+    const { view, settled } = await sup.resumeRun({ runId, prompt: "again" });
+    await settled;
+
+    const final = sup.getRun(view.runId)!;
+    expect(final.status).toBe("failed");
+    expect(final.attempts).toHaveLength(1);
+    expect(final.instance).toBe("acct-a");
+    expect(final.error).toContain("stays on the instance holding its session");
+  }, 30_000);
+
+  test("the concurrency cap counts a resume like any other launch", async () => {
+    const db = newDb();
+    const { sup, runId } = await originRun(db, "default");
+    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
+    // Someone else's attempt is already holding the scope's only slot.
+    const otherRun = newId("run");
+    db.query(
+      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+       VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', 'running', ?, ?)`,
+    ).run(otherRun, nowIso(), nowIso());
+    db.query(
+      "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'running')",
+    ).run(newId("att"), otherRun);
+
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /concurrency cap/,
+    );
+  }, 30_000);
+});

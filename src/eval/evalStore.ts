@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 
+import { AUTONOMY_ORDER, type Autonomy } from "../adapters/types.ts";
 import { nowIso, withBusyRetry } from "../store/store.ts";
 import {
   addGradeEvent,
@@ -431,9 +432,29 @@ function hasEvidence(db: Database): boolean {
   );
 }
 
+/**
+ * Splits an execution-target fingerprint into the route the registry minted
+ * (`<app>:<instance>/<slug>@a<adapterVersion>+v<appVersion>`) and the autonomy
+ * level the supervisor appended. A tail that is not an autonomy level is part
+ * of the route: fingerprints written before a component existed keep their old
+ * shape and simply age out by decay, so this must never mistake a version
+ * segment for an authority level.
+ */
+export function splitTarget(target: string): { route: string; autonomy: Autonomy | "" } {
+  const plus = target.lastIndexOf("+");
+  const tail = plus === -1 ? "" : target.slice(plus + 1);
+  return (AUTONOMY_ORDER as string[]).includes(tail)
+    ? { route: target.slice(0, plus), autonomy: tail as Autonomy }
+    : { route: target, autonomy: "" };
+}
+
 /** Observed evidence for one execution target, decayed to the read time. */
 export interface TargetRating {
   target: string;
+  /** `target` without the autonomy segment: the route evidence belongs to. */
+  route: string;
+  /** Autonomy the evidence was produced at; "" when the fingerprint predates it. */
+  autonomy: Autonomy | "";
   model: string;
   category: string;
   /** Decayed mean, or null with no evidence left. */
@@ -449,6 +470,8 @@ export interface TargetRating {
  * is the level ratings actually attach to (PLAN.md §Registry: execution
  * target), and what lets selection prefer the harness or instance that has been
  * answering well rather than treating every route to a model as identical.
+ * `route`/`autonomy` are the split fingerprint, so a lens can ask for evidence
+ * at the authority level a candidate would actually run at.
  */
 export function targetRatings(db: Database, at = nowIso()): TargetRating[] {
   const hl = halfLifeMsFor(db);
@@ -462,6 +485,7 @@ export function targetRatings(db: Database, at = nowIso()): TargetRating[] {
       const acc = decayAccumulator(fromRow(row), at, hl);
       return {
         target: acc.target,
+        ...splitTarget(acc.target),
         model: acc.model,
         category: acc.category,
         observed: mean(acc),
@@ -644,8 +668,12 @@ function writeSetting(db: Database, key: string, value: string): void {
   ).run(key, value);
 }
 
-/** Monotonic, in the same transaction as the outcome it publishes. */
-function bumpRevision(db: Database): number {
+/**
+ * Monotonic, in the same transaction as the outcome it publishes. Exported so
+ * duels bump the same counter through the same three lines rather than a
+ * second copy of them.
+ */
+export function bumpRevision(db: Database): number {
   const next = revision(db) + 1;
   writeSetting(db, SETTING_RATINGS_REVISION, String(next));
   return next;

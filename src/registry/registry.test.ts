@@ -2,11 +2,12 @@ import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { builtinAdapters } from "../adapters/builtin/index.ts";
 import type { Autonomy } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths } from "../config/paths.ts";
+import { submitSpec } from "../discovery/discovery.ts";
 import { recordGrade, seedPriors } from "../eval/evalStore.ts";
 import { preciousnessKey, setPool } from "../quota/pools.ts";
 import { recordAdmissionFailure, recordRun } from "../quota/quota.ts";
@@ -43,11 +44,21 @@ function withPath<T>(path: string, fn: () => T): T {
 
 const NO_PATH = "/nonexistent-baton-test";
 
-/** A PATH holding exactly one (fake, never executed) binary — hermetic availability. */
-function withFakeBinary<T>(name: string, fn: () => T): T {
+/**
+ * A PATH holding exactly one fake binary — hermetic availability. The script
+ * answers `--version` because the app version is part of the execution-target
+ * fingerprint; nothing else about it is ever executed.
+ */
+const FAKE_VERSION = "9.9.9";
+
+function fakeBinary(name: string, version = FAKE_VERSION): string {
   const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
-  writeFileSync(join(dir, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  return withPath(dir, fn);
+  writeFileSync(join(dir, name), `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
+  return join(dir, name);
+}
+
+function withFakeBinary<T>(name: string, fn: () => T): T {
+  return withPath(dirname(fakeBinary(name)), fn);
 }
 
 // codex and kimi are installed on the dev machine; skip the availability-true
@@ -79,8 +90,8 @@ function setting(db: Database, key: string, value: string): void {
 describe("detectApps", () => {
   test("reports every builtin app, sorted, without throwing", () => {
     const apps = detectApps({ probeVersion: false });
-    expect(apps.map((a) => a.app)).toEqual(["claude-code", "codex", "kimi", "opencode"]);
-    expect(apps.length).toBe(builtinAdapters.length);
+    expect(apps.map((a) => a.app)).toEqual([...builtinAdapters.map((a) => a.app)].sort());
+    expect(apps).toContainEqual(expect.objectContaining({ app: "codex" }));
   });
 
   test("missing binaries yield null paths, not errors", () => {
@@ -124,13 +135,110 @@ describe("resolveTargets", () => {
   });
 });
 
+/**
+ * Discovered adapters are the same format as built-ins, but only an ACTIVE one
+ * (reviewed, approved, canaried) is merged into the registry — PLAN.md
+ * §Agentic discovery: approval precedes execution, and routing IS execution.
+ */
+describe("discovered adapters in the registry", () => {
+  const DISCOVERED_STATUSES = ["quarantined", "approved", "stale", "rejected"] as const;
+
+  /** Submits a spec for `model`, and forces it to `status` as review would. */
+  function discovered(
+    db: Database,
+    opts: { model: string; status?: string; binary?: string; app?: string } = { model: "demo-1" },
+  ): { app: string; binary: string } {
+    const app = opts.app ?? "demo";
+    const binary = opts.binary ?? fakeBinary(app);
+    const stored = submitSpec(db, {
+      app,
+      adapterVersion: 3,
+      binary,
+      models: [{ model: opts.model, slug: "demo/one" }],
+      invoke: {
+        argv: ["run", "--model", "{slug}"],
+        promptVia: "stdin",
+        extract: { kind: "text" },
+      },
+      autonomyFlags: { full: ["--dangerously"] },
+      defaultAutonomy: "full",
+      defaultTimeoutMs: 60_000,
+      admissionFailurePatterns: ["rate limit"],
+    });
+    expect(stored).toMatchObject({ ok: true });
+    if (opts.status && opts.status !== "quarantined") {
+      db.query("UPDATE discovered_adapters SET status = ? WHERE app = ?").run(opts.status, app);
+    }
+    return { app, binary };
+  }
+
+  test("an active adapter routes like a builtin, from its reviewed absolute path", () => {
+    const db = scopeStore("discovered-active");
+    const { binary } = discovered(db, { model: "demo-1", status: "active" });
+
+    // Empty PATH: nothing here was found by name — the approved path is spawned.
+    const target = withPath(NO_PATH, () => selectTarget(db, "demo-1"));
+    expect(target.spec.app).toBe("demo");
+    expect(target.binaryPath).toBe(binary);
+    expect(target.instance).toBe("default");
+    expect(target.targetFingerprint).toBe(`demo:default/demo/one@a3+v${FAKE_VERSION}`);
+    expect(resolveTargets("demo-1", db).map((r) => r.slug)).toEqual(["demo/one"]);
+    expect(knownModels(db)).toContain("demo-1");
+  });
+
+  test("a discovered route carries a model whose builtin is unavailable", () => {
+    const db = scopeStore("discovered-failover");
+    discovered(db, { model: "kimi-k3", status: "active" });
+    // kimi's own binary is off PATH; the discovered app still reaches the model.
+    expect(withPath(NO_PATH, () => selectTarget(db, "kimi-k3")).spec.app).toBe("demo");
+  });
+
+  test("nothing but an active adapter routes — that is the quarantine gate", () => {
+    for (const status of DISCOVERED_STATUSES) {
+      const db = scopeStore(`discovered-${status}`);
+      discovered(db, { model: "demo-1", status });
+      expect(() => selectTarget(db, "demo-1")).toThrow(/Unknown model 'demo-1'/);
+      expect(() => resolveTargets("demo-1", db)).toThrow(/Unknown model 'demo-1'/);
+      expect(knownModels(db)).not.toContain("demo-1");
+    }
+  });
+
+  test("listModels shows a quarantined adapter as degraded, never as available", () => {
+    const db = scopeStore("discovered-listed");
+    discovered(db, { model: "demo-1" });
+    const row = listModels(db).find((r) => r.model === "demo-1")!;
+    expect(row.available).toBe(false);
+    expect(row.degradedReason).toContain("quarantined — awaiting review");
+    expect(row.degradedReason).toContain("baton adapters review demo");
+
+    // A rejected adapter is a decision, not a hint: it drops out of the listing.
+    db.query("UPDATE discovered_adapters SET status = 'rejected' WHERE app = 'demo'").run();
+    expect(listModels(db).find((r) => r.model === "demo-1")).toBeUndefined();
+  });
+
+  test("an active adapter is listed available, with its own pool suppressed", () => {
+    const db = scopeStore("discovered-listed-active");
+    discovered(db, { model: "demo-1", status: "active" });
+    const row = listModels(db).find((r) => r.model === "demo-1")!;
+    expect(row).toMatchObject({ app: "demo", available: true, instance: "default" });
+    expect(row.degradedReason).toBeUndefined();
+    // No identityEnv: every "instance" would be the same account, so no pool.
+    db.query("INSERT INTO pools (app, members, created_at) VALUES ('demo', ?, ?)").run(
+      JSON.stringify(["default", "other"]),
+      nowIso(),
+    );
+    expect(listModels(db).find((r) => r.model === "demo-1")!.pool).toBeUndefined();
+    expect(selectTarget(db, "demo-1").considered).toHaveLength(1);
+  });
+});
+
 describe("selectTarget", () => {
   test("policy v2 picks an available route on the default instance", () => {
     const db = scopeStore("select");
     const target = withFakeBinary("codex", () => selectTarget(db, "gpt-5.6-sol"));
     expect(target.spec.app).toBe("codex");
     expect(target.instance).toBe("default");
-    expect(target.targetFingerprint).toBe("codex:default/gpt-5.6-sol@a1");
+    expect(target.targetFingerprint).toBe(`codex:default/gpt-5.6-sol@a1+v${FAKE_VERSION}`);
     // No pool: the sole candidate is the inherited environment, at full headroom.
     expect(target.considered).toEqual([
       {
@@ -205,7 +313,7 @@ describe("selectTarget", () => {
       selectTarget(db, "kimi-k3", { instance: "personal-2" }),
     );
     expect(target.instance).toBe("personal-2");
-    expect(target.targetFingerprint).toBe("kimi:personal-2/kimi-code/k3@a1");
+    expect(target.targetFingerprint).toBe(`kimi:personal-2/kimi-code/k3@a1+v${FAKE_VERSION}`);
   });
 
   test("instances are scope-local: another scope's DB does not see them", () => {
@@ -228,6 +336,24 @@ describe("selectTarget", () => {
   test("unknown model errors before anything else", () => {
     const db = scopeStore("unknown");
     expect(() => selectTarget(db, "nope")).toThrow(/Unknown model 'nope'/);
+  });
+
+  test("the fingerprint carries the app version, as one sanitised segment", () => {
+    const db = scopeStore("fingerprint-version");
+    const bin = fakeBinary("codex", "codex-cli 0.42.0");
+    const target = withPath(dirname(bin), () => selectTarget(db, "gpt-5.6-sol"));
+    // The same adapter against another build of the app is not interchangeable
+    // evidence, so the version is part of the execution-target identity — and
+    // it may not smuggle a '+' or a space into the fingerprint's grammar.
+    expect(target.targetFingerprint).toBe("codex:default/gpt-5.6-sol@a1+vcodex-cli-0.42.0");
+  });
+
+  test("an app that will not answer --version is 'unknown', not a failure", () => {
+    const db = scopeStore("fingerprint-unversioned");
+    const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
+    writeFileSync(join(dir, "codex"), "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+    const target = withPath(dir, () => selectTarget(db, "gpt-5.6-sol"));
+    expect(target.targetFingerprint).toBe("codex:default/gpt-5.6-sol@a1+vunknown");
   });
 });
 
@@ -380,7 +506,7 @@ describe("selectTarget: pool ranking (policy v2)", () => {
     recordGrade(db, {
       runId,
       grade,
-      target: `kimi:${instance}/kimi-code/k3@a1+${opts.autonomy ?? "full"}`,
+      target: `kimi:${instance}/kimi-code/k3@a1+v${FAKE_VERSION}+${opts.autonomy ?? "full"}`,
       model: "kimi-k3",
       ...(opts.category === undefined ? {} : { category: opts.category }),
       runAt: NOW,
@@ -407,14 +533,34 @@ describe("selectTarget: pool ranking (policy v2)", () => {
     expect(target.considered!.every((c) => c.quota === 1)).toBe(true);
   });
 
-  test("a target's evidence counts whatever autonomy it ran at", () => {
+  test("thin same-autonomy evidence falls back to the level-pooled rating", () => {
     const db = scopeStore("pool-target-autonomy");
     pooled(db, ["a", "b"]);
     graded(db, "a", 1, { autonomy: "readonly" });
     graded(db, "b", 5, { autonomy: "full" });
-    // Autonomy resolves after selection, so evidence pools across the levels.
+    // One graded run at 'full' is thinner than the prior it would be shrunk
+    // against, so the level-pooled evidence — which includes it — decides.
     expect(pick(db).instance).toBe("b");
   });
+
+  test("the lens reads evidence at the autonomy the run would actually use", () => {
+    const db = scopeStore("pool-autonomy-lens");
+    pooled(db, ["a", "b"]);
+    // Each member is good at one authority level and bad at the other, with
+    // enough runs at each that the same-level evidence stands on its own.
+    for (let i = 0; i < 6; i++) {
+      graded(db, "a", 5, { autonomy: "full" });
+      graded(db, "b", 1, { autonomy: "full" });
+      graded(db, "a", 1, { autonomy: "readonly" });
+      graded(db, "b", 5, { autonomy: "readonly" });
+    }
+    // Pooled, the two are identical; only the autonomy lens can tell them apart.
+    expect(pick(db, { autonomy: "full" }).instance).toBe("a");
+    expect(pick(db, { autonomy: "readonly" }).instance).toBe("b");
+    // The resolved default is 'full' for kimi: no explicit request, same answer.
+    expect(pick(db).instance).toBe("a");
+  });
+
 
   test("per-category evidence steers only the category it was graded in", () => {
     const db = scopeStore("pool-category-rating");

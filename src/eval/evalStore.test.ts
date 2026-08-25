@@ -22,6 +22,7 @@ import {
   seedPriors,
   setActiveProfile,
   setRatingSetting,
+  splitTarget,
   targetRatings,
 } from "./evalStore.ts";
 import {
@@ -703,6 +704,37 @@ describe("targetRatings", () => {
       ["", 2],
       ["review", 5],
     ]);
+  });
+
+  test("splits each fingerprint into the route and the autonomy it ran at", () => {
+    const db = scopeStore("target-ratings-autonomy");
+    grade(db, { grade: 5, target: "kimi:default/kimi-code/k3@a1+v1.2.3+readonly" });
+    expect(targetRatings(db, at(0))[0]).toMatchObject({
+      route: "kimi:default/kimi-code/k3@a1+v1.2.3",
+      autonomy: "readonly",
+    });
+  });
+});
+
+describe("splitTarget", () => {
+  test("separates the autonomy segment from everything the registry minted", () => {
+    expect(splitTarget("kimi:a/k3@a1+v1.2.3+full")).toEqual({
+      route: "kimi:a/k3@a1+v1.2.3",
+      autonomy: "full",
+    });
+    // Fingerprints written before the app version existed keep their old shape;
+    // they age out by decay rather than being migrated.
+    expect(splitTarget(KIMI)).toEqual({ route: "kimi:default/kimi-code/k3@a1", autonomy: "full" });
+  });
+
+  test("a tail that is not an authority level stays part of the route", () => {
+    // Otherwise a version segment would be read as an autonomy level and the
+    // lens would compare evidence against a level nothing ever ran at.
+    expect(splitTarget("kimi:a/k3@a1+v1.2.3")).toEqual({
+      route: "kimi:a/k3@a1+v1.2.3",
+      autonomy: "",
+    });
+    expect(splitTarget("kimi:a/k3@a1")).toEqual({ route: "kimi:a/k3@a1", autonomy: "" });
   });
 });
 

@@ -1,7 +1,13 @@
 import type { Database } from "bun:sqlite";
 
 import { classifyFailure, executeAdapter } from "../adapters/executor.ts";
-import type { Autonomy, ExecRequest, ExecResult } from "../adapters/types.ts";
+import {
+  AUTONOMY_ORDER,
+  type AdapterSpec,
+  type Autonomy,
+  type ExecRequest,
+  type ExecResult,
+} from "../adapters/types.ts";
 import { recordReliability } from "../eval/evalStore.ts";
 import {
   clearCooldown,
@@ -16,6 +22,7 @@ import {
   ceilingFor,
   clampAutonomy,
   selectTarget,
+  targetFor,
   type SelectOptions,
   type Target,
 } from "../registry/registry.ts";
@@ -24,9 +31,11 @@ import {
   DEFAULT_MAX_CONCURRENT,
   DEFAULT_MAX_HOPS,
   HOPS_ENV,
+  RESUMED_FROM,
   SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type AttemptView,
+  type ResumeRequest,
   type RunOptions,
   type RunRequest,
   type RunStatus,
@@ -53,6 +62,12 @@ const MAX_RAW_TAIL_CHARS = 32_000;
  * Long enough that another process launching a run right now is never swept.
  */
 const QUEUED_GRACE_MS = 60_000;
+/**
+ * Session handles come out of a callee's stdout, i.e. untrusted content. They
+ * are passed as a single argv element (never a shell string), so the only real
+ * hazard left is a handle that reads as a flag — which this shape forbids.
+ */
+const SESSION_REF = /^[A-Za-z0-9][\w./-]*$/;
 
 const TERMINAL: ReadonlySet<RunStatus> = new Set<RunStatus>([
   "succeeded",
@@ -71,6 +86,21 @@ export type AdapterExec = (req: ExecRequest, hooks?: ExecHooks) => Promise<ExecR
 
 export interface TargetResolver {
   resolve(model: string, opts: SelectOptions): Target;
+  /**
+   * The exact target a resumed run must land on — a lookup, never a selection:
+   * the session lives in one instance's config dir, so affinity outranks pool
+   * balancing entirely (PLAN.md §Session affinity). Optional so existing
+   * resolvers keep working; the registry's `targetFor` lookup is the default.
+   */
+  pinned?(ref: PinnedRef): Target;
+}
+
+/** Everything the original run recorded about where it ran. */
+export interface PinnedRef {
+  model: string;
+  app: string;
+  slug: string;
+  instance: string;
 }
 
 export interface SupervisorInit {
@@ -112,6 +142,14 @@ interface AttemptCtx {
   timeoutMs: number;
   /** `<app>:<instance>` keys this run has used; the cap on a failover chain. */
   tried: string[];
+  /** Set on a resumed run: the handle the adapter's resume argv continues. */
+  resumeRef?: string;
+  /**
+   * Instance overlay resolved once, up front. A resume looks it up strictly
+   * (the instance must still be defined), so it must not be re-read loosely
+   * on the way to the executor.
+   */
+  overlay?: Record<string, string>;
 }
 
 export class Supervisor {
@@ -142,13 +180,7 @@ export class Supervisor {
    * (waitForRun) so the MCP surface stays handle-based.
    */
   async startRun(req: RunRequest): Promise<{ view: RunView; settled: Promise<void> }> {
-    const depth = this.hopDepth();
-    const maxHops = this.maxHops();
-    if (depth >= maxHops) {
-      throw new Error(
-        `Refusing to delegate: this process is already ${depth} delegation hop(s) deep (${HOPS_ENV}=${depth}) and the '${SETTING_MAX_HOPS}' setting is ${maxHops}. Raise it with 'baton set ${SETTING_MAX_HOPS} <n>' if this chain is intended.`,
-      );
-    }
+    const depth = this.guardHops();
 
     const key = req.idempotencyKey;
     if (key !== undefined && key.length === 0) {
@@ -169,6 +201,9 @@ export class Supervisor {
       // Ratings are per (target, category), so ranking is judged on the kind of
       // work this run actually is.
       ...(req.category ? { category: req.category } : {}),
+      // ...and per autonomy, so candidates are rated at the authority level
+      // this run will actually execute at, not the adapter's default.
+      ...(req.options?.autonomy ? { autonomy: req.options.autonomy } : {}),
     });
     const { autonomy, timeoutMs, fingerprint } = this.resolve(target, req.options);
     const runId = newId("run");
@@ -177,15 +212,19 @@ export class Supervisor {
     try {
       withBusyRetry(() =>
         this.insert({
-          req,
           runId,
           attemptId,
-          target,
           fingerprint,
-          autonomy,
-          timeoutMs,
+          model: req.model,
+          app: target.spec.app,
+          slug: target.slug,
+          instance: target.instance,
+          prompt: req.prompt,
           cwd,
+          ...(req.category ? { category: req.category } : {}),
+          ...(key !== undefined ? { idempotencyKey: key } : {}),
           payloadHash,
+          options: { autonomy, timeoutMs },
         }),
       );
     } catch (err) {
@@ -218,16 +257,103 @@ export class Supervisor {
     return { view: this.getRun(runId)!, settled };
   }
 
+  /**
+   * Continues a run's session on the SAME app and instance it ran on: session
+   * state lives in that instance's config dir, so affinity bypasses pool
+   * balancing entirely (PLAN.md §Session affinity). The original run is left
+   * untouched; this is a new run that records which one it continues, so the
+   * caller's decision to resume is visible in the evidence.
+   */
+  async resumeRun(req: ResumeRequest): Promise<{ view: RunView; settled: Promise<void> }> {
+    const depth = this.guardHops();
+    const origin = this.db
+      .query<OriginRow, [string]>(
+        "SELECT status, model, app, slug, instance, cwd, category, options FROM runs WHERE id = ?",
+      )
+      .get(req.runId);
+    if (!origin) throw new Error(`Unknown run '${req.runId}'.`);
+    if (!TERMINAL.has(origin.status)) {
+      // The callee still owns that session on disk; a second turn against it
+      // would race the process writing it.
+      throw new Error(
+        `Cannot resume run '${req.runId}': it is still ${origin.status}. Wait for it to finish (or cancel it) before continuing its session.`,
+      );
+    }
+
+    const sessionRef = this.sessionRefOf(req.runId);
+    const target = this.pin({
+      model: origin.model,
+      app: origin.app,
+      slug: origin.slug,
+      instance: origin.instance,
+    });
+    if (!target.spec.resume) {
+      throw new Error(
+        `Cannot resume run '${req.runId}': the '${origin.app}' adapter declares no non-interactive resume, so its session can only be continued by hand. Start a new run with the context it needs.`,
+      );
+    }
+    // Fail closed: without the definition the overlay is gone, and running
+    // without it would hand the session to whatever identity the bare
+    // environment supplies — a different account than the one holding it.
+    const overlay = this.overlay(origin.app, origin.instance, { strict: true });
+    const options = { ...inheritedOptions(origin.options), ...req.options };
+    const { autonomy, timeoutMs, fingerprint } = this.resolve(target, options);
+    const runId = newId("run");
+    const attemptId = newId("att");
+
+    withBusyRetry(() =>
+      this.insert({
+        runId,
+        attemptId,
+        fingerprint,
+        model: origin.model,
+        app: origin.app,
+        slug: origin.slug,
+        instance: origin.instance,
+        prompt: req.prompt,
+        cwd: origin.cwd,
+        ...(origin.category ? { category: origin.category } : {}),
+        // A resume is a fresh request by definition; nothing may dedup onto it.
+        payloadHash: null,
+        options: { autonomy, timeoutMs, [RESUMED_FROM]: req.runId },
+      }),
+    );
+
+    this.markRunning(runId, attemptId);
+    const settled = this.execute({
+      runId,
+      attemptId,
+      seq: 1,
+      model: origin.model,
+      prompt: req.prompt,
+      cwd: origin.cwd,
+      depth,
+      options,
+      ...(origin.category ? { category: origin.category } : {}),
+      // The pinned instance is also the only one: a resumed run never fails over.
+      requestedInstance: origin.instance,
+      target,
+      fingerprint,
+      autonomy,
+      timeoutMs,
+      tried: [candidateKey(origin.app, origin.instance)],
+      resumeRef: sessionRef,
+      overlay,
+    });
+
+    return { view: this.getRun(runId)!, settled };
+  }
+
   getRun(runId: string): RunView | undefined {
     const run = this.db
       .query<RunRow, [string]>(
-        "SELECT id, status, model, app, slug, instance, created_at, updated_at FROM runs WHERE id = ?",
+        "SELECT id, status, model, app, slug, instance, options, created_at, updated_at FROM runs WHERE id = ?",
       )
       .get(runId);
     if (!run) return undefined;
     const attempts = this.db
       .query<AttemptRow, [string]>(
-        "SELECT id, seq, target, status, exit_code, output, error, started_at, finished_at FROM attempts WHERE run_id = ? ORDER BY seq",
+        "SELECT id, seq, target, status, exit_code, output, error, session_ref, started_at, finished_at FROM attempts WHERE run_id = ? ORDER BY seq",
       )
       .all(runId);
     return toView(run, attempts);
@@ -344,14 +470,17 @@ export class Supervisor {
     try {
       return await this.exec(
         {
-          spec: ctx.target.spec,
+          spec:
+            ctx.resumeRef === undefined
+              ? ctx.target.spec
+              : resumeSpec(ctx.target.spec, ctx.resumeRef),
           // The registry already verified this path; spawning the bare name
           // would let an instance's PATH overlay swap the executable.
           binaryPath: ctx.target.binaryPath,
           slug: ctx.target.slug,
           prompt: ctx.prompt,
           cwd: ctx.cwd,
-          env: this.calleeEnv(ctx.target, ctx.depth),
+          env: this.calleeEnv(ctx),
           autonomy: ctx.autonomy,
           timeoutMs: ctx.timeoutMs,
         },
@@ -424,7 +553,11 @@ export class Supervisor {
     this.observe(ctx, res, { status, cancelled, refused, quotaEventId });
 
     const next = refused ? this.nextCandidate(ctx) : undefined;
-    const error = failureText(res, { refused, failedOver: next !== undefined });
+    const error = failureText(res, {
+      refused,
+      failedOver: next !== undefined,
+      resumed: ctx.resumeRef !== undefined,
+    });
     try {
       return this.commit(ctx, res, { status, error, next });
     } catch {
@@ -471,6 +604,9 @@ export class Supervisor {
 
   /** The next pool candidate for a refused attempt, or undefined when spent. */
   private nextCandidate(ctx: AttemptCtx): AttemptCtx | undefined {
+    // A resumed run has exactly one home: the session it continues lives in
+    // that instance's config dir, so there is nowhere to fail over to.
+    if (ctx.resumeRef !== undefined) return undefined;
     let target: Target;
     try {
       target = this.resolver.resolve(ctx.model, {
@@ -478,6 +614,7 @@ export class Supervisor {
         // already in `tried`, so selection finds nothing and the run fails.
         ...(ctx.requestedInstance ? { instance: ctx.requestedInstance } : {}),
         ...(ctx.category ? { category: ctx.category } : {}),
+        ...(ctx.options?.autonomy ? { autonomy: ctx.options.autonomy } : {}),
         exclude: ctx.tried,
       });
     } catch {
@@ -585,31 +722,47 @@ export class Supervisor {
    * Inherited environment + the instance's overlay + the incremented hop count.
    * Nothing is scrubbed: Baton is not more special than a shell (PLAN.md §Identity).
    */
-  private calleeEnv(target: Target, depth: number): Record<string, string | undefined> {
+  private calleeEnv(ctx: AttemptCtx): Record<string, string | undefined> {
     return {
       ...this.env,
-      ...this.overlay(target.spec.app, target.instance),
-      [HOPS_ENV]: String(depth + 1),
+      ...(ctx.overlay ?? this.overlay(ctx.target.spec.app, ctx.target.instance)),
+      [HOPS_ENV]: String(ctx.depth + 1),
     };
   }
 
-  private overlay(app: string, instance: string): Record<string, string> {
+  /**
+   * An instance's env overlay. `strict` is for session affinity: a resume that
+   * cannot find the definition must fail rather than run somewhere else, while
+   * a fresh run's selection already vetted the instance and only reads it here.
+   */
+  private overlay(
+    app: string,
+    instance: string,
+    opts: { strict?: boolean } = {},
+  ): Record<string, string> {
     if (instance === DEFAULT_INSTANCE) return {};
     const row = this.db
       .query<{ env: string }, [string, string]>(
         "SELECT env FROM instances WHERE app = ? AND name = ?",
       )
       .get(app, instance);
-    if (!row) return {};
-    try {
-      const parsed: unknown = JSON.parse(row.env);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-      return Object.fromEntries(
-        Object.entries(parsed as Record<string, unknown>).map(([k, v]) => [k, String(v)]),
-      );
-    } catch {
+    if (!row) {
+      if (opts.strict) throw vanishedInstance(app, instance, "is no longer defined in this scope");
       return {};
     }
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(row.env);
+    } catch {
+      // Falls through to the unusable-overlay branch below.
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (opts.strict) throw vanishedInstance(app, instance, "has an unusable env overlay");
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).map(([k, v]) => [k, String(v)]),
+    );
   }
 
   private notePid(attemptId: string, pid: number): void {
@@ -626,15 +779,21 @@ export class Supervisor {
   }
 
   private insert(a: {
-    req: RunRequest;
     runId: string;
     attemptId: string;
-    target: Target;
     fingerprint: string;
-    autonomy: Autonomy;
-    timeoutMs: number;
+    model: string;
+    app: string;
+    slug: string;
+    instance: string;
+    prompt: string;
     cwd: string;
-    payloadHash: string;
+    category?: string;
+    idempotencyKey?: string;
+    /** Null for runs no key can dedup onto (a resume is never idempotent). */
+    payloadHash: string | null;
+    /** Resolved authority and budget, plus `resumed_from` on a resume. */
+    options: Record<string, unknown>;
   }): void {
     const now = nowIso();
     // BEGIN IMMEDIATE: the admission count and the insert that consumes a slot
@@ -663,16 +822,16 @@ export class Supervisor {
           )
           .run(
             a.runId,
-            a.req.idempotencyKey ?? null,
+            a.idempotencyKey ?? null,
             a.payloadHash,
-            a.req.model,
-            a.target.spec.app,
-            a.target.slug,
-            a.target.instance,
-            a.req.prompt,
+            a.model,
+            a.app,
+            a.slug,
+            a.instance,
+            a.prompt,
             a.cwd,
-            a.req.category ?? null,
-            JSON.stringify({ autonomy: a.autonomy, timeoutMs: a.timeoutMs }),
+            a.category ?? null,
+            JSON.stringify(a.options),
             POLICY_VERSION,
             now,
             now,
@@ -719,6 +878,48 @@ export class Supervisor {
       );
     }
     return this.getRun(row.id);
+  }
+
+  /** The exact target the original run used; never a fresh selection. */
+  private pin(ref: PinnedRef): Target {
+    return this.resolver.pinned ? this.resolver.pinned(ref) : targetFor(ref, this.db);
+  }
+
+  /**
+   * The handle the app itself minted for this run's session, off its LAST
+   * attempt — the one that actually holds the state. Anything else is a run
+   * that cannot be continued, and saying so plainly beats a CLI error.
+   */
+  private sessionRefOf(runId: string): string {
+    const row = this.db
+      .query<{ session_ref: string | null; status: RunStatus }, [string]>(
+        "SELECT session_ref, status FROM attempts WHERE run_id = ? ORDER BY seq DESC LIMIT 1",
+      )
+      .get(runId);
+    const ref = row?.session_ref;
+    if (!ref) {
+      throw new Error(
+        `Cannot resume run '${runId}': its last attempt (${row?.status ?? "none recorded"}) reported no session handle, so the app has nothing to continue. Start a new run instead.`,
+      );
+    }
+    if (!SESSION_REF.test(ref)) {
+      throw new Error(
+        `Cannot resume run '${runId}': the recorded session handle is not a plain identifier, so Baton refuses to pass it to the CLI.`,
+      );
+    }
+    return ref;
+  }
+
+  /** Recursion guard, shared by every entry point that launches a callee. */
+  private guardHops(): number {
+    const depth = this.hopDepth();
+    const maxHops = this.maxHops();
+    if (depth >= maxHops) {
+      throw new Error(
+        `Refusing to delegate: this process is already ${depth} delegation hop(s) deep (${HOPS_ENV}=${depth}) and the '${SETTING_MAX_HOPS}' setting is ${maxHops}. Raise it with 'baton set ${SETTING_MAX_HOPS} <n>' if this chain is intended.`,
+      );
+    }
+    return depth;
   }
 
   private hopDepth(): number {
@@ -779,6 +980,53 @@ export function createSupervisor(init: SupervisorInit): Supervisor {
   return new Supervisor(init);
 }
 
+/**
+ * The resume invocation as a one-off spec: only the argv template differs, so
+ * prompt delivery, extraction, the session handle and the failure patterns are
+ * literally the ones the first attempt used. `{sessionRef}` is substituted here
+ * because it is run state; every other placeholder stays the executor's job.
+ */
+function resumeSpec(spec: AdapterSpec, sessionRef: string): AdapterSpec {
+  const argv = spec.resume?.argv;
+  if (!argv) throw new Error(`Adapter '${spec.app}' declares no resume invocation.`);
+  return {
+    ...spec,
+    invoke: {
+      ...spec.invoke,
+      argv: argv.map((element) => element.replaceAll("{sessionRef}", sessionRef)),
+    },
+  };
+}
+
+/** What a resumed run inherits from the run it continues, ignoring the rest. */
+function inheritedOptions(optionsJson: string): RunOptions {
+  const parsed = parseOptions(optionsJson);
+  const autonomy = parsed?.["autonomy"];
+  const timeoutMs = parsed?.["timeoutMs"];
+  return {
+    ...(typeof autonomy === "string" && (AUTONOMY_ORDER as string[]).includes(autonomy)
+      ? { autonomy: autonomy as Autonomy }
+      : {}),
+    ...(typeof timeoutMs === "number" && timeoutMs > 0 ? { timeoutMs } : {}),
+  };
+}
+
+function parseOptions(optionsJson: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(optionsJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function vanishedInstance(app: string, instance: string, why: string): Error {
+  return new Error(
+    `Cannot resume: instance '${candidateKey(app, instance)}' ${why}, and the session lives in that instance's config dir. Re-add it with 'baton instance add ${app} ${instance} --env ...' or start a fresh run.`,
+  );
+}
+
 const defaultExec: AdapterExec = (req, hooks) =>
   executeAdapter({ ...req, ...(hooks?.onSpawn ? { onSpawn: hooks.onSpawn } : {}) });
 
@@ -789,8 +1037,21 @@ interface RunRow {
   app: string;
   slug: string;
   instance: string;
+  options: string;
   created_at: string;
   updated_at: string;
+}
+
+/** The run a resume continues: everything but the prompt comes from here. */
+interface OriginRow {
+  status: RunStatus;
+  model: string;
+  app: string;
+  slug: string;
+  instance: string;
+  cwd: string;
+  category: string | null;
+  options: string;
 }
 
 interface AttemptRow {
@@ -801,6 +1062,7 @@ interface AttemptRow {
   exit_code: number | null;
   output: string | null;
   error: string | null;
+  session_ref: string | null;
   started_at: string | null;
   finished_at: string | null;
 }
@@ -812,7 +1074,9 @@ interface AttemptRow {
  */
 function toView(run: RunRow, attempts: AttemptRow[]): RunView {
   const last = attempts[attempts.length - 1];
+  const resumedFrom = parseOptions(run.options)?.[RESUMED_FROM];
   return {
+    ...(typeof resumedFrom === "string" ? { resumedFrom } : {}),
     runId: run.id,
     status: run.status,
     model: run.model,
@@ -835,6 +1099,7 @@ function toAttemptView(a: AttemptRow): AttemptView {
     status: a.status,
     exitCode: a.exit_code,
     ...(a.error ? { error: a.error } : {}),
+    ...(a.session_ref ? { sessionRef: a.session_ref } : {}),
     ...(a.started_at ? { startedAt: a.started_at } : {}),
     ...(a.finished_at ? { finishedAt: a.finished_at } : {}),
   };
@@ -847,10 +1112,13 @@ function toAttemptView(a: AttemptRow): AttemptView {
  */
 function failureText(
   res: ExecResult,
-  o: { refused: boolean; failedOver: boolean },
+  o: { refused: boolean; failedOver: boolean; resumed: boolean },
 ): string | null {
   if (!o.refused || o.failedOver) return res.error ?? null;
-  return `${res.error ?? "admission failed"} — admission was refused and no other instance was eligible (each one is already attempted or cooling down)`;
+  const why = o.resumed
+    ? "a resumed run stays on the instance holding its session, so admission was not retried elsewhere"
+    : "no other instance was eligible (each one is already attempted or cooling down)";
+  return `${res.error ?? "admission failed"} — admission was refused and ${why}`;
 }
 
 function deduped(view: RunView): { view: RunView; settled: Promise<void> } {

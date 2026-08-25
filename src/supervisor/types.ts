@@ -33,6 +33,18 @@ export interface RunRequest {
   idempotencyKey?: string;
 }
 
+/**
+ * Continue a run's session (PLAN.md §Session affinity). The original run
+ * decides everything except the new prompt: model, app, slug, instance and cwd
+ * are copied, because the session state lives in that instance's config dir.
+ */
+export interface ResumeRequest {
+  runId: string;
+  prompt: string;
+  /** Narrows what the original run resolved; the scope ceiling still clamps. */
+  options?: RunOptions;
+}
+
 export interface AttemptView {
   id: string;
   seq: number;
@@ -47,6 +59,12 @@ export interface AttemptView {
   error?: string;
   startedAt?: string;
   finishedAt?: string;
+  /**
+   * The app's own session handle, when it reported one. Surfaced so a caller
+   * can see that a failed run left something resumable — the decision to
+   * replay is the caller's, never Baton's.
+   */
+  sessionRef?: string;
 }
 
 export interface RunView {
@@ -64,7 +82,12 @@ export interface RunView {
   attempts: AttemptView[];
   /** True when this call deduplicated onto an existing run via idempotency key. */
   deduplicated?: boolean;
+  /** Set when this run continues another run's session (resumeRun). */
+  resumedFrom?: string;
 }
+
+/** Key inside a run's `options` JSON naming the run it resumed. */
+export const RESUMED_FROM = "resumed_from";
 
 /** Recursion guard: injected into every callee environment. */
 export const HOPS_ENV = "BATON_HOPS";

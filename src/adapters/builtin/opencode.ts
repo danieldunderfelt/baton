@@ -48,6 +48,23 @@ export const opencodeAdapter: AdapterSpec = {
   // Every event line — including error events — carries the same top-level
   // sessionID, so no filter is needed. Resume via `--session <id>`.
   sessionRef: { kind: "jsonl", path: "sessionID", take: "first" },
+  // `-s, --session <id>` on `opencode run` itself (verified against
+  // `opencode run --help`; not exercised live — the resume canary is
+  // codex-only). `--fork` is not passed: the continued session keeps its id,
+  // which is the id every event line already carries.
+  resume: {
+    argv: [
+      "run",
+      "-m",
+      "{slug}",
+      "--format",
+      "json",
+      "-s",
+      "{sessionRef}",
+      "{autonomyFlags}",
+      "{prompt}",
+    ],
+  },
   autonomyFlags: { full: ["--auto"] },
   defaultAutonomy: "full",
   defaultTimeoutMs: 300_000,

@@ -10,16 +10,21 @@ import { dirname, join, resolve } from "node:path";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
 // the source tree, and install must work from any cwd.
+import CLAUDE_CODE_TEMPLATE from "./templates/claude-code.md" with { type: "text" };
+import CODEX_TEMPLATE from "./templates/codex.md" with { type: "text" };
+import CORE_TEMPLATE from "./templates/core.md" with { type: "text" };
 import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
-import INSTRUCTIONS_TEMPLATE from "./templates/instructions.md" with { type: "text" };
-import SKILL_FRONTMATTER from "./templates/skill-frontmatter.md" with { type: "text" };
+import KIMI_TEMPLATE from "./templates/kimi.md" with { type: "text" };
+import OPENCODE_TEMPLATE from "./templates/opencode.md" with { type: "text" };
 
 /**
  * `baton install <host>` (PLAN.md §Installers): register the MCP server in the
  * host's own config and render the instruction layer in the host's dialect —
  * a skill for Claude Code, a markered `AGENTS.md` block for the AGENTS.md
- * family. One instruction text, host-parameterised: what the agent needs to
- * know about delegating does not change per host.
+ * family. The substance is one shared core; each host wraps it in its own
+ * framing, because what changes per host is how the file gets read (a skill
+ * that must earn its trigger vs. a block that is always in context) and what
+ * that host is usually good for.
  *
  * Three rules hold for every host:
  * - **Merge, never replace.** Other servers and other instructions in those
@@ -68,6 +73,8 @@ interface Registration {
 interface HostInstaller {
   register(dir: string, command: string, args: string[]): Registration;
   writeInstructions(dir: string, body: string): string;
+  /** Host variant: the shared core goes where its `{core}` placeholder is. */
+  template: string;
   restart: string;
 }
 
@@ -79,9 +86,10 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
     writeInstructions: (dir, body) => {
       const path = join(dir, ".claude", "skills", SERVER_NAME, "SKILL.md");
       mkdirSync(dirname(path), { recursive: true });
-      atomicWrite(path, `${SKILL_FRONTMATTER.trimEnd()}\n\n${body}`);
+      atomicWrite(path, body);
       return path;
     },
+    template: CLAUDE_CODE_TEMPLATE,
     restart: "Restart Claude Code in that directory to pick both up.",
   },
   codex: {
@@ -90,16 +98,19 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
       mcpNote: `Codex applies a project's .codex/config.toml only to trusted projects: accept the trust prompt on first run in ${dir}, or add projects."${dir}".trust_level = "trusted" to ~/.codex/config.toml.`,
     }),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    template: CODEX_TEMPLATE,
     restart: "Start a new codex session in that directory to pick both up.",
   },
   kimi: {
     register: (dir, command, args) => registerKimi(dir, command, args),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    template: KIMI_TEMPLATE,
     restart: "MCP servers load at session start: start a new kimi session in that directory.",
   },
   opencode: {
     register: (dir, command, args) => mergeOpencodeJson(join(dir, "opencode.json"), command, args),
     writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    template: OPENCODE_TEMPLATE,
     restart: "Start a new opencode session in that directory to pick both up.",
   },
 };
@@ -115,7 +126,7 @@ export function installHost(
   const installer = HOSTS[host];
   const { command, args } = serverCommand();
   const registration = installer.register(dir, command, args);
-  const body = instructionText(opts.withEval ?? false);
+  const body = instructionText(host, opts.withEval ?? false);
   const instructionsPath = installer.writeInstructions(dir, body);
 
   return {
@@ -128,11 +139,22 @@ export function installHost(
   };
 }
 
-/** The instruction layer, with the opt-in eval section appended. */
-export function instructionText(withEval: boolean): string {
-  const body = INSTRUCTIONS_TEMPLATE.trimEnd();
+/**
+ * The instruction layer for one host: its own variant with the shared core
+ * spliced in, and the opt-in eval section appended. The core is a whole line of
+ * the variant, so it needs no indentation handling — a host that ever drops the
+ * placeholder would silently ship a preamble with no instructions, hence the throw.
+ */
+export function instructionText(host: InstallHost, withEval: boolean): string {
+  const template = HOSTS[host].template;
+  if (!template.includes(CORE_PLACEHOLDER)) {
+    throw new Error(`The ${host} instruction template lost its ${CORE_PLACEHOLDER} placeholder.`);
+  }
+  const body = template.replace(CORE_PLACEHOLDER, CORE_TEMPLATE.trim()).trimEnd();
   return withEval ? `${body}\n\n${EVAL_TEMPLATE.trimEnd()}\n` : `${body}\n`;
 }
+
+const CORE_PLACEHOLDER = "{core}";
 
 /**
  * How the host should launch Baton. A compiled binary is self-contained and

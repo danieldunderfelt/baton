@@ -129,6 +129,26 @@ describe.skipIf(!BUILT)("compiled binary", () => {
     expect(yaml).toContain("ratings: []");
   });
 
+  /**
+   * Phase 3's two new read surfaces from the real artifact: both open the
+   * scope's v5 tables (discovered_adapters, duels) through a binary with no
+   * source tree, and both must be honest about an empty scope rather than
+   * failing on it.
+   */
+  test("adapters list and duel list run in a fresh scope", async () => {
+    const adapters = await run("adapters", "list");
+    expect(adapters.code, adapters.stderr).toBe(0);
+    expect(adapters.stdout).toContain("PROVENANCE");
+    // Built-ins are pinned, and a fresh scope has discovered nothing.
+    expect(adapters.stdout).toContain("builtin");
+    expect(adapters.stdout).toContain("codex");
+    expect(adapters.stdout).not.toContain("quarantined");
+
+    const duels = await run("duel", "list");
+    expect(duels.code, duels.stderr).toBe(0);
+    expect(duels.stdout).toContain("No duels in this scope yet");
+  });
+
   test("install writes the bundled skill and registers the binary itself", async () => {
     const target = scope();
     const { code, stdout } = await run("install", "claude-code", "--dir", target);
@@ -160,10 +180,15 @@ describe.skipIf(!BUILT)("compiled binary", () => {
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
+        "discover_app",
         "get_ratings",
         "get_run",
         "list_models",
+        "register_app",
+        "report_duel",
         "report_result",
+        "resume_run",
+        "run_duel",
         "run_model",
         "seed_ratings",
       ]);

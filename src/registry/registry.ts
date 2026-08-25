@@ -2,6 +2,8 @@ import type { Database } from "bun:sqlite";
 
 import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy } from "../adapters/types.ts";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
+import { activeDiscoveredSpecs, listDiscovered } from "../discovery/discovery.ts";
+import type { DiscoveredAdapter } from "../discovery/types.ts";
 import { blend } from "../eval/decay.ts";
 import { effectiveRatings, targetRatings } from "../eval/evalStore.ts";
 import { candidatesFor, getPool } from "../quota/pools.ts";
@@ -41,9 +43,9 @@ export interface Target extends Route {
   /** Absolute path of the verified binary, spawned instead of the bare name. */
   binaryPath: string;
   /**
-   * `<app>:<instance>/<slug>@a<adapterVersion>`. The supervisor appends
-   * `+<autonomy>` once the resolved authority is known — autonomy is part of
-   * the execution-target identity but is not decided here.
+   * `<app>:<instance>/<slug>@a<adapterVersion>+v<appVersion>`. The supervisor
+   * appends `+<autonomy>` once the resolved authority is known — autonomy is
+   * part of the execution-target identity but is not decided here.
    */
   targetFingerprint: string;
   /**
@@ -85,6 +87,13 @@ export interface SelectOptions {
   exclude?: string[];
   /** Kind of work: ratings are kept per category, so ranking is too. */
   category?: string;
+  /**
+   * Autonomy the caller asked for (the scope ceiling still clamps it). Only the
+   * rating lens uses it here — the supervisor resolves the same value again for
+   * the fingerprint it records — so ratings are read at the authority level the
+   * run would actually use.
+   */
+  autonomy?: Autonomy;
 }
 
 /** Blended prior + observed for a canonical model, reported separately. */
@@ -128,9 +137,14 @@ function resolveBinary(binary: string): string | null {
   return Bun.which(binary, { PATH: process.env.PATH ?? "" });
 }
 
-export function detectApps(opts: { probeVersion?: boolean } = {}): DetectedApp[] {
+/**
+ * The apps this scope can reach. With a db, active discovered adapters are
+ * included — otherwise `detect`/`list_models` would report an app roster that
+ * contradicts the routes right beside it.
+ */
+export function detectApps(opts: { probeVersion?: boolean; db?: Database } = {}): DetectedApp[] {
   const probe = opts.probeVersion ?? true;
-  return builtinAdapters
+  return routableAdapters(opts.db)
     .map((spec) => {
       const binaryPath = resolveBinary(spec.binary);
       const version = binaryPath && probe ? probeVersion(binaryPath) : undefined;
@@ -139,39 +153,123 @@ export function detectApps(opts: { probeVersion?: boolean } = {}): DetectedApp[]
     .sort((a, b) => a.app.localeCompare(b.app));
 }
 
-/** Detect-path only: spawning per selection would be absurd. Never throws. */
+const VERSION_PROBE_MS = 5_000;
+const versionCache = new Map<string, string | undefined>();
+
+/**
+ * `<binary> --version`, memoized per binary path for the life of the process.
+ * The version is part of the execution-target fingerprint, so selection needs
+ * it — but spawning a process per candidate is not acceptable, and a binary
+ * cannot change under a running Baton without the next process seeing it.
+ * Never throws: an app that will not answer is "unknown", not an error.
+ */
 function probeVersion(binaryPath: string): string | undefined {
+  if (versionCache.has(binaryPath)) return versionCache.get(binaryPath);
+  let version: string | undefined;
   try {
     const res = Bun.spawnSync({
       cmd: [binaryPath, "--version"],
       stdout: "pipe",
       stderr: "pipe",
-      timeout: 5_000,
+      timeout: VERSION_PROBE_MS,
     });
-    if (res.exitCode !== 0) return undefined;
-    const line = res.stdout.toString().trim().split("\n")[0]?.trim();
-    return line || undefined;
+    version =
+      res.exitCode === 0 ? res.stdout.toString().trim().split("\n")[0]?.trim() || undefined : undefined;
   } catch {
-    return undefined;
+    version = undefined;
   }
+  versionCache.set(binaryPath, version);
+  return version;
+}
+
+/** Unknown when unprobeable, and always one fingerprint segment: no `+`, no spaces. */
+const UNKNOWN_VERSION = "unknown";
+
+function appVersion(binaryPath: string): string {
+  const raw = probeVersion(binaryPath);
+  return raw ? raw.replace(/[^A-Za-z0-9._-]+/g, "-") : UNKNOWN_VERSION;
+}
+
+/**
+ * The full execution-target identity a rating attaches to, minus the autonomy
+ * the supervisor appends once authority is resolved (PLAN.md §Registry:
+ * execution target). The app version is in it because the same adapter against
+ * a different build of the app is not interchangeable evidence.
+ */
+export function targetFingerprint(
+  app: string,
+  instance: string,
+  slug: string,
+  adapterVersion: number,
+  binaryPath: string,
+): string {
+  return `${app}:${instance}/${slug}@a${adapterVersion}+v${appVersion(binaryPath)}`;
+}
+
+/**
+ * Adapter specs routable in this scope: the pinned built-ins plus the
+ * discovered adapters a human approved and a canary activated. Everything else
+ * a discovery submitted is inert here — that is the whole quarantine gate
+ * (PLAN.md §Agentic discovery). Without a db only built-ins are knowable.
+ */
+export function routableAdapters(db?: Database): AdapterSpec[] {
+  return db ? [...builtinAdapters, ...activeDiscoveredSpecs(db)] : [...builtinAdapters];
+}
+
+/**
+ * The execution target a run already ran on — a LOOKUP, not a selection.
+ * Session affinity (PLAN.md §Instance pools) must never consult the policy: a
+ * resumed run belongs to the instance whose config dir holds its session, so
+ * quota, ratings and pool balancing have no say. Throws with the reason when
+ * the route no longer exists in this scope, which is the honest answer.
+ */
+export function targetFor(
+  ref: { app: string; slug: string; instance: string },
+  db?: Database,
+): Target {
+  const spec = routableAdapters(db).find((s) => s.app === ref.app);
+  if (!spec) {
+    throw new Error(
+      `Cannot resume a '${ref.app}' run: no adapter for that app is registered in this scope.`,
+    );
+  }
+  const binaryPath = resolveBinary(spec.binary);
+  if (!binaryPath) {
+    throw new Error(
+      `Cannot resume a '${ref.app}' run: '${spec.binary}' is not on PATH in this scope.`,
+    );
+  }
+  return {
+    spec,
+    slug: ref.slug,
+    instance: ref.instance,
+    binaryPath,
+    targetFingerprint: targetFingerprint(
+      ref.app,
+      ref.instance,
+      ref.slug,
+      spec.adapterVersion,
+      binaryPath,
+    ),
+  };
 }
 
 /** Every route able to serve `model`, in deterministic order (app, then slug). */
-export function resolveTargets(model: string): Route[] {
+export function resolveTargets(model: string, db?: Database): Route[] {
   const routes: Route[] = [];
-  for (const spec of builtinAdapters) {
+  for (const spec of routableAdapters(db)) {
     for (const route of spec.models) {
       if (route.model === model) routes.push({ spec, slug: route.slug });
     }
   }
-  if (routes.length === 0) throw unknownModel(model);
+  if (routes.length === 0) throw unknownModel(model, db);
   return routes.sort((a, b) => a.spec.app.localeCompare(b.spec.app) || a.slug.localeCompare(b.slug));
 }
 
 interface Candidate extends Considered {
   route: Route;
   binaryPath: string;
-  /** `<app>:<instance>/<slug>@a<adapterVersion>` — what evidence attaches to. */
+  /** The route half of the execution-target identity — see targetFingerprint. */
   fingerprint: string;
   /** Position in the pool's member list — the stable tie-break. */
   memberIndex: number;
@@ -210,7 +308,7 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
   const candidates: Candidate[] = [];
   const blockedRoutes: string[] = [];
 
-  for (const route of resolveTargets(model)) {
+  for (const route of resolveTargets(model, db)) {
     const app = route.spec.app;
     const binaryPath = resolveBinary(route.spec.binary);
     if (binaryPath === null) {
@@ -219,7 +317,8 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     }
     // A ceiling the adapter cannot express is an exclusion, not a broken route:
     // running anyway would hand the callee an authority Baton cannot constrain.
-    const unsupported = unsupportedCeiling(route.spec, ceilingFor(db, app));
+    const ceiling = ceilingFor(db, app);
+    const unsupported = unsupportedCeiling(route.spec, ceiling);
     if (unsupported) {
       blockedRoutes.push(`${app}: ${unsupported}`);
       continue;
@@ -229,7 +328,10 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
       blockedRoutes.push(`${app}: ${unknown}`);
       continue;
     }
-    candidatesFor(db, app, opts.instance, now).forEach((c, memberIndex) => {
+    // The authority this candidate would run at, resolved here so the rating
+    // lens can ask for evidence produced at that same level.
+    const autonomy = clampAutonomy(opts.autonomy, ceiling, route.spec.defaultAutonomy);
+    candidatesFor(db, app, poolInstance(route.spec, opts.instance), now).forEach((c, memberIndex) => {
       const block: Block | undefined = tried.has(candidateKey(app, c.instance))
         ? "tried"
         : !c.defined
@@ -239,7 +341,13 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
             : c.excludedUnlessLastResort
               ? "emergency"
               : undefined;
-      const fingerprint = `${app}:${c.instance}/${route.slug}@a${route.spec.adapterVersion}`;
+      const fingerprint = targetFingerprint(
+        app,
+        c.instance,
+        route.slug,
+        route.spec.adapterVersion,
+        binaryPath,
+      );
       candidates.push({
         route,
         binaryPath,
@@ -249,7 +357,7 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
         slug: route.slug,
         instance: c.instance,
         quota: onGrid(c.weight),
-        rating: rating.factorFor(fingerprint),
+        rating: rating.factorFor(fingerprint, autonomy),
         headroom: c.headroom,
         preciousness: c.preciousness,
         ...(c.coolingUntil ? { coolingUntil: c.coolingUntil } : {}),
@@ -275,6 +383,18 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     targetFingerprint: chosen.fingerprint,
     considered: candidates.map(publicView),
   };
+}
+
+/**
+ * Pools only mean something for an app whose identity an env var can relocate:
+ * without one every "instance" is the same account under another name (PLAN.md
+ * §Instance mechanics). Built-in pools are already refused at write time; a
+ * discovered adapter's spec is what says whether it has one, so the gate lives
+ * here too. Pinning the instance bypasses the pool without losing the explicit
+ * argument's precedence.
+ */
+function poolInstance(spec: AdapterSpec, explicit: string | undefined): string | undefined {
+  return spec.identityEnv ? explicit : (explicit ?? DEFAULT_INSTANCE);
 }
 
 /** Identity of a pool candidate across routes: what failover excludes. */
@@ -344,8 +464,8 @@ const RATING_FLOOR = 0.6;
 const MODEL_PRIOR_WEIGHT = 5;
 
 interface RatingLens {
-  /** Routing multiplier for one execution target. */
-  factorFor(fingerprint: string): number;
+  /** Routing multiplier for one execution target at the autonomy it would run at. */
+  factorFor(fingerprint: string, autonomy: Autonomy): number;
 }
 
 /**
@@ -354,10 +474,13 @@ interface RatingLens {
  * the rating term would be a common factor across a selection's candidates and
  * could not discriminate between them at all.
  *
- * Evidence is pooled across the autonomy levels a target ran at: autonomy is
- * resolved per route *after* selection, so the suffixed fingerprints the
- * supervisor writes are not yet knowable here. A category with no evidence
- * falls back to the model's uncategorised rating rather than to nothing.
+ * The lens is autonomy-aware: the same model at another authority level is not
+ * interchangeable evidence, so a candidate is judged on runs at the level it
+ * would actually run at — but only once there is enough of it. Below
+ * MODEL_PRIOR_WEIGHT the same-level evidence is thinner than the hierarchical
+ * prior it would be shrunk against, and the level-pooled rating (a superset,
+ * which includes it) is the better estimate. A category with no evidence falls
+ * back to the model's uncategorised rating rather than to nothing.
  */
 function ratingLens(db: Database, model: string, category: string, at: string): RatingLens {
   const ratings = effectiveRatings(db, at);
@@ -367,18 +490,25 @@ function ratingLens(db: Database, model: string, category: string, at: string): 
     null;
 
   const evidence = new Map<string, { sumWg: number; sumW: number }>();
+  const fold = (key: string, observed: number, weight: number): void => {
+    const acc = evidence.get(key) ?? { sumWg: 0, sumW: 0 };
+    acc.sumWg += observed * weight;
+    acc.sumW += weight;
+    evidence.set(key, acc);
+  };
   for (const t of targetRatings(db, at)) {
     if (t.model !== model || t.category !== category || t.observed === null) continue;
-    const key = routeKey(t.target);
-    const acc = evidence.get(key) ?? { sumWg: 0, sumW: 0 };
-    acc.sumWg += t.observed * t.weight;
-    acc.sumW += t.weight;
-    evidence.set(key, acc);
+    fold(lensKey(t.route, ""), t.observed, t.weight);
+    if (t.autonomy !== "") fold(lensKey(t.route, t.autonomy), t.observed, t.weight);
   }
 
   return {
-    factorFor(fingerprint) {
-      const acc = evidence.get(fingerprint);
+    factorFor(fingerprint, autonomy) {
+      const sameLevel = evidence.get(lensKey(fingerprint, autonomy));
+      const acc =
+        sameLevel && sameLevel.sumW >= MODEL_PRIOR_WEIGHT
+          ? sameLevel
+          : evidence.get(lensKey(fingerprint, ""));
       const observed = acc && acc.sumW > 0 ? acc.sumWg / acc.sumW : null;
       const blended = blend(observed, acc?.sumW ?? 0, modelBlended, MODEL_PRIOR_WEIGHT);
       if (blended === null) return 1;
@@ -388,10 +518,9 @@ function ratingLens(db: Database, model: string, category: string, at: string): 
   };
 }
 
-/** Drops the `+<autonomy>` the supervisor appends once authority is resolved. */
-function routeKey(target: string): string {
-  const plus = target.lastIndexOf("+");
-  return plus === -1 ? target : target.slice(0, plus);
+/** Route, plus the autonomy segment — "" is the level-pooled bucket. */
+function lensKey(route: string, autonomy: string): string {
+  return `${route}+${autonomy}`;
 }
 
 function noCandidate(model: string, blockedRoutes: string[], candidates: Candidate[]): Error {
@@ -493,47 +622,78 @@ export function listModels(db: Database, at = nowIso()): ModelListing[] {
       ),
   );
   const rows: ModelListing[] = [];
-  for (const spec of builtinAdapters) {
-    const ceiling = ceilingFor(db, spec.app);
-    const degradedReason =
-      resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling);
-    // Only a pool makes per-instance headroom meaningful: without one there is
-    // nothing to spread across, and 'default' is the whole story.
-    const pool = getPool(db, spec.app)?.members.map((instance) => {
-      const observed = snapshot(db, spec.app, instance, at);
-      return {
-        instance,
-        headroom: observed.headroom,
-        ...(observed.coolingUntil ? { coolingUntil: observed.coolingUntil } : {}),
-      };
-    });
-    for (const route of spec.models) {
-      const score = scores.get(route.model);
-      rows.push({
-        model: route.model,
-        app: spec.app,
-        slug: route.slug,
-        available: degradedReason === "",
-        ...(degradedReason === "" ? {} : { degradedReason }),
-        instance: DEFAULT_INSTANCE,
-        rating: score?.blended === undefined || score.blended === null ? "unrated" : "rated",
-        scores: score ?? { observed: null, nEff: 0, prior: null, blended: null },
-        ...(pool ? { pool } : {}),
-        maxAutonomy: ceiling,
-      });
-    }
+  for (const spec of routableAdapters(db)) rows.push(...routeRows(db, spec, scores, at));
+  // A quarantined adapter routes nowhere, but hiding it would hide the thing
+  // the user is being asked to review — same for one waiting on a canary or
+  // gone stale after a version bump. A rejected one is a decision, not a hint.
+  for (const record of listDiscovered(db)) {
+    if (record.status === "active" || record.status === "rejected") continue;
+    if (!Array.isArray(record.spec?.models)) continue; // unvalidated row on disk
+    rows.push(...routeRows(db, record.spec, scores, at, quarantineHint(record)));
   }
   return rows.sort((a, b) => a.model.localeCompare(b.model) || a.app.localeCompare(b.app));
 }
 
-export function knownModels(): string[] {
+function routeRows(
+  db: Database,
+  spec: AdapterSpec,
+  scores: Map<string, ModelScores>,
+  at: string,
+  forcedReason?: string,
+): ModelListing[] {
+  const ceiling = ceilingFor(db, spec.app);
+  const degradedReason =
+    forcedReason ??
+    (resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling));
+  // Only a pool makes per-instance headroom meaningful: without one there is
+  // nothing to spread across, and 'default' is the whole story.
+  const pool = spec.identityEnv
+    ? getPool(db, spec.app)?.members.map((instance) => {
+        const observed = snapshot(db, spec.app, instance, at);
+        return {
+          instance,
+          headroom: observed.headroom,
+          ...(observed.coolingUntil ? { coolingUntil: observed.coolingUntil } : {}),
+        };
+      })
+    : undefined;
+  return spec.models.map((route) => {
+    const score = scores.get(route.model);
+    return {
+      model: route.model,
+      app: spec.app,
+      slug: route.slug,
+      available: degradedReason === "",
+      ...(degradedReason === "" ? {} : { degradedReason }),
+      instance: DEFAULT_INSTANCE,
+      rating: score?.blended === undefined || score.blended === null ? "unrated" : "rated",
+      scores: score ?? { observed: null, nEff: 0, prior: null, blended: null },
+      ...(pool ? { pool } : {}),
+      maxAutonomy: ceiling,
+    };
+  });
+}
+
+/** Why a discovered adapter is not routable, and the command that fixes it. */
+function quarantineHint(record: DiscoveredAdapter): string {
+  switch (record.status) {
+    case "approved":
+      return `approved — awaiting canary ('baton adapters canary ${record.app}')`;
+    case "stale":
+      return `stale — binary version changed ('baton adapters canary ${record.app}')`;
+    default:
+      return `quarantined — awaiting review ('baton adapters review ${record.app}')`;
+  }
+}
+
+export function knownModels(db?: Database): string[] {
   const models = new Set<string>();
-  for (const spec of builtinAdapters) for (const r of spec.models) models.add(r.model);
+  for (const spec of routableAdapters(db)) for (const r of spec.models) models.add(r.model);
   return [...models].sort();
 }
 
-function unknownModel(model: string): Error {
-  return new Error(`Unknown model '${model}'. Known models: ${knownModels().join(", ")}.`);
+function unknownModel(model: string, db?: Database): Error {
+  return new Error(`Unknown model '${model}'. Known models: ${knownModels(db).join(", ")}.`);
 }
 
 function isAutonomy(value: unknown): value is Autonomy {

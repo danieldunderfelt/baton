@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import type { AdapterSpec } from "../adapters/types.ts";
 import { newId, nowIso, openStore } from "../store/store.ts";
 
 /**
@@ -12,6 +13,7 @@ import { newId, nowIso, openStore } from "../store/store.ts";
  */
 
 const ENTRY = resolve(import.meta.dir, "..", "index.ts");
+const HTTP_MODULE = resolve(import.meta.dir, "..", "mcp", "http.ts");
 
 function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), `baton-cli-${prefix}-`));
@@ -21,8 +23,27 @@ async function baton(
   scope: string,
   ...args: string[]
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  return await spawnBaton({ BATON_CONFIG_DIR: scope }, args);
+}
+
+/** Same, with a throwaway bin directory ahead of PATH: the callees are fakes. */
+async function batonOnPath(
+  scope: string,
+  bin: string,
+  ...args: string[]
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return await spawnBaton(
+    { BATON_CONFIG_DIR: scope, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    args,
+  );
+}
+
+async function spawnBaton(
+  env: Record<string, string>,
+  args: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, "run", ENTRY, ...args], {
-    env: { ...process.env, BATON_CONFIG_DIR: scope, BATON_HOPS: undefined },
+    env: { ...process.env, BATON_HOPS: undefined, ...env },
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
@@ -250,7 +271,9 @@ describe("install claude-code", () => {
     const plain = tmp("install-plain");
     await baton(tmp("install-plain-scope"), "install", "claude-code", "--dir", plain);
     const without = readFileSync(join(plain, ".claude", "skills", "baton", "SKILL.md"), "utf8");
-    expect(without).not.toContain("report_result");
+    // The core tells every host to grade what it used; the grading rubric and
+    // the seeding interview are what --with-eval adds on top.
+    expect(without).not.toContain("seed_ratings");
 
     const target = tmp("install-eval");
     const res = await baton(
@@ -265,11 +288,11 @@ describe("install claude-code", () => {
     expect(res.stdout).toContain("grading + onboarding");
     const skill = readFileSync(join(target, ".claude", "skills", "baton", "SKILL.md"), "utf8");
     expect(skill).toContain("report_result(run_id, grade, notes?)");
-    // Consumer grades, the interview, and the honest phase-3 note on duels.
+    // Consumer grades, the interview, and the upsert rule for duel verdicts.
     expect(skill).toContain("after you have used its result");
     expect(skill).toContain("seed_ratings");
     expect(skill).toContain("Echo the normalized entries back");
-    expect(skill).toContain("phase 3");
+    expect(skill).toContain("`report_duel` is an upsert too");
   });
 });
 
@@ -427,7 +450,9 @@ describe("install kimi", () => {
       mcpServers: Record<string, { command: string; args: string[] }>;
     };
     expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
-    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain("Delegating with Baton");
+    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain(
+      "Baton — delegating to other models",
+    );
   });
 
   test("registers in .kimi-code/mcp.json where a root .mcp.json would never be read", async () => {
@@ -580,7 +605,7 @@ describe("set (phase-2 keys)", () => {
  * Seeds a run and the attempt that answered it, so grading has something real
  * to attach to without spawning a callee. Mirrors what the supervisor writes.
  */
-function seedRun(scope: string, opts: { succeeded: boolean }): string {
+function seedRun(scope: string, opts: { succeeded: boolean; sessionRef?: string }): string {
   mkdirSync(join(scope, "state"), { recursive: true, mode: 0o700 });
   const db = openStore(join(scope, "state", "baton.db"));
   const runId = newId("run");
@@ -590,9 +615,16 @@ function seedRun(scope: string, opts: { succeeded: boolean }): string {
      VALUES (?, 'kimi-k3', 'kimi', 'kimi-code/k3', 'default', 'do a thing', '/tmp', ?, ?, ?)`,
   ).run(runId, opts.succeeded ? "succeeded" : "failed", at, at);
   db.query(
-    `INSERT INTO attempts (id, run_id, seq, target, status, started_at, finished_at)
-     VALUES (?, ?, 1, 'kimi:default/kimi-code/k3@a1', ?, ?, ?)`,
-  ).run(newId("att"), runId, opts.succeeded ? "succeeded" : "failed", at, at);
+    `INSERT INTO attempts (id, run_id, seq, target, status, session_ref, started_at, finished_at)
+     VALUES (?, ?, 1, 'kimi:default/kimi-code/k3@a1', ?, ?, ?, ?)`,
+  ).run(
+    newId("att"),
+    runId,
+    opts.succeeded ? "succeeded" : "failed",
+    opts.sessionRef ?? null,
+    at,
+    at,
+  );
   db.close();
   return runId;
 }
@@ -608,7 +640,8 @@ describe("grade and ratings", () => {
 
     const ratings = await baton(scope, "ratings");
     expect(ratings.code).toBe(0);
-    expect(ratings.stdout).toMatch(/kimi-k3\s+-\s+4(\.00)? \(1\)/);
+    // n_eff is 1 observation, give or take the decay arithmetic's last bit.
+    expect(ratings.stdout).toMatch(/kimi-k3\s+-\s+4(\.00)? \(1(\.00)?\)/);
     expect(ratings.stdout).toContain("revision");
 
     const yaml = readFileSync(join(scope, "ratings.yaml"), "utf8");
@@ -619,7 +652,7 @@ describe("grade and ratings", () => {
     // Upsert: re-grading replaces rather than adding a second observation.
     expect((await baton(scope, "grade", runId, "2")).code).toBe(0);
     const after = await baton(scope, "ratings");
-    expect(after.stdout).toMatch(/kimi-k3\s+-\s+2(\.00)? \(1\)/);
+    expect(after.stdout).toMatch(/kimi-k3\s+-\s+2(\.00)? \(1(\.00)?\)/);
   });
 
   test("refuses a run that never produced an answer, and an unknown one", async () => {
@@ -811,6 +844,10 @@ describe("run cancellation", () => {
  * A throwaway `kimi` for PATH: it records its own pid and a grandchild's, then
  * sleeps. The grandchild ignores SIGTERM, so the group only dies if the CLI
  * stays alive long enough to escalate to SIGKILL.
+ *
+ * `--version` answers immediately, like a real CLI: selection probes the binary
+ * for the fingerprint before the run starts, and a fake that slept through that
+ * probe would have the test kill the CLI before it even owns a run.
  */
 function fakeKimi(): { bin: string; pidfile: string } {
   const bin = tmp("bin");
@@ -818,6 +855,7 @@ function fakeKimi(): { bin: string; pidfile: string } {
   writeFileSync(
     join(bin, "kimi"),
     `#!/bin/sh
+${VERSION_SHIM}
 echo $$ >> "${pidfile}"
 ${process.execPath} -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
 echo $! >> "${pidfile}"
@@ -826,6 +864,28 @@ sleep 30
     { mode: 0o755 },
   );
   return { bin, pidfile };
+}
+
+/** Answer the pre-run version probe the way an installed CLI would. */
+const VERSION_SHIM = 'case "$1" in --version) echo "fake 1.0.0"; exit 0;; esac';
+
+/** Reads a live stdout stream until it says what we are waiting for. */
+async function readUntil(
+  stream: ReadableStream<Uint8Array>,
+  needle: string,
+  budgetMs: number,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + budgetMs;
+  let text = "";
+  while (!text.includes(needle) && Date.now() < deadline) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  reader.releaseLock();
+  return text;
 }
 
 async function poll<T>(what: string, budgetMs: number, probe: () => T | undefined): Promise<T> {
@@ -877,6 +937,370 @@ describe("run (live)", () => {
       expect(res.stdout).toContain("BATON_OK");
     },
     240_000,
+  );
+});
+
+/**
+ * Two throwaway callees on PATH, each answering in the format its own built-in
+ * adapter extracts. No real agent CLI is involved, so a duel costs nothing.
+ */
+function fakeCallees(answers: { kimi: string; codex: string }): string {
+  const bin = tmp("duelbin");
+  writeFileSync(
+    join(bin, "kimi"),
+    `#!/bin/sh\n${VERSION_SHIM}\nprintf '{"role":"assistant","content":"%s"}\\n' "${answers.kimi}"\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(bin, "codex"),
+    `#!/bin/sh\n${VERSION_SHIM}\ncat > /dev/null\nprintf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\\n' "${answers.codex}"\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+describe("duel", () => {
+  test("prints both answers under labels alone, and names nobody until reported", async () => {
+    const scope = tmp("duel");
+    const bin = fakeCallees({ kimi: "ANSWER FROM ALPHA", codex: "ANSWER FROM BRAVO" });
+
+    const started = await batonOnPath(
+      scope,
+      bin,
+      "duel",
+      "--category",
+      "review",
+      "kimi-k3",
+      "gpt-5.6-sol",
+      "which of these is better",
+    );
+    expect(started.code).toBe(0);
+    expect(started.stdout).toContain("ANSWER FROM ALPHA");
+    expect(started.stdout).toContain("ANSWER FROM BRAVO");
+    expect(started.stdout).toContain("──── A ────");
+    expect(started.stdout).toContain("──── B ────");
+    // Blindness is the whole point: a judge who can see the names is rating
+    // the name. Nothing before the verdict may identify either side.
+    expect(started.stdout).not.toContain("kimi");
+    expect(started.stdout).not.toContain("gpt-5.6-sol");
+    expect(started.stdout).not.toContain("run_");
+    expect(started.stdout).toContain("judge with: baton duel report");
+
+    const duelId = /baton duel report (\S+)/.exec(started.stdout)?.[1] ?? "";
+    expect(duelId).toStartWith("duel");
+
+    const listed = await baton(scope, "duel", "list");
+    expect(listed.stdout).toContain("awaiting_judgment");
+    expect(listed.stdout).toContain("blind until judged");
+    expect(listed.stdout).not.toContain("kimi-k3");
+
+    const reported = await baton(scope, "duel", "report", duelId, "a");
+    expect(reported.code).toBe(0);
+    expect(reported.stdout).toContain("A was");
+    expect(reported.stdout).toContain("kimi-k3");
+    expect(reported.stdout).toContain("gpt-5.6-sol");
+
+    // Judged duels are a separate signal in ratings, never blended into grades.
+    const ratings = await baton(scope, "ratings");
+    expect(ratings.stdout).toContain("Bradley-Terry");
+    expect(ratings.stdout).toContain("kimi-k3");
+
+    const after = await baton(scope, "duel", "list");
+    expect(after.stdout).toContain("reported");
+    expect(after.stdout).toMatch(/A=\S+ B=\S+/);
+  }, 30_000);
+
+  test("rejects the same model twice, an unknown duel, and a nonsense verdict", async () => {
+    const scope = tmp("duel-bad");
+    const same = await baton(scope, "duel", "kimi-k3", "kimi-k3", "hi");
+    expect(same.code).toBe(1);
+    expect(same.stderr).toContain("two different models");
+
+    const verdict = await baton(scope, "duel", "report", "duel_x", "maybe");
+    expect(verdict.code).toBe(2);
+    expect(verdict.stderr).toContain("'A', 'B' or 'tie'");
+
+    const unknown = await baton(scope, "duel", "report", "duel_x", "A");
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("Unknown duel");
+
+    expect((await baton(scope, "duel", "list")).stdout).toContain("No duels in this scope yet");
+  });
+});
+
+/** A discovered spec, quarantined exactly as `register_app` would leave it. */
+function seedDiscovered(scope: string, binary: string): AdapterSpec {
+  mkdirSync(join(scope, "state"), { recursive: true, mode: 0o700 });
+  const db = openStore(join(scope, "state", "baton.db"));
+  const spec: AdapterSpec = {
+    app: "fakeagent",
+    adapterVersion: 1,
+    binary,
+    models: [{ model: "fake-1", slug: "fake/1" }],
+    invoke: {
+      argv: ["--model", "{slug}", "{autonomyFlags}"],
+      promptVia: "stdin",
+      extract: { kind: "json", path: "result" },
+    },
+    autonomyFlags: { readonly: ["--readonly"] },
+    defaultAutonomy: "readonly",
+    defaultTimeoutMs: 60_000,
+    admissionFailurePatterns: [],
+  };
+  db.query(
+    "INSERT INTO discovered_adapters (app, spec, status, submitted_at) VALUES (?, ?, 'quarantined', ?)",
+  ).run(spec.app, JSON.stringify(spec), nowIso());
+  db.close();
+  return spec;
+}
+
+/** The discovered app's binary: answers with the token it was asked for. */
+function fakeAgentBinary(): string {
+  const path = join(tmp("agentbin"), "fakeagent");
+  writeFileSync(
+    path,
+    `#!${process.execPath}
+const prompt = await Bun.stdin.text();
+const token = prompt.trim().split(/\\s+/).at(-1) ?? "";
+await Bun.write(Bun.stdout, JSON.stringify({ result: token, argv: process.argv.slice(2) }));
+`,
+    { mode: 0o755 },
+  );
+  return path;
+}
+
+describe("adapters review and approval", () => {
+  test("review prints the exact mechanics, approval canaries it into active", async () => {
+    const scope = tmp("adapters");
+    const binary = fakeAgentBinary();
+    seedDiscovered(scope, binary);
+
+    const quarantined = await baton(scope, "adapters", "list");
+    expect(quarantined.stdout).toContain("fakeagent");
+    expect(quarantined.stdout).toContain("quarantined");
+    expect(quarantined.stdout).toContain("has been executed");
+
+    const review = await baton(scope, "adapters", "review", "fakeagent");
+    expect(review.code).toBe(0);
+    expect(review.stdout).toContain(binary);
+    expect(review.stdout).toContain("--model {slug}");
+    expect(review.stdout).toContain("prompt via: stdin");
+    expect(review.stdout).toContain('JSON stdout, path "result"');
+    expect(review.stdout).toContain("fake-1 → fake/1");
+    expect(review.stdout).toContain("Nothing from this spec has been executed");
+    expect(review.stdout).toContain("Approve running this exact binary");
+
+    const approved = await baton(scope, "adapters", "approve", "fakeagent");
+    expect(approved.code).toBe(0);
+    expect(approved.stdout).toContain("Canary passed");
+    expect((await baton(scope, "adapters", "list")).stdout).toContain("active");
+
+    const rejected = await baton(scope, "adapters", "reject", "fakeagent", "changed", "my", "mind");
+    expect(rejected.code).toBe(0);
+    // Approval is consent to run one reviewed spec, and withdrawing it takes
+    // execution rights back immediately.
+    const refused = await baton(scope, "adapters", "canary", "fakeagent");
+    expect(refused.code).toBe(1);
+    expect(refused.stdout).toContain("failed");
+    expect(refused.stderr).toContain("approval precedes execution");
+  }, 30_000);
+
+  test("--no-canary approves without executing anything", async () => {
+    const scope = tmp("adapters-nocanary");
+    seedDiscovered(scope, fakeAgentBinary());
+    const res = await baton(scope, "adapters", "approve", "fakeagent", "--no-canary");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("Not active yet");
+    const list = await baton(scope, "adapters", "list");
+    expect(list.stdout).toMatch(/fakeagent\s+discovered\s+approved/);
+  });
+
+  test("a review of an app this scope never heard of fails without guessing", async () => {
+    const res = await baton(tmp("adapters-unknown"), "adapters", "review", "ghost");
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("no discovered adapter 'ghost'");
+  });
+});
+
+describe("adapters canary --all (conformance suite)", () => {
+  test("--structural validates every built-in without executing one", async () => {
+    const scope = tmp("conformance");
+    // Every built-in binary is a fake that records having been run: the marker
+    // is what proves the structural half really executes nothing.
+    const bin = tmp("conformance-bin");
+    const marker = join(bin, "ran");
+    for (const app of ["codex", "kimi", "claude", "opencode", "cursor-agent"]) {
+      writeFileSync(join(bin, app), `#!/bin/sh\necho ran >> "${marker}"\n`, { mode: 0o755 });
+    }
+    seedDiscovered(scope, fakeAgentBinary());
+
+    const res = await batonOnPath(scope, bin, "adapters", "canary", "--all", "--structural");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("STRUCTURE");
+    expect(res.stdout).toMatch(/codex\s+builtin\s+ok/);
+    expect(res.stdout).toMatch(/kimi\s+builtin\s+ok/);
+    expect(res.stdout).toMatch(/fakeagent\s+quarantined\s+ok/);
+    expect(res.stdout).toContain("not run (--structural)");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("an adapter nobody has heard of is a usage error, not an empty pass", async () => {
+    const res = await baton(tmp("conformance-unknown"), "adapters", "canary", "ghost");
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("unknown adapter 'ghost'");
+  });
+
+  // The live half runs every installed agent CLI for real: opt in with
+  // BATON_LIVE_TESTS=1.
+  test.skipIf(process.env.BATON_LIVE_TESTS !== "1")(
+    "runs a real canary against every installed built-in",
+    async () => {
+      const res = await baton(tmp("conformance-live"), "adapters", "canary", "--all");
+      expect(res.stdout).toContain("passed");
+      expect(res.code).toBe(0);
+    },
+    600_000,
+  );
+});
+
+describe("profile export", () => {
+  test("round-trips through profile import, canonical priors only", async () => {
+    const source = tmp("export-source");
+    const file = join(tmp("export-file"), "team.yaml");
+    writeFileSync(file, PROFILE_FILE);
+    await baton(source, "profile", "import", file, "--yes", "--activate");
+
+    const printed = await baton(source, "profile", "export");
+    expect(printed.code).toBe(0);
+    expect(printed.stdout).toContain("name: team");
+    expect(printed.stdout).toContain("kimi-k3");
+    // The portability guarantee, stated where a reader of the file will see it.
+    expect(printed.stdout).toContain("portable priors only");
+
+    const out = join(tmp("export-out"), "exported.yaml");
+    const written = await baton(source, "profile", "export", "--out", out);
+    expect(written.stdout).toContain("2 priors");
+    // Everything but the export stamp, which is the moment of writing.
+    expect(priorLines(readFileSync(out, "utf8"))).toEqual(priorLines(printed.stdout));
+
+    // Into a scope that has never seen this profile: same two entries.
+    const target = tmp("export-target");
+    const imported = await baton(target, "profile", "import", out, "--yes", "--activate");
+    expect(imported.code).toBe(0);
+    expect(imported.stdout).toContain("2 added, 0 changed, 0 unchanged");
+    expect(priorLines((await baton(target, "profile", "export")).stdout)).toEqual(
+      priorLines(printed.stdout),
+    );
+
+    // And back into the scope it came from: nothing moved.
+    const again = await baton(source, "profile", "import", out);
+    expect(again.stdout).toContain("0 added, 0 changed, 2 unchanged");
+  });
+
+  /** The document minus `exported_at`: two exports differ only in that stamp. */
+  function priorLines(text: string): string[] {
+    return text.split("\n").filter((line) => !line.startsWith("exported_at:"));
+  }
+
+  test("says so when there is no profile to export", async () => {
+    const scope = tmp("export-empty");
+    const res = await baton(scope, "profile", "export");
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("no active one");
+
+    const named = await baton(scope, "profile", "export", "--profile", "team");
+    expect(named.code).toBe(1);
+    expect(named.stderr).toContain("no priors to export");
+  });
+});
+
+describe("resume", () => {
+  test("continues the original run's session on the same adapter", async () => {
+    const scope = tmp("resume");
+    const runId = seedRun(scope, { succeeded: true, sessionRef: "session_abc" });
+    const bin = tmp("resume-bin");
+    // Echoes its own argv back as the answer, so the assertion can see the
+    // session handle the adapter's resume template filled in.
+    writeFileSync(
+      join(bin, "kimi"),
+      `#!/bin/sh\n${VERSION_SHIM}\nprintf '{"role":"assistant","content":"RESUMED %s"}\\n' "$*"\n`,
+      { mode: 0o755 },
+    );
+
+    const res = await batonOnPath(scope, bin, "resume", runId, "and now the second turn");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("RESUMED");
+    expect(res.stdout).toContain("-S session_abc");
+    expect(res.stdout).toContain("and now the second turn");
+  }, 30_000);
+
+  test("refuses an unknown run and a run with no session handle", async () => {
+    const scope = tmp("resume-bad");
+    const unknown = await baton(scope, "resume", "run_nope", "continue");
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("Unknown run 'run_nope'");
+
+    const handleless = seedRun(scope, { succeeded: true });
+    const noHandle = await baton(scope, "resume", handleless, "continue");
+    expect(noHandle.code).toBe(1);
+    expect(noHandle.stderr).toContain("no session handle");
+
+    expect((await baton(scope, "resume", handleless)).code).toBe(2);
+  });
+});
+
+describe("serve --http", () => {
+  test("needs --http, and rejects a stray argument", async () => {
+    const scope = tmp("serve-usage");
+    const bare = await baton(scope, "serve");
+    expect(bare.code).toBe(2);
+    expect(bare.stderr).toContain("serve needs --http");
+
+    const stray = await baton(scope, "serve", "--http", "please");
+    expect(stray.code).toBe(2);
+    expect(stray.stderr).toContain("no positional arguments");
+  });
+
+  test.skipIf(!existsSync(HTTP_MODULE))(
+    "serves this scope and reports where, until it is signalled",
+    async () => {
+      const scope = tmp("serve-up");
+      const proc = Bun.spawn([process.execPath, ENTRY, "serve", "--http", "--port", "0"], {
+        env: { ...process.env, BATON_CONFIG_DIR: scope, BATON_HOPS: undefined },
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      const banner = await readUntil(proc.stdout, "url", 15_000);
+      expect(banner).toContain("http://127.0.0.1:");
+      // One daemon serves exactly one scope, because it inherits one environment.
+      expect(banner).toContain(scope);
+
+      proc.kill("SIGTERM");
+      expect(await proc.exited).toBe(0);
+    },
+    30_000,
+  );
+
+  // Skipped only while src/mcp/http.ts is unimplemented; without it the CLI
+  // would "fail" for the wrong reason and the assertion would prove nothing.
+  test.skipIf(!existsSync(HTTP_MODULE))(
+    "fails gracefully when the port is already taken",
+    async () => {
+      const scope = tmp("serve-busy");
+      // Same address the daemon binds: a wildcard holder would let it start.
+      const holder = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("busy") });
+      try {
+        const res = await baton(scope, "serve", "--http", "--port", String(holder.port));
+        // A daemon that cannot bind must say so and exit, not run half-alive.
+        expect(res.code).toBe(1);
+        expect(res.stderr).toContain("baton:");
+        expect(res.stderr).not.toContain("Cannot find module");
+      } finally {
+        await holder.stop(true);
+      }
+    },
+    30_000,
   );
 });
 

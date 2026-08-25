@@ -1,6 +1,7 @@
 import type { AdapterSpec } from "../types.ts";
 import { claudeCodeAdapter } from "./claude-code.ts";
 import { codexAdapter } from "./codex.ts";
+import { cursorAdapter } from "./cursor.ts";
 import { kimiAdapter } from "./kimi.ts";
 import { opencodeAdapter } from "./opencode.ts";
 
@@ -8,6 +9,7 @@ import { opencodeAdapter } from "./opencode.ts";
 export const builtinAdapters: AdapterSpec[] = [
   claudeCodeAdapter,
   codexAdapter,
+  cursorAdapter,
   kimiAdapter,
   opencodeAdapter,
 ];
@@ -16,4 +18,4 @@ export function getAdapter(app: string): AdapterSpec | undefined {
   return builtinAdapters.find((a) => a.app === app);
 }
 
-export { claudeCodeAdapter, codexAdapter, kimiAdapter, opencodeAdapter };
+export { claudeCodeAdapter, codexAdapter, cursorAdapter, kimiAdapter, opencodeAdapter };

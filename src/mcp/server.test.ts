@@ -93,6 +93,9 @@ function fakeKimi(): { bin: string; pidfile: string } {
   writeFileSync(
     join(bin, "kimi"),
     `#!/bin/sh
+# Answer the registry's version probe like a real CLI: a probe that fell into
+# the branch below would leave a pid nobody delegated behind.
+case "$1" in --version) echo "kimi 9.9.9"; exit 0;; esac
 echo $$ >> "${pidfile}"
 ${process.execPath} -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
 echo $! >> "${pidfile}"
@@ -145,13 +148,18 @@ afterAll(async () => {
 });
 
 describe("tools/list", () => {
-  test("exposes exactly the phase-2 tool set with usable schemas", async () => {
+  test("exposes exactly the phase-3 tool set with usable schemas", async () => {
     const { tools } = await session.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
+      "discover_app",
       "get_ratings",
       "get_run",
       "list_models",
+      "register_app",
+      "report_duel",
       "report_result",
+      "resume_run",
+      "run_duel",
       "run_model",
       "seed_ratings",
     ]);
@@ -206,6 +214,40 @@ describe("tools/list", () => {
     // Propose/approve, and the cap that keeps a wrong seed from steering routing.
     expect(seed.description).toContain("approve");
     expect(seed.description).toContain("capped at 10");
+
+    const duel = tools.find((t) => t.name === "run_duel")!;
+    expect((duel.inputSchema.required as string[]).sort()).toEqual(["models", "prompt"]);
+    expect(duel.inputSchema.properties).toMatchObject({
+      models: { type: "array", minItems: 2, maxItems: 2 },
+    });
+    // The three things a judging agent has to be told: blind, identical, and
+    // that mutating tasks are a bad fit for two agents in one checkout.
+    expect(duel.description).toContain("blind");
+    expect(duel.description).toContain("identical");
+    expect(duel.description).toContain("non-mutating");
+    expect(duel.description).toContain("report_duel");
+
+    const reportDuel = tools.find((t) => t.name === "report_duel")!;
+    expect((reportDuel.inputSchema.required as string[]).sort()).toEqual(["duel_id", "winner"]);
+    expect(reportDuel.description).toContain("REPLACES");
+
+    const resume = tools.find((t) => t.name === "resume_run")!;
+    expect((resume.inputSchema.required as string[]).sort()).toEqual(["prompt", "run_id"]);
+    expect(resume.inputSchema.properties).toMatchObject({ wait: { type: "boolean", default: true } });
+    // Affinity is the whole reason resume exists as its own tool.
+    expect(resume.description).toContain("instance");
+    expect(resume.description).toMatch(/cannot fail over/i);
+
+    const register = tools.find((t) => t.name === "register_app")!;
+    expect((register.inputSchema.required as string[])).toEqual(["spec"]);
+    // The invariant an agent must not try to route around.
+    expect(register.description).toContain("QUARANTINED");
+    expect(register.description).toContain("baton adapters review");
+    expect(register.description).toContain("CLI-only");
+
+    const discover = tools.find((t) => t.name === "discover_app")!;
+    expect((discover.inputSchema.required as string[])).toEqual(["name"]);
+    expect(discover.description).toContain("UNTRUSTED");
   });
 });
 
@@ -573,6 +615,8 @@ describe("seed_ratings / get_ratings", () => {
     expect(res.revision).toBe(0);
     expect(res.profile).toBeNull();
     expect(res.ratings).toEqual([]);
+    // No duels here either — the two signals are empty independently.
+    expect(res.bt).toEqual([]);
     expect(res.ratingsFile).toBe(join(seedSession.dir, "ratings.yaml"));
   });
 
@@ -659,6 +703,328 @@ describe("seed_ratings / get_ratings", () => {
       db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM priors WHERE model = 'kimi-k3'").get()
         ?.n,
     ).toBe(1);
+  });
+});
+
+// --- Phase 3: duels, resume, discovery -------------------------------------
+
+/** A CLI on PATH that answers the version probe, admits the run, then stalls. */
+function fakeSleeper(name: string): string {
+  const bin = mkdtempSync(join(tmpdir(), "baton-mcp-bin-"));
+  writeFileSync(
+    join(bin, name),
+    `#!/bin/sh\ncase "$1" in --version) echo "${name} 9.9.9"; exit 0;; esac\nsleep 30\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+interface EdgeRow {
+  model_a: string;
+  model_b: string;
+  category: string;
+  wins_a: number;
+  wins_b: number;
+  ties: number;
+}
+
+function edgeRow(db: Database): EdgeRow | null {
+  return db
+    .query<EdgeRow, []>("SELECT model_a, model_b, category, wins_a, wins_b, ties FROM bt_edges")
+    .get();
+}
+
+interface BtRow {
+  model: string;
+  category: string;
+  theta: number;
+  se: number;
+  nEff: number;
+}
+
+describe("run_duel / report_duel", () => {
+  let duelSession: Session;
+  let db: Database;
+  let bin: string;
+  let duelId: string;
+  let runs: { label: string; runId: string }[];
+  let started: Record<string, unknown>;
+  /** Filled in by the reveal test — nothing before it may know the mapping. */
+  let revealed: { A: string; B: string };
+
+  beforeAll(async () => {
+    // Both codex models, so one fake binary serves both sides of the duel.
+    bin = fakeSleeper("codex");
+    duelSession = await connect("0", { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    db = scopeDb(duelSession.dir);
+    started = await callJson(duelSession.client, "run_duel", {
+      models: ["gpt-5.6-sol", "gpt-5.6-luna"],
+      prompt: "review this diff",
+      category: "review",
+    });
+    duelId = started.duelId as string;
+    runs = started.runs as { label: string; runId: string }[];
+  }, 45_000);
+
+  afterAll(async () => {
+    db?.close();
+    await duelSession?.close();
+    rmSync(bin, { recursive: true, force: true });
+  });
+
+  test("hands back labels and nothing that could identify either side", async () => {
+    expect(duelId).toStartWith("duel");
+    expect(runs.map((r) => r.label)).toEqual(["A", "B"]);
+    expect(started.status).toBe("running");
+    expect(started.category).toBe("review");
+    // Blindness is the whole mechanism: no mapping, and no model name anywhere
+    // in the payload the judging agent gets to read.
+    expect(started.revealed).toBeUndefined();
+    expect(JSON.stringify(started)).not.toContain("gpt-5.6");
+
+    // Both sides really launched, under the same prompt and category.
+    for (const run of runs) {
+      const view = await callJson(duelSession.client, "get_run", { run_id: run.runId });
+      expect(view.status).toBe("running");
+      expect(view.app).toBe("codex");
+    }
+    const launched = db
+      .query<{ model: string; prompt: string }, []>("SELECT model, prompt FROM runs ORDER BY model")
+      .all();
+    expect(launched.map((r) => r.model)).toEqual(["gpt-5.6-luna", "gpt-5.6-sol"]);
+    expect(new Set(launched.map((r) => r.prompt)).size).toBe(1);
+  });
+
+  test("the same model twice is refused before anything is launched", async () => {
+    const { isError, text } = await call(duelSession.client, "run_duel", {
+      models: ["gpt-5.6-sol", "gpt-5.6-sol"],
+      prompt: "who wins",
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain("two different models");
+  });
+
+  test("reporting reveals the mapping and folds one comparison into the edge map", async () => {
+    // What the supervisor would write once both callees answered; the fakes are
+    // still sleeping, so the test settles the runs directly.
+    for (const run of runs) {
+      db.query("UPDATE runs SET status = 'succeeded' WHERE id = ?").run(run.runId);
+    }
+
+    const res = await callJson(duelSession.client, "report_duel", {
+      duel_id: duelId,
+      winner: "A",
+    });
+    expect(res.status).toBe("reported");
+    expect(res.winner).toBe("A");
+
+    revealed = res.revealed as { A: string; B: string };
+    expect([revealed.A, revealed.B].sort()).toEqual(["gpt-5.6-luna", "gpt-5.6-sol"]);
+
+    const edge = edgeRow(db)!;
+    // Stored lexicographically, which is what makes an edge one edge.
+    expect(edge.model_a < edge.model_b).toBe(true);
+    expect(edge.category).toBe("review");
+    const winnerSide = revealed.A === edge.model_a ? edge.wins_a : edge.wins_b;
+    expect(winnerSide).toBeCloseTo(1, 6);
+    expect(edge.ties).toBe(0);
+  });
+
+  test("get_ratings reports Bradley-Terry as its own signal, never merged into blended", async () => {
+    const res = await callJson(duelSession.client, "get_ratings");
+    const bt = res.bt as BtRow[];
+    expect(bt.map((r) => r.model).sort()).toEqual(["gpt-5.6-luna", "gpt-5.6-sol"]);
+    for (const row of bt) {
+      expect(row.category).toBe("review");
+      expect(Number.isFinite(row.theta)).toBe(true);
+      expect(row.se).toBeGreaterThan(0);
+      expect(row.nEff).toBeCloseTo(1, 6);
+    }
+    const winner = bt.find((r) => r.model === revealed.A)!;
+    const loser = bt.find((r) => r.model === revealed.B)!;
+    expect(winner.theta).toBeGreaterThan(loser.theta);
+
+    // A duel is not a grade: the grade-side view has nothing in it.
+    expect(res.ratings).toEqual([]);
+  });
+
+  test("re-reporting replaces the verdict instead of stacking a second comparison", async () => {
+    const before = edgeRow(db)!;
+    const res = await callJson(duelSession.client, "report_duel", {
+      duel_id: duelId,
+      winner: "tie",
+    });
+    expect(res.winner).toBe("tie");
+
+    const after = edgeRow(db)!;
+    // One duel is one comparison however often it is judged; a tie is half a
+    // win each way.
+    expect(after.wins_a + after.wins_b + after.ties).toBeCloseTo(
+      before.wins_a + before.wins_b + before.ties + 1,
+      6,
+    );
+    expect(after.wins_a).toBeCloseTo(0.5, 6);
+    expect(after.wins_b).toBeCloseTo(0.5, 6);
+    expect(after.ties).toBeCloseTo(1, 6);
+  });
+
+  test("an unknown duel handle is a clean tool error", async () => {
+    const { isError, text } = await call(duelSession.client, "report_duel", {
+      duel_id: "duel_nope",
+      winner: "A",
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain("duel_nope");
+  });
+});
+
+describe("resume_run", () => {
+  let resumeSession: Session;
+  let db: Database;
+
+  beforeAll(async () => {
+    resumeSession = await connect();
+    db = scopeDb(resumeSession.dir);
+  }, 30_000);
+
+  afterAll(async () => {
+    db?.close();
+    await resumeSession?.close();
+  });
+
+  test("a run whose attempt reported no session handle cannot be continued", async () => {
+    insertRun(db, "run_nosession", [{ target: KIMI_TARGET, status: "succeeded" }]);
+    const { isError, text } = await call(resumeSession.client, "resume_run", {
+      run_id: "run_nosession",
+      prompt: "and now the tests",
+      wait: false,
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("run_nosession");
+    expect(text).toContain("session handle");
+    // Refused, not silently restarted as a fresh run.
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()?.n).toBe(1);
+  });
+
+  test("an unknown handle is a clean tool error", async () => {
+    const { isError, text } = await call(resumeSession.client, "resume_run", {
+      run_id: "run_elsewhere",
+      prompt: "carry on",
+      wait: false,
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain("run_elsewhere");
+  });
+});
+
+describe("discover_app / register_app", () => {
+  let discoverySession: Session;
+  let db: Database;
+
+  const spec = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    app: "fake-agent",
+    adapterVersion: 1,
+    binary: "/usr/local/bin/fake-agent",
+    identityEnv: "FAKE_AGENT_HOME",
+    models: [{ model: "fake-model", slug: "fake/slug" }],
+    invoke: {
+      argv: ["run", "--json", "-m", "{slug}", "{autonomyFlags}"],
+      promptVia: "stdin",
+      extract: { kind: "json", path: "result" },
+    },
+    autonomyFlags: { readonly: ["--readonly"], full: [] },
+    defaultAutonomy: "full",
+    defaultTimeoutMs: 60_000,
+    admissionFailurePatterns: ["rate limit reached"],
+    ...overrides,
+  });
+
+  beforeAll(async () => {
+    discoverySession = await connect();
+    db = scopeDb(discoverySession.dir);
+  }, 30_000);
+
+  afterAll(async () => {
+    db?.close();
+    await discoverySession?.close();
+  });
+
+  test("discover_app briefs the probing agent and executes nothing", async () => {
+    const { isError, text } = await call(discoverySession.client, "discover_app", {
+      name: "cursor-agent",
+    });
+    expect(isError).toBe(false);
+    expect(text).toContain("cursor-agent");
+    expect(text).toContain("UNTRUSTED");
+    expect(text).toContain("baton adapters review cursor-agent");
+    // The spec schema travels with the brief; that is what makes register_app
+    // answerable without a second round-trip.
+    expect(text).toContain("admissionFailurePatterns");
+  });
+
+  test("register_app quarantines the spec and points at the CLI for approval", async () => {
+    const res = await callJson(discoverySession.client, "register_app", { spec: spec() });
+
+    expect(res.app).toBe("fake-agent");
+    expect(res.status).toBe("quarantined");
+    expect(res.nextStep).toBe("baton adapters review fake-agent");
+    expect(String(res.note)).toContain("CLI-only");
+    expect(
+      db
+        .query<{ status: string }, [string]>("SELECT status FROM discovered_adapters WHERE app = ?")
+        .get("fake-agent")?.status,
+    ).toBe("quarantined");
+  });
+
+  test("a quarantined app is visible as pending, and is not delegatable", async () => {
+    const payload = await callJson(discoverySession.client, "list_models");
+    const models = payload.models as {
+      app: string;
+      model: string;
+      available: boolean;
+      degradedReason?: string;
+    }[];
+
+    // Visible, because hiding it would hide the thing the user is being asked
+    // to review — but unavailable, with the command that would change that.
+    const pending = models.find((m) => m.app === "fake-agent")!;
+    expect(pending.model).toBe("fake-model");
+    expect(pending.available).toBe(false);
+    expect(pending.degradedReason).toContain("baton adapters review fake-agent");
+
+    expect(payload.quarantined_apps).toEqual([
+      { app: "fake-agent", status: "quarantined", nextStep: "baton adapters review fake-agent" },
+    ]);
+
+    // And it really is inert: delegating to its model is refused.
+    const { isError, text } = await call(discoverySession.client, "run_model", {
+      model: "fake-model",
+      prompt: "hello",
+      wait: false,
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain("fake-model");
+  });
+
+  test("an invalid spec is refused with every problem at once, and stores nothing", async () => {
+    const { isError, text } = await call(discoverySession.client, "register_app", {
+      spec: spec({ app: "another-agent", binary: "./fake-agent", invoke: {
+        argv: ["run", "; rm -rf ~"],
+        promptVia: "stdin",
+        extract: { kind: "text" },
+      } }),
+    });
+
+    expect(isError).toBe(true);
+    expect(text).toContain("absolute path");
+    expect(text).toContain("shell metacharacters");
+    expect(text).toContain("{slug}");
+    expect(
+      db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM discovered_adapters WHERE app = ?")
+        .get("another-agent")?.n,
+    ).toBe(0);
   });
 });
 

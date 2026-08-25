@@ -45,6 +45,30 @@ export const codexAdapter: AdapterSpec = {
     path: "thread_id",
     take: "first",
   },
+  // `codex exec resume [SESSION_ID] [PROMPT]`, verified against
+  // `codex exec resume --help` and live (the resume canary in builtin.test.ts).
+  // Two differences from `exec` that matter:
+  // - the PROMPT positional is documented as "if `-` is used, read from stdin"
+  //   and, unlike `exec`, does NOT say an absent positional means stdin. `-` is
+  //   passed explicitly so the prompt on stdin is certain to be the prompt.
+  // - the subcommand accepts `--dangerously-bypass-approvals-and-sandbox` but
+  //   NOT `-s/--sandbox` or `--approve-for-me`, so only `full` is expressible
+  //   here. A scope whose ceiling is readonly/edits gets a clap error from the
+  //   CLI instead of a run at an authority Baton cannot constrain — loud and
+  //   safe, which is the direction to err in.
+  resume: {
+    argv: [
+      "exec",
+      "resume",
+      "{sessionRef}",
+      "-",
+      "--json",
+      "--skip-git-repo-check",
+      "-m",
+      "{slug}",
+      "{autonomyFlags}",
+    ],
+  },
   autonomyFlags: {
     readonly: ["-s", "read-only"],
     edits: ["-s", "workspace-write", "--approve-for-me"],

@@ -142,7 +142,9 @@ describe("openStore — schema and migrations", () => {
     const paths = scopePaths("upgrade");
     const first = openStore(paths.dbPath);
     insertRun(first, { id: "run_pre_v2" });
-    // Rewind to a genuine v1 database: undo v4/v2's columns and v3's tables.
+    const versions =
+      first.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations").get()!.n;
+    // Rewind to a genuine v1 database: undo the later migrations' columns/tables.
     first.exec("ALTER TABLE attempts DROP COLUMN owner_pid");
     first.exec("ALTER TABLE runs DROP COLUMN payload_hash");
     for (const t of [
@@ -153,6 +155,9 @@ describe("openStore — schema and migrations", () => {
       "quota_events",
       "cooldowns",
       "pools",
+      "duels",
+      "bt_edges",
+      "discovered_adapters",
     ]) {
       first.exec(`DROP TABLE ${t}`);
     }
@@ -163,7 +168,7 @@ describe("openStore — schema and migrations", () => {
     expect(runColumns(upgraded)).toContain("payload_hash");
     expect(
       upgraded.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations").get()!.n,
-    ).toBe(4);
+    ).toBe(versions);
     expect(countRuns(upgraded)).toBe(1);
     upgraded.close();
   });
@@ -317,6 +322,33 @@ describe("pruneRuns — capped ring buffer", () => {
     const second = openStore(paths.dbPath, 10);
     expect(countRuns(second)).toBe(10);
     second.close();
+  });
+
+  /**
+   * A duel points at two runs, and those runs age out like any other. While
+   * `duels.run_a/run_b` were foreign keys into runs(id), the first eviction of
+   * a duelled run threw FOREIGN KEY constraint failed — inside openStore, so
+   * every process in the scope stopped being able to open the database at all.
+   */
+  test("evicts runs that a duel points at, leaving the duel row void", () => {
+    const paths = scopePaths("prune-duel");
+    const db = openStore(paths.dbPath);
+    seedTerminal(db, 12);
+    const [a, b] = db
+      .query<{ id: string }, []>("SELECT id FROM runs ORDER BY created_at LIMIT 2")
+      .all()
+      .map((r) => r.id) as [string, string];
+    db.query(
+      "INSERT INTO duels (id, model_a, model_b, run_a, run_b, label_map, created_at) VALUES (?,?,?,?,?,?,?)",
+    ).run("duel_old", "kimi-k3", "opus-5", a, b, "{}", stamp(0));
+    db.close();
+
+    const reopened = openStore(paths.dbPath, 5);
+    expect(countRuns(reopened)).toBe(5);
+    // The verdict record survives its evidence; duelView reads it as void.
+    expect(reopened.query("SELECT id FROM duels WHERE id = 'duel_old'").get()).toBeTruthy();
+    expect(reopened.query("SELECT id FROM runs WHERE id = ?").get(a)).toBeFalsy();
+    reopened.close();
   });
 });
 

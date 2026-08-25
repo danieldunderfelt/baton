@@ -51,7 +51,7 @@ export interface InvokeSpec {
 }
 
 export interface AdapterSpec {
-  /** App id: "codex", "kimi", "claude-code", "opencode". */
+  /** App id: "codex", "kimi", "claude-code", "opencode", "cursor-agent". */
   app: string;
   adapterVersion: number;
   /** Executable name, resolved to an absolute path at detect time. */
@@ -68,6 +68,17 @@ export interface AdapterSpec {
   autonomyFlags: Partial<Record<Autonomy, string[]>>;
   /** Where the app's own session/thread id appears in stdout, for resume (phase 2). */
   sessionRef?: ExtractSpec;
+  /**
+   * How to continue a session the app already holds (PLAN.md §Session
+   * affinity). argv AFTER the binary, same substitution rules as `invoke`
+   * plus `{sessionRef}` — the handle `sessionRef` extracted from the run being
+   * resumed, filled in by the supervisor because it is run state, not adapter
+   * state. `promptVia` and `extract` are inherited from `invoke`: only the argv
+   * template differs, so a resume goes through the identical executor pipeline.
+   * Absent = this app has no verified non-interactive resume, and Baton refuses
+   * to resume its runs rather than guess.
+   */
+  resume?: { argv: string[] };
   defaultAutonomy: Autonomy;
   defaultTimeoutMs: number;
   /**

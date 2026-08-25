@@ -47,6 +47,24 @@ export const kimiAdapter: AdapterSpec = {
     path: "session_id",
     take: "last",
   },
+  // `-S, --session [id]` on the same command as `-p` (verified against
+  // `kimi --help`; not exercised live — the resume canary is codex-only). The
+  // id follows `-S` directly because its value is optional and an absent one
+  // opens the interactive picker. Only `--agent`/`--agent-file` are documented
+  // as incompatible with `--session`; neither is used here.
+  resume: {
+    argv: [
+      "--model",
+      "{slug}",
+      "--output-format",
+      "stream-json",
+      "-S",
+      "{sessionRef}",
+      "{autonomyFlags}",
+      "-p",
+      "{prompt}",
+    ],
+  },
   autonomyFlags: { full: [] },
   defaultAutonomy: "full",
   defaultTimeoutMs: 300_000,

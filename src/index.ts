@@ -37,15 +37,20 @@ function printHelp(): void {
 
 Usage:
   baton mcp                      Run the stdio MCP server (register via 'baton install')
+  baton serve --http [--port <n>]  Run the HTTP MCP daemon for this scope
   baton detect                   Detect installed agent CLIs and adapter health
   baton models                   List available models in this scope
   baton run <model> <prompt>     Run a one-off delegation from the shell
+  baton resume <run-id> <prompt> Continue a finished run's own session
   baton runs [<run-id>]          Show recent runs / one run's detail
+  baton duel <a> <b> <prompt>    Blind A/B between two models (report to judge)
+  baton adapters <list|review|approve|reject|canary> ...   Adapters and discovery
   baton instance <add|list|remove> ...   Manage named app instances
   baton pool <set|list|clear> ...        Load-balance an app across instances
   baton ratings [publish]        Show model ratings / refresh ratings.yaml
   baton grade <run-id> <1-5>     Grade a run after using its result
   baton profile import <file>    Import a shared priors profile (--yes to commit)
+  baton profile export           Print the active profile as a portable file
   baton set <key> <value>        Set a scope setting (e.g. max_autonomy:codex full)
   baton install <host>           Register Baton with a host app (claude-code, codex, kimi, opencode)
   baton status                   Show scope, resolved identity env vars, DB path

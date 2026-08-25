@@ -13,7 +13,7 @@ Baton routes on evidence, and the evidence is your grades. Grade a delegation **
 - `notes` is one line on *why* — that is what makes a grade re-readable later.
 - Reports are upserts: re-reporting the same `run_id` replaces its grade, so a correction never double-counts.
 - From the shell: `baton grade <run_id> <1-5> [notes...]`, and `baton ratings` prints the current table (observed, prior, blended, and which profile the prior came from).
-- Blind duels (`run_duel` / `report_duel`) are not available yet — they land in phase 3.
+- `report_duel` is an upsert too: a re-judged duel replaces its verdict instead of stacking a second one onto the pair.
 
 ### Onboarding: seeding the user's priors
 

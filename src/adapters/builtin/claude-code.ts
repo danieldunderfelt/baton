@@ -38,6 +38,24 @@ export const claudeCodeAdapter: AdapterSpec = {
   // Same single JSON object: {"session_id":"<uuid>", ...}. Resumable with
   // `--resume <session_id>` from the same instance.
   sessionRef: { kind: "json", path: "session_id" },
+  // `-r, --resume [value]` on the same command as `-p`, so every invoke flag
+  // stays valid (verified against `claude --help`; not exercised live — the
+  // resume canary is codex-only, see builtin.test.ts). The session id goes
+  // immediately after `-r`: its value is optional, and an absent one opens the
+  // interactive picker. `--fork-session` is deliberately not passed, so the
+  // resumed session keeps its id and can be resumed again.
+  resume: {
+    argv: [
+      "-p",
+      "--output-format",
+      "json",
+      "-r",
+      "{sessionRef}",
+      "--model",
+      "{slug}",
+      "{autonomyFlags}",
+    ],
+  },
   // One flag family covers all three levels, so a scope ceiling maps cleanly.
   // `plan` is the read-only mode (it may read, never write); `acceptEdits`
   // auto-approves edits without granting the rest. Unlike kimi, `-p` accepts

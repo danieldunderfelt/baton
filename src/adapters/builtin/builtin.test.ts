@@ -8,6 +8,7 @@ import {
   builtinAdapters,
   claudeCodeAdapter,
   codexAdapter,
+  cursorAdapter,
   getAdapter,
   opencodeAdapter,
 } from "./index.ts";
@@ -20,18 +21,25 @@ import {
 /** Anything a shell would treat specially: argv must never need quoting. */
 const SHELL_METACHARS = /[;&|<>$`(){}[\]!*?~"'\\\s]/;
 const PLACEHOLDERS = new Set(["{slug}", "{prompt}", "{autonomyFlags}"]);
+const RESUME_PLACEHOLDERS = new Set([...PLACEHOLDERS, "{sessionRef}"]);
+/** Session flags whose value is optional — an absent one goes interactive. */
+const OPTIONAL_VALUE_SESSION_FLAGS = ["-r", "--resume", "-S", "--session"];
 
 const count = (argv: string[], token: string): number =>
   argv.filter((element) => element === token).length;
 
-/** Apps whose credential store no env var relocates (probed, see opencode.ts). */
-const NO_IDENTITY_ENV = new Set(["opencode"]);
+/**
+ * Apps with no config-dir style identity var, so no instances and no pool
+ * (probed: see opencode.ts and cursor.ts).
+ */
+const NO_IDENTITY_ENV = new Set(["opencode", "cursor-agent"]);
 
 describe("registry", () => {
   test("exposes every built-in app in a deterministic order", () => {
     expect(builtinAdapters.map((a) => a.app)).toEqual([
       "claude-code",
       "codex",
+      "cursor-agent",
       "kimi",
       "opencode",
     ]);
@@ -39,7 +47,7 @@ describe("registry", () => {
 
   test("getAdapter resolves by app id", () => {
     for (const spec of builtinAdapters) expect(getAdapter(spec.app)).toBe(spec);
-    expect(getAdapter("cursor-agent")).toBeUndefined();
+    expect(getAdapter("aider")).toBeUndefined();
     expect(getAdapter("")).toBeUndefined();
   });
 
@@ -105,6 +113,33 @@ describe.each(builtinAdapters.map((spec) => [spec.app, spec] as const))("%s spec
     if (spec.sessionRef) expectWellFormedExtract(spec.sessionRef);
   });
 
+  test("resume argv substitutes exactly like invoke argv", () => {
+    const argv = spec.resume?.argv;
+    if (!argv) return; // Declared per app; the roster is pinned below.
+    // A resume that cannot be handed a handle is unusable by construction.
+    expect(spec.sessionRef).toBeDefined();
+    expect(count(argv, "{sessionRef}")).toBe(1);
+    // promptVia and extract are inherited, so the prompt placeholder must
+    // follow the same rule the first turn did.
+    expect(count(argv, "{prompt}")).toBe(spec.invoke.promptVia === "argv" ? 1 : 0);
+    for (const element of argv) {
+      if (RESUME_PLACEHOLDERS.has(element)) continue;
+      expect(element).not.toInclude("{");
+      expect(element).not.toBe("");
+      expect(element).not.toMatch(SHELL_METACHARS);
+    }
+  });
+
+  test("an optional-value session flag is followed by the handle itself", () => {
+    const argv = spec.resume?.argv ?? [];
+    // `claude -r [value]` and `kimi -S [id]` open an interactive picker when
+    // the value is missing, which non-interactively means a hung run.
+    for (const flag of OPTIONAL_VALUE_SESSION_FLAGS) {
+      const at = argv.indexOf(flag);
+      if (at !== -1) expect(argv[at + 1]).toBe("{sessionRef}");
+    }
+  });
+
   test("autonomy levels are known and the default is supported", () => {
     for (const level of Object.keys(spec.autonomyFlags)) {
       expect(AUTONOMY_ORDER as string[]).toContain(level);
@@ -153,6 +188,33 @@ test("claude-code lists only the verified auth signature", () => {
   expect(claudeCodeAdapter.workStartedPatterns).toEqual([]);
 });
 
+describe("resume roster", () => {
+  test("every built-in declares a help-verified non-interactive resume", () => {
+    // Every app documents a resume flag on the very command Baton already runs
+    // non-interactively (`codex exec resume`, `claude -r`, `cursor-agent
+    // --resume`, `kimi -S`, `opencode run -s`). codex's is exercised live (see
+    // the canary below) and cursor-agent's was verified live while writing the
+    // adapter (a second turn recalled the first); the rest are verified against
+    // --help, which is what the phase-3 brief asks for.
+    expect(builtinAdapters.filter((s) => s.resume).map((s) => s.app)).toEqual([
+      "claude-code",
+      "codex",
+      "cursor-agent",
+      "kimi",
+      "opencode",
+    ]);
+  });
+
+  test("codex asks for the prompt on stdin explicitly", () => {
+    // `codex exec` documents "if not provided as an argument (or if `-` is
+    // used), instructions are read from stdin"; `codex exec resume` documents
+    // only the `-` form, so the positional is passed rather than assumed.
+    const argv = codexAdapter.resume!.argv;
+    expect(argv.slice(0, 4)).toEqual(["exec", "resume", "{sessionRef}", "-"]);
+    expect(codexAdapter.invoke.promptVia).toBe("stdin");
+  });
+});
+
 function expectWellFormedExtract(extract: ExtractSpec): void {
   expect(["text", "json", "jsonl"]).toContain(extract.kind);
   if (extract.kind === "text") return;
@@ -176,12 +238,14 @@ function expectWellFormedExtract(extract: ExtractSpec): void {
  * executor's contract, covered in executor.test.ts) and reproduces the exit
  * code, which for these apps is not a reliable success signal on its own.
  */
-function replay(spec: AdapterSpec, stdout: string, exitCode = 0): Promise<ExecResult> {
+function replay(spec: AdapterSpec, stdout: string, exitCode = 0, stderr = ""): Promise<ExecResult> {
   const dir = mkdtempSync(join(tmpdir(), "baton-replay-"));
   const sample = join(dir, "stdout");
+  const errSample = join(dir, "stderr");
   const script = join(dir, "cli");
   writeFileSync(sample, stdout);
-  writeFileSync(script, `#!/bin/sh\ncat ${sample}\nexit ${exitCode}\n`);
+  writeFileSync(errSample, stderr);
+  writeFileSync(script, `#!/bin/sh\ncat ${sample}\ncat ${errSample} >&2\nexit ${exitCode}\n`);
   chmodSync(script, 0o755);
   return executeAdapter({
     spec,
@@ -358,6 +422,83 @@ describe("codex recorded output", () => {
   });
 });
 
+describe("cursor-agent recorded output", () => {
+  const SESSION = "f0d6b505-1095-47ee-a6fb-59aede2de90c";
+  // Verbatim event shapes from a live `--output-format stream-json` run.
+  const init = json({
+    type: "system",
+    subtype: "init",
+    apiKeySource: "login",
+    session_id: SESSION,
+    model: "Cursor Grok 4.6 High",
+  });
+  const assistant = (text: string): string =>
+    json({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+      session_id: SESSION,
+    });
+  const result = (fields: Record<string, unknown>): string =>
+    json({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      duration_ms: 4694,
+      session_id: SESSION,
+      ...fields,
+    });
+
+  test("answer is the terminal result event, session id comes off the first", async () => {
+    const res = await replay(
+      cursorAdapter,
+      // The assistant event carries a partial message on purpose: the terminal
+      // result is the canonical answer, and reading the content array instead
+      // would return this.
+      init + assistant("Let me think") + result({ result: "BATON_CANARY" }),
+    );
+    expect(res.ok).toBe(true);
+    expect(res.output).toBe("BATON_CANARY");
+    expect(res.sessionRef).toBe(SESSION);
+  });
+
+  test("is_error fails the run even though the envelope carries a result string", async () => {
+    // subtype is prose and the exit code has been 0 for failed turns elsewhere;
+    // is_error is the field to branch on.
+    const res = await replay(
+      cursorAdapter,
+      init + result({ subtype: "error", is_error: true, result: "Conversation was interrupted" }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.output).toBeUndefined();
+    expect(res.error).toContain("Conversation was interrupted");
+  });
+
+  test("a logged-out config cools the instance down though it printed no JSON", async () => {
+    // Reproduced live by pointing HOME at an empty dir: --output-format is
+    // ignored on the failure path, so this arrives as one plain stderr line.
+    const res = await replay(
+      cursorAdapter,
+      "",
+      1,
+      "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY environment variable.\n",
+    );
+    expect(res.ok).toBe(false);
+    expect(classifyFailure(cursorAdapter, res)).toBe("admission");
+  });
+
+  test("a bad model slug fails the run without cooling the instance down", async () => {
+    const res = await replay(
+      cursorAdapter,
+      "",
+      1,
+      "Cannot use this model: cursor-not-a-model. Available models: auto, gpt-5.3-codex, …\n",
+    );
+    expect(res.ok).toBe(false);
+    // A route defect: every other account would reject the same slug.
+    expect(classifyFailure(cursorAdapter, res)).toBe("failure");
+  });
+});
+
 // --- Live canary: real CLI, real subscription quota. ------------------------
 
 const LIVE = Bun.env.BATON_LIVE_TESTS === "1";
@@ -390,4 +531,58 @@ describe.skipIf(!LIVE)("live canary", () => {
     },
     CANARY_TIMEOUT_MS + 30_000,
   );
+
+  /**
+   * The one live resume, on the cheapest verified path. Only a second turn
+   * that remembers the first proves the whole chain: the handle extraction,
+   * the resume argv, and the app actually restoring the session — none of
+   * which a --help reading can establish.
+   */
+  test(
+    "codex remembers the first turn when resumed",
+    async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "baton-resume-canary-"));
+      const slug = "gpt-5.6-luna"; // cheapest codex route
+      const env = { ...process.env, BATON_HOPS: "1" };
+
+      const first = await executeAdapter({
+        spec: codexAdapter,
+        slug,
+        prompt: "Say the word apple. Reply with just that word.",
+        cwd,
+        env,
+        autonomy: codexAdapter.defaultAutonomy,
+        timeoutMs: CANARY_TIMEOUT_MS,
+      });
+      expect(first.ok).toBe(true);
+      expect(first.sessionRef).toBeTruthy();
+
+      const resumed = await executeAdapter({
+        spec: resumeInvocation(codexAdapter, first.sessionRef ?? ""),
+        slug,
+        prompt: "Repeat the word you just said.",
+        cwd,
+        env,
+        autonomy: codexAdapter.defaultAutonomy,
+        timeoutMs: CANARY_TIMEOUT_MS,
+      });
+      expect(resumed.error).toBeUndefined();
+      expect(resumed.ok).toBe(true);
+      expect(resumed.output?.toLowerCase()).toInclude("apple");
+    },
+    2 * (CANARY_TIMEOUT_MS + 30_000),
+  );
 });
+
+/**
+ * The resume invocation as a one-off spec — the same substitution the
+ * supervisor performs before handing a resumed attempt to the executor
+ * (`{sessionRef}` is run state; every other placeholder stays the executor's).
+ */
+function resumeInvocation(spec: AdapterSpec, sessionRef: string): AdapterSpec {
+  const argv = spec.resume?.argv ?? [];
+  return {
+    ...spec,
+    invoke: { ...spec.invoke, argv: argv.map((e) => e.replaceAll("{sessionRef}", sessionRef)) },
+  };
+}

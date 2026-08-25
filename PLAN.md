@@ -144,7 +144,7 @@ Eval is opt-in via the instruction layer (grade after *using* the result; consum
 - `codex exec --json`, `codex exec resume`, `CODEX_HOME`
 - `opencode run --format json` — **no identity env var** (phase-2 probe: `OPENCODE_CONFIG_DIR` does not exist, and neither `XDG_*` nor `HOME` relocates `~/.local/share/opencode/auth.json`), so opencode has only the inherited-environment `default` instance and no pool is possible, same as cursor-agent
 - `kimi -p --model kimi-code/k3`, `KIMI_CODE_HOME`
-- `cursor-agent -p --output-format stream-json` — adapter yes (phase 3), instances no
+- `cursor-agent -p --output-format stream-json` — adapter built (phase 3), instances no. Live-probed: `--mode plan` holds above `--force`, so `readonly` is expressible; failures bypass `--output-format` entirely and print plain text on stderr; `HOME` relocates the credential store but is not an identity var, so the instance exclusion stands
 
 ## Build phases (3, dogfood-first)
 
@@ -168,6 +168,15 @@ Duels + regularized Bradley-Terry; agentic discovery (quarantine, approval-befor
 
 ## Review log
 
+- 2026-08-25 (phase-3 build) — decisions taken while landing duels/BT, discovery, resume, cursor-agent, HTTP and the conformance suite:
+  - **`duels.run_a/run_b` are advisory references, not foreign keys** (migration v6). The run ring buffer evicts by age, and a real FK turned the first eviction of a duelled run into `FOREIGN KEY constraint failed` *inside `openStore`* — every process in the scope failing to open the database. A duel whose runs aged out is void, not judgeable, which is what `duelView` already reported; the verdict record outliving its evidence is correct and harmless (it holds no prompts).
+  - **Session affinity is a registry lookup** (`targetFor`), never a selection: the supervisor no longer mints its own fingerprint or resolves its own binary, so a resumed attempt records evidence under the same execution target as the run it continues, and a resumed *discovered* app resolves at all.
+  - **The app version is in the execution-target fingerprint** (`...@a1+v0.42.0+full`), with no migration: evidence under the old key ages out under the normal half-life rather than being rewritten. Selection pays one memoized `<binary> --version` per binary path per process.
+  - **The rating lens is autonomy-aware.** Evidence is indexed same-autonomy and level-pooled; the same-autonomy bucket is used only once its Σw clears the model-prior weight, and the caller's requested autonomy is forwarded into selection so candidates are rated at the level the run will actually execute at.
+  - **`register_app` always re-quarantines**, even for a byte-identical resubmission: approval is consent to one reviewed spec, and re-deriving it from an agent-controlled tool call is the hole quarantine exists to close. Approve/reject/canary are CLI-only and deliberately have no MCP tool.
+  - **BT is a second signal, never blended.** One decayed-edge projection (`currentEdges`/`btRatings`) serves `get_ratings`, `baton ratings` and the CLI, because three copies of the decay rule is the bug class the phase-2 review already caught once.
+  - **Resume cannot be expressed at every autonomy level for codex**: `codex exec resume` accepts `--dangerously-bypass-approvals-and-sandbox` but not `-s/--sandbox`. A resume under a narrowed ceiling therefore fails loudly at the CLI rather than escalating silently; giving `resume` its own `autonomyFlags` is deferred until something needs it.
+  - Exit criterion rehearsed as an ordinary test (`test/onboarding.e2e.test.ts`): an unknown app is discovered, registered, quarantined, reviewed and approved through the real MCP and CLI surfaces, canaried into `active`, delegated to, and seeded — no config file edited, no live CLI, no quota.
 - 2026-08-22 — kimi-k3 and gpt-5.6-sol (round 1, on v1): convergent findings on cwd trust, credential-isolation verification, run_model security surface, discovery injection, eval sample-size realism, static-cost fiction, file-store concurrency → v2. Sol additionally: execution-target ratings with hierarchical priors, run state machine + idempotency, recursion limits, Cursor state-dir gap. Kimi additionally: quota-budget framing, visible degraded adapters, read-time decay bug.
 - 2026-08-22 (v3) — user decision: critical identity separation delegated to direnv; enforcement machinery removed, replaced by environment transparency and instance pools.
 - 2026-08-22 (v4) — user decisions: renamed Baton; Bun toolchain; derived human-readable ratings YAML; execution modes dropped (permissions caller-owned); seeded priors via onboarding; 3 dogfood-first phases.

@@ -1,13 +1,36 @@
 import type { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
-import { killProcessGroup } from "../adapters/executor.ts";
-import { AUTONOMY_ORDER, type Autonomy } from "../adapters/types.ts";
+import { executeAdapter, killProcessGroup } from "../adapters/executor.ts";
+import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
 import {
+  approveDiscovered,
+  canaryDiscovered,
+  CANARY_PROMPT,
+  CANARY_TIMEOUT_MS,
+  formatReview,
+  listDiscovered,
+  rejectDiscovered,
+  detectDiscovered,
+  reviewDiscovered,
+  validateSpec,
+} from "../discovery/discovery.ts";
+import { CANARY_TOKEN, type DiscoveredStatus } from "../discovery/types.ts";
+import {
+  btRatings,
+  currentEdges,
+  duelView,
+  reportDuel,
+  startDuel,
+  type Winner,
+} from "../eval/duels.ts";
+import type { DuelView } from "../eval/duelTypes.ts";
+import {
+  activeProfile,
   recordGrade,
   setActiveProfile,
   setRatingSetting,
@@ -16,8 +39,10 @@ import {
 } from "../eval/evalStore.ts";
 import {
   diffProfileDocument,
+  exportProfile,
   importProfileFile,
   parseProfileDocument,
+  renderProfile,
 } from "../eval/profileFile.ts";
 import { publishRatings, repairProjection, snapshotRatings } from "../eval/publish.ts";
 import {
@@ -35,15 +60,16 @@ import {
   setPool,
 } from "../quota/pools.ts";
 import { PRECIOUSNESS_FACTOR, SETTING_PRECIOUSNESS_PREFIX } from "../quota/types.ts";
-import { detectApps, listModels } from "../registry/registry.ts";
+import { detectApps, listModels, routableAdapters } from "../registry/registry.ts";
 import { nowIso, openStore, withBusyRetry } from "../store/store.ts";
-import { createSupervisor } from "../supervisor/supervisor.ts";
+import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
 import {
   HOPS_ENV,
   SETTING_MAX_AUTONOMY_PREFIX,
   SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type RunStatus,
+  type RunView,
 } from "../supervisor/types.ts";
 import { INSTALL_HOSTS, installHost, isInstallHost } from "./install.ts";
 
@@ -76,8 +102,16 @@ export async function runCli(command: string, args: string[]): Promise<number> {
         return models();
       case "run":
         return await run(args);
+      case "resume":
+        return await resume(args);
       case "runs":
         return runs(args);
+      case "duel":
+        return await duel(args);
+      case "adapters":
+        return await adapters(args);
+      case "serve":
+        return await serve(args);
       case "instance":
         return instance(args);
       case "pool":
@@ -118,18 +152,24 @@ function status(): number {
   console.log(table(rows));
 
   console.log("\nadapters:");
-  for (const app of detectApps({ probeVersion: false })) {
+  const { db } = openScope();
+  for (const app of detectApps({ probeVersion: false, db })) {
     console.log(`  ${app.app.padEnd(12)} ${app.binaryPath ?? "not on PATH in this scope"}`);
   }
   return 0;
 }
 
 function detect(): number {
+  const { db } = openScope();
+  // A version bump means the canary's evidence is stale, so detect is also
+  // where an active discovered adapter drops out of the registry until it is
+  // re-canaried (PLAN.md §Agentic discovery, step 5).
+  const changes = detectDiscovered(db);
   const modelsByApp = new Map(
-    builtinAdapters.map((spec) => [spec.app, spec.models.map((m) => m.model).join(", ")]),
+    routableAdapters(db).map((spec) => [spec.app, spec.models.map((m) => m.model).join(", ")]),
   );
   const rows: string[][] = [["APP", "BINARY", "VERSION", "MODELS"]];
-  for (const app of detectApps()) {
+  for (const app of detectApps({ db })) {
     rows.push([
       app.app,
       app.binaryPath ?? "(not found)",
@@ -138,6 +178,9 @@ function detect(): number {
     ]);
   }
   console.log(table(rows));
+  for (const change of changes) {
+    console.log(`\n${change.app}: ${change.from} → ${change.to} — ${change.note}`);
+  }
   return 0;
 }
 
@@ -167,7 +210,7 @@ async function run(args: string[]): Promise<number> {
 
   const db = openDb();
   const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
-  const { view, settled } = await supervisor.startRun({
+  const started = await supervisor.startRun({
     model,
     prompt,
     ...(flags.cwd === undefined ? {} : { cwd: resolve(String(flags.cwd)) }),
@@ -177,44 +220,93 @@ async function run(args: string[]): Promise<number> {
       ...(timeoutMs ? { timeoutMs } : {}),
     },
   });
+  return await settle(db, supervisor, started);
+}
 
-  // Ctrl-C must not leave the callee's process group running: the CLI is its
-  // only supervisor, and cancelRun merely SIGTERMs (its SIGKILL escalation is an
-  // unref'd timer that an exiting process never fires). Cancel, wait for the
-  // group to be verifiably dead, then leave with the signal's exit code.
-  let cancelling = false;
-  const cancel = async (exitCode: number): Promise<void> => {
-    if (cancelling) return; // a second Ctrl-C while the group is dying changes nothing
-    cancelling = true;
-    supervisor.cancelRun(view.runId);
-    const kills = attemptPids(db, view.runId).map((pid) => killProcessGroup(pid));
-    for (const outcome of await Promise.all(kills)) {
-      if (!outcome.dead) console.error(`baton: ${outcome.why}`);
-    }
-    console.error(`baton: run ${view.runId} cancelled`);
-    process.exit(exitCode);
-  };
-  const sigint = (): void => void cancel(130);
-  const sigterm = (): void => void cancel(143);
-  process.on("SIGINT", sigint);
-  process.on("SIGTERM", sigterm);
+/**
+ * A second turn on a finished run's own session, on the instance that holds it
+ * (PLAN.md §Session affinity — the supervisor pins both). Everything else about
+ * the original request is inherited; only the prompt is new.
+ */
+async function resume(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { value: ["timeout", "autonomy"] });
+  const runId = rest[0];
+  if (!runId) return usage("resume needs a run: baton resume <run-id> <prompt...>");
+  const prompt = await readPrompt(rest.slice(1));
+  if (!prompt) return usage("resume needs a prompt (or '-' to read one from stdin)");
 
-  // There is no --no-wait: this process is the supervisor, so detaching would
-  // orphan the record. Async delegation is the MCP server's job (wait:false),
-  // because that server outlives the call.
+  const autonomy = flags.autonomy === undefined ? undefined : parseAutonomy(String(flags.autonomy));
+  const timeoutMs =
+    flags.timeout === undefined ? undefined : parsePositiveInt(String(flags.timeout), "--timeout");
+
+  const db = openDb();
+  const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
+  const started = await supervisor.resumeRun({
+    runId,
+    prompt,
+    options: {
+      ...(autonomy ? { autonomy } : {}),
+      ...(timeoutMs ? { timeoutMs } : {}),
+    },
+  });
+  return await settle(db, supervisor, started);
+}
+
+/**
+ * Waits for a launched run and prints its answer. There is no --no-wait: this
+ * process is the supervisor, so detaching would orphan the record. Async
+ * delegation is the MCP server's job (wait:false), because that server outlives
+ * the call.
+ */
+async function settle(
+  db: Database,
+  supervisor: Supervisor,
+  started: { view: RunView; settled: Promise<void> },
+): Promise<number> {
+  const release = guardCancellation(db, supervisor, [started.view.runId]);
   try {
-    await settled;
+    await started.settled;
   } finally {
-    process.off("SIGINT", sigint);
-    process.off("SIGTERM", sigterm);
+    release();
   }
-  const final = supervisor.getRun(view.runId) ?? view;
+  const final = supervisor.getRun(started.view.runId) ?? started.view;
   if (final.status === "succeeded") {
     console.log(final.output ?? "");
     return 0;
   }
   console.error(`baton: run ${final.runId} ${final.status}: ${final.error ?? "no error recorded"}`);
   return 1;
+}
+
+/**
+ * Ctrl-C must not leave a callee's process group running: the CLI is its only
+ * supervisor, and cancelRun merely SIGTERMs (its SIGKILL escalation is an
+ * unref'd timer that an exiting process never fires). Cancel, wait for the
+ * groups to be verifiably dead, then leave with the signal's exit code.
+ * Returns the handler removal, so a finished command stops intercepting signals.
+ */
+function guardCancellation(db: Database, supervisor: Supervisor, runIds: string[]): () => void {
+  let cancelling = false;
+  const cancel = async (exitCode: number): Promise<void> => {
+    if (cancelling) return; // a second Ctrl-C while the groups are dying changes nothing
+    cancelling = true;
+    for (const runId of runIds) supervisor.cancelRun(runId);
+    const pids = runIds.flatMap((runId) => attemptPids(db, runId));
+    const kills = pids.map((pid) => killProcessGroup(pid));
+    for (const outcome of await Promise.all(kills)) {
+      if (!outcome.dead) console.error(`baton: ${outcome.why}`);
+    }
+    console.error(`baton: run ${runIds.join(", ")} cancelled`);
+    process.exit(exitCode);
+  };
+  const sigint = (): void => void cancel(130);
+  const sigterm = (): void => void cancel(143);
+  process.on("SIGINT", sigint);
+  process.on("SIGTERM", sigterm);
+  return () => {
+    process.off("SIGINT", sigint);
+    process.off("SIGTERM", sigterm);
+  };
 }
 
 /** Process groups this run launched — everything the CLI is allowed to kill. */
@@ -288,6 +380,454 @@ function runList(db: Database): number {
     table_.push([r.id, r.model, r.status, age(r.created_at), preview(r.prompt)]);
   }
   console.log(table(table_));
+  return 0;
+}
+
+/**
+ * Blind A/B (PLAN.md §Evaluation). Both sides run with identical prompt,
+ * options and cwd, and the two answers are printed under labels only: a judge
+ * who knows which model wrote which text is rating the name, not the answer.
+ * `duel report` is the single place the mapping is revealed.
+ */
+async function duel(args: string[]): Promise<number> {
+  switch (args[0]) {
+    case "report":
+      return duelReport(args.slice(1));
+    case "list":
+      return duelList();
+    default:
+      return await duelStart(args);
+  }
+}
+
+const DUEL_POLL_MS = 250;
+const DUELS_LIMIT = 20;
+
+async function duelStart(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { value: ["category", "cwd", "timeout"] });
+  const [modelA, modelB] = rest;
+  if (!modelA || !modelB) {
+    return usage("duel needs two models: baton duel <modelA> <modelB> <prompt...>");
+  }
+  const prompt = await readPrompt(rest.slice(2));
+  if (!prompt) return usage("duel needs a prompt (or '-' to read one from stdin)");
+  const timeoutMs =
+    flags.timeout === undefined ? undefined : parsePositiveInt(String(flags.timeout), "--timeout");
+
+  const db = openDb();
+  const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
+  const started = await startDuel(
+    { db, supervisor },
+    {
+      models: [modelA, modelB],
+      prompt,
+      ...(flags.category === undefined ? {} : { category: String(flags.category) }),
+      ...(flags.cwd === undefined ? {} : { cwd: resolve(String(flags.cwd)) }),
+      ...(timeoutMs === undefined ? {} : { options: { timeoutMs } }),
+    },
+  );
+
+  const release = guardCancellation(
+    db,
+    supervisor,
+    started.runs.map((r) => r.runId),
+  );
+  let view: DuelView;
+  try {
+    view = await settleDuel(db, supervisor, started.duelId);
+  } finally {
+    release();
+  }
+  if (view.status !== "awaiting_judgment") {
+    console.error(
+      `baton: duel ${view.duelId} is void — a side produced no answer, and a side that never answered cannot lose. 'baton runs' has the detail.`,
+    );
+    return 1;
+  }
+
+  for (const side of view.runs) {
+    console.log(`──── ${side.label} ────`);
+    console.log(supervisor.getRun(side.runId)?.output ?? "");
+    console.log("");
+  }
+  console.log(`judge with: baton duel report ${view.duelId} <A|B|tie>`);
+  return 0;
+}
+
+/** Both runs settle on their own; the duel is polled, never awaited. */
+async function settleDuel(
+  db: Database,
+  supervisor: Supervisor,
+  duelId: string,
+): Promise<DuelView> {
+  for (;;) {
+    const view = duelView(db, supervisor, duelId);
+    if (view.status !== "running") return view;
+    await Bun.sleep(DUEL_POLL_MS);
+  }
+}
+
+/** Judgment, and the only reveal: the mapping is printed after the verdict. */
+function duelReport(args: string[]): number {
+  const [duelId, verdict] = args;
+  if (!duelId || verdict === undefined) {
+    return usage("duel report needs: <duel-id> <A|B|tie>");
+  }
+  const winner = parseWinner(verdict);
+  const { db, paths } = openScope();
+  const view = reportDuel(db, duelId, winner);
+  publishRatings(db, paths.configDir);
+  const revealed = view.revealed ?? { A: "?", B: "?" };
+  console.log(
+    table([
+      ["duel", view.duelId],
+      ["category", view.category || "-"],
+      ["winner", view.winner ?? "-"],
+      ["A was", revealed.A],
+      ["B was", revealed.B],
+    ]),
+  );
+  return 0;
+}
+
+function parseWinner(value: string): Winner {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "a") return "A";
+  if (normalized === "b") return "B";
+  if (normalized === "tie") return "tie";
+  throw new UsageError(`duel winner must be 'A', 'B' or 'tie', got '${value}'.`);
+}
+
+function duelList(): number {
+  const db = openDb();
+  const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
+  const ids = db
+    .query<{ id: string }, [number]>(
+      "SELECT id FROM duels ORDER BY created_at DESC, id DESC LIMIT ?",
+    )
+    .all(DUELS_LIMIT);
+  if (ids.length === 0) {
+    console.log("No duels in this scope yet. 'baton duel <modelA> <modelB> <prompt...>' starts one.");
+    return 0;
+  }
+  const rows: string[][] = [["ID", "CATEGORY", "STATUS", "WINNER", "MODELS", "AGE"]];
+  for (const { id } of ids) {
+    const view = duelView(db, supervisor, id);
+    rows.push([
+      view.duelId,
+      view.category || "-",
+      view.status,
+      view.winner ?? "-",
+      view.revealed ? `A=${view.revealed.A} B=${view.revealed.B}` : "(blind until judged)",
+      age(view.createdAt),
+    ]);
+  }
+  console.log(table(rows));
+  return 0;
+}
+
+/**
+ * The adapter surface: built-ins are pinned, discovered specs are quarantined
+ * until a human approves the exact binary and argv here (PLAN.md §Agentic
+ * discovery — approval precedes execution, and only the trusted CLI can give it).
+ */
+async function adapters(args: string[]): Promise<number> {
+  switch (args[0]) {
+    case "list":
+      return adaptersList();
+    case "review":
+      return adaptersReview(args[1]);
+    case "approve":
+      return await adaptersApprove(args.slice(1));
+    case "reject":
+      return adaptersReject(args.slice(1));
+    case "canary":
+      return await adaptersCanary(args.slice(1));
+    default:
+      return usage(
+        "adapters takes: list | review <app> | approve <app> [--no-canary] | reject <app> [reason...] | canary <app|--all> [--structural]",
+      );
+  }
+}
+
+function adaptersList(): number {
+  const db = openDb();
+  const detected = detectedBinaries();
+  const rows: string[][] = [["APP", "PROVENANCE", "STATUS", "BINARY"]];
+  for (const spec of builtinAdapters) {
+    rows.push([
+      spec.app,
+      "builtin",
+      "pinned",
+      detected.get(spec.app) ?? "not on PATH in this scope",
+    ]);
+  }
+  const discovered = listDiscovered(db);
+  for (const record of discovered) {
+    rows.push([record.app, "discovered", record.status, record.spec.binary]);
+  }
+  console.log(table(rows));
+
+  const pending = discovered.filter((r) => r.status === "quarantined").map((r) => r.app);
+  if (pending.length > 0) {
+    console.log(
+      `\nNothing from ${pending.join(", ")} has been executed. Review before approving: baton adapters review ${pending[0]}`,
+    );
+  }
+  return 0;
+}
+
+function adaptersReview(app: string | undefined): number {
+  if (!app) return usage("adapters review needs: <app>");
+  const db = openDb();
+  const review = reviewDiscovered(db, app);
+  if (!review) {
+    console.error(
+      `baton: no discovered adapter '${app}' in this scope. 'baton adapters list' shows what there is.`,
+    );
+    return 1;
+  }
+  console.log(formatReview(review));
+  console.log(
+    review.needsApproval
+      ? `\nApprove running this exact binary with this exact argv as '${app}'?
+  baton adapters approve ${app}             approve, run the canary, activate
+  baton adapters approve ${app} --no-canary approve without executing anything yet
+  baton adapters reject ${app} [reason...]  discard it`
+      : `\nAlready approved (${review.record.status}); 'baton adapters reject ${app}' withdraws that approval.`,
+  );
+  return 0;
+}
+
+async function adaptersApprove(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { boolean: ["canary", "no-canary"] });
+  const app = rest[0];
+  if (!app) return usage("adapters approve needs: <app> [--canary|--no-canary]");
+  const db = openDb();
+  const approved = approveDiscovered(db, app);
+  if (!approved.ok) {
+    console.error(`baton: ${approved.errors.join("; ")}`);
+    return 1;
+  }
+  console.log(`Approved ${app}: ${approved.record.spec.binary}`);
+  // Canary by default — an approved adapter that was never executed is not yet
+  // known to work, and activation is what the canary is evidence for.
+  if (flags["no-canary"] === true) {
+    console.log(
+      `Not active yet: nothing has been executed. 'baton adapters canary ${app}' runs the canary and activates it.`,
+    );
+    return 0;
+  }
+  const canary = await canaryDiscovered(db, app);
+  if (!canary.ok) {
+    console.error(`baton: ${canary.errors.join("; ")}`);
+    console.error(
+      `baton: '${app}' stays approved but inactive — fix the spec and resubmit, or re-run 'baton adapters canary ${app}'.`,
+    );
+    return 1;
+  }
+  console.log(
+    `Canary passed (${CANARY_TOKEN} extracted through the declared path) — ${app} is active.`,
+  );
+  return 0;
+}
+
+function adaptersReject(args: string[]): number {
+  const [app, ...reason] = args;
+  if (!app) return usage("adapters reject needs: <app> [reason...]");
+  const db = openDb();
+  const rejected = rejectDiscovered(db, app, reason.length > 0 ? reason.join(" ") : undefined);
+  if (!rejected.ok) {
+    console.error(`baton: ${rejected.errors.join("; ")}`);
+    return 1;
+  }
+  console.log(`Rejected ${app}. It is out of the registry and nothing from its spec runs.`);
+  return 0;
+}
+
+/**
+ * The adapter conformance suite. Two checks per adapter: the same structural
+ * validation the quarantine gate applies, and a live canary that asks the real
+ * binary for CANARY_TOKEN and reads the answer back through the declared
+ * extraction. `--all` covers the built-ins too — they are pinned, not exempt —
+ * and `--structural` is the offline half, which executes nothing.
+ */
+async function adaptersCanary(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { boolean: ["all", "structural"] });
+  const app = rest[0];
+  if (!app && flags.all !== true) return usage("adapters canary needs: <app> | --all [--structural]");
+  const db = openDb();
+  const targets = flags.all === true ? allTargets(db) : [namedTarget(db, app ?? "")];
+  const live = flags.structural !== true;
+
+  const rows: string[][] = [["APP", "PROVENANCE", "STRUCTURE", "CANARY"]];
+  const details: string[] = [];
+  let failed = 0;
+  for (const target of targets) {
+    const errors = conformanceErrors(target);
+    let canary = live ? "" : "not run (--structural)";
+    if (errors.length > 0) {
+      failed++;
+      canary = "not attempted";
+      for (const error of errors) details.push(`${target.app}: ${error}`);
+    } else if (live) {
+      const result = await liveCanary(db, target);
+      canary = result.failed ? "failed" : result.detail;
+      if (result.failed) {
+        failed++;
+        details.push(`${target.app}: ${result.detail}`);
+      }
+    }
+    rows.push([
+      target.app,
+      target.builtin ? "builtin" : target.status,
+      errors.length === 0 ? "ok" : `${errors.length} error(s)`,
+      canary,
+    ]);
+  }
+  console.log(table(rows));
+  for (const detail of details) console.error(`baton: ${detail}`);
+  return failed === 0 ? 0 : 1;
+}
+
+interface ConformanceTarget {
+  app: string;
+  spec: AdapterSpec;
+  builtin: boolean;
+  /** Absolute path: detect-resolved for a built-in, the spec's own otherwise. */
+  binaryPath: string | undefined;
+  status: DiscoveredStatus | "pinned";
+}
+
+function allTargets(db: Database): ConformanceTarget[] {
+  const detected = detectedBinaries();
+  return [
+    ...builtinAdapters.map((spec) => builtinTarget(spec, detected.get(spec.app))),
+    ...listDiscovered(db).map(
+      (record): ConformanceTarget => ({
+        app: record.app,
+        spec: record.spec,
+        builtin: false,
+        binaryPath: record.spec.binary,
+        status: record.status,
+      }),
+    ),
+  ];
+}
+
+function namedTarget(db: Database, app: string): ConformanceTarget {
+  const record = listDiscovered(db).find((r) => r.app === app);
+  if (record) {
+    return {
+      app,
+      spec: record.spec,
+      builtin: false,
+      binaryPath: record.spec.binary,
+      status: record.status,
+    };
+  }
+  const spec = getAdapter(app);
+  if (!spec) {
+    throw new UsageError(
+      `unknown adapter '${app}'. 'baton adapters list' shows the built-in and discovered ones.`,
+    );
+  }
+  return builtinTarget(spec, detectedBinaries().get(app));
+}
+
+function builtinTarget(
+  spec: AdapterSpec,
+  binaryPath: string | null | undefined,
+): ConformanceTarget {
+  return {
+    app: spec.app,
+    spec,
+    builtin: true,
+    binaryPath: binaryPath ?? undefined,
+    status: "pinned",
+  };
+}
+
+/** Built-in binaries only: a discovered spec carries its own absolute path. */
+function detectedBinaries(): Map<string, string | null | undefined> {
+  return new Map(detectApps({ probeVersion: false }).map((a) => [a.app, a.binaryPath]));
+}
+
+/**
+ * The same structural rules the quarantine gate applies. A built-in is checked
+ * for shape only: the validator's other two rules are about provenance, and a
+ * pinned adapter necessarily trips both (its app id "collides" with itself, its
+ * `binary` is the PATH name detect resolves at run time).
+ */
+function conformanceErrors(target: ConformanceTarget): string[] {
+  const result = validateSpec(target.spec, { builtin: target.builtin });
+  return result.ok ? [] : result.errors;
+}
+
+/** Live half of the suite: burns real quota, so it is opt-in per invocation. */
+async function liveCanary(
+  db: Database,
+  target: ConformanceTarget,
+): Promise<{ failed: boolean; detail: string }> {
+  if (!target.builtin) {
+    const result = await canaryDiscovered(db, target.app);
+    return result.ok
+      ? { failed: false, detail: "passed" }
+      : { failed: true, detail: result.errors.join("; ") };
+  }
+  // Not installed is not a conformance failure: this scope simply cannot reach
+  // that app, which `detect` already reports.
+  if (!target.binaryPath) return { failed: false, detail: "skipped (not on PATH)" };
+  const slug = target.spec.models[0]?.slug;
+  const autonomy = AUTONOMY_ORDER.find((level) => target.spec.autonomyFlags[level]);
+  if (!slug || !autonomy) return { failed: true, detail: "declares no runnable route" };
+
+  const result = await executeAdapter({
+    spec: target.spec,
+    binaryPath: target.binaryPath,
+    slug,
+    prompt: CANARY_PROMPT,
+    cwd: process.cwd(),
+    env: process.env,
+    autonomy,
+    timeoutMs: CANARY_TIMEOUT_MS,
+  });
+  const output = result.output ?? "";
+  if (result.ok && output.includes(CANARY_TOKEN)) return { failed: false, detail: "passed" };
+  return {
+    failed: true,
+    detail: result.ok
+      ? `answered ${preview(output)} instead of ${CANARY_TOKEN}`
+      : (result.error ?? "failed"),
+  };
+}
+
+/**
+ * The stateless Streamable-HTTP face, one daemon per environment scope
+ * (PLAN.md §Architecture) — a daemon inherits one environment, so it serves
+ * exactly the scope it was started in.
+ */
+async function serve(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { value: ["port"], boolean: ["http"] });
+  if (rest.length > 0) return usage(`serve takes no positional arguments, got '${rest[0]}'.`);
+  if (flags.http !== true) {
+    return usage("serve needs --http; the stdio server is 'baton mcp' (that is what hosts register).");
+  }
+  // 0 is meaningful here: it asks the OS for a free port, which the printed url
+  // then reports.
+  const port =
+    flags.port === undefined ? undefined : parseNonNegativeInt(String(flags.port), "--port");
+  const { serveHttp } = await import("../mcp/http.ts");
+  const daemon = serveHttp(port === undefined ? {} : { port });
+  console.log(
+    table([
+      ["url", daemon.url],
+      ["scope", daemon.configDir],
+    ]),
+  );
+  console.log("\nServing the same tools as 'baton mcp'. Ctrl-C stops it and its callees.");
+  // The daemon owns the process from here; its signal handlers are the exit.
+  await new Promise<never>(() => {});
   return 0;
 }
 
@@ -494,10 +1034,12 @@ function ratings(args: string[]): number {
       ["revision", String(snap.revision)],
     ]),
   );
+  const bt = btSection(db);
   if (snap.rows.length === 0) {
     console.log(
       "\nNo ratings yet: grade a run with 'baton grade <run-id> <1-5>', or seed priors via the seed_ratings tool.",
     );
+    if (bt) console.log(`\n${bt}`);
     return 0;
   }
   const rows: string[][] = [["MODEL", "CATEGORY", "OBSERVED (nEff)", "PRIOR (SOURCE)", "BLENDED"]];
@@ -511,7 +1053,27 @@ function ratings(args: string[]): number {
     ]);
   }
   console.log(`\n${table(rows)}`);
+  if (bt) console.log(`\n${bt}`);
   return 0;
+}
+
+/**
+ * Duel evidence, fitted and shown as its own signal: grade EMAs and BT are
+ * reported separately and never merged (PLAN.md §Layering and sharing). Absent
+ * entirely until a duel has been judged, so an unused feature adds no noise.
+ */
+function btSection(db: Database, at = nowIso()): string | null {
+  if (currentEdges(db, at).length === 0) return null;
+  const rows: string[][] = [["MODEL", "CATEGORY", "STRENGTH", "SE", "COMPARISONS"]];
+  const fitted = btRatings(db, at)
+    // A model with a prior but no duels is fitted into every category to keep
+    // the graph identified; it is not duel evidence and does not belong here.
+    .filter((r) => r.nEff > 0)
+    .sort((a, b) => a.category.localeCompare(b.category) || b.theta - a.theta);
+  for (const r of fitted) {
+    rows.push([r.model, r.category || "-", fixed(r.theta), fixed(r.se), fixed(r.nEff)]);
+  }
+  return `duels (Bradley-Terry — a separate signal, never blended into the grades above):\n${table(rows)}`;
 }
 
 function ratingsPublish(): number {
@@ -527,7 +1089,39 @@ function ratingsPublish(): number {
 
 function profile(args: string[]): number {
   if (args[0] === "import") return profileImport(args.slice(1));
-  return usage("profile takes: import <file> [--name <n>] [--activate] [--yes]");
+  if (args[0] === "export") return profileExport(args.slice(1));
+  return usage(
+    "profile takes: import <file> [--name <n>] [--activate] [--yes] | export [--profile <n>] [--out <file>]",
+  );
+}
+
+/**
+ * Portable by construction (PLAN.md §Layering and sharing): the document is
+ * canonical model priors and nothing else — no targets, instances, machine
+ * details or prompts — which profileFile.ts guarantees at the format level.
+ */
+function profileExport(args: string[]): number {
+  const { flags, rest } = parseFlags(args, { value: ["out", "profile"] });
+  if (rest.length > 0) {
+    return usage(`profile export takes no positional arguments, got '${rest[0]}'.`);
+  }
+  const db = openDb();
+  const name = flags.profile === undefined ? activeProfile(db) : String(flags.profile);
+  if (!name) {
+    return usage(
+      "profile export needs a profile: this scope has no active one. Name it with --profile <n>, or 'baton set active_profile <n>'.",
+    );
+  }
+  const doc = exportProfile(db, name);
+  const text = renderProfile(doc);
+  if (flags.out === undefined) {
+    process.stdout.write(text);
+    return 0;
+  }
+  const path = resolve(String(flags.out));
+  writeFileSync(path, text);
+  console.log(`Exported profile '${name}' (${doc.entries.length} priors) to ${path}`);
+  return 0;
 }
 
 /**
@@ -787,7 +1381,17 @@ Usage:
   baton run <model> <prompt...>           Delegate once from the shell
       --cwd <dir> --timeout <ms> --autonomy <readonly|edits|full>
       --instance <name>                   ('-' as the prompt reads stdin)
+  baton resume <run-id> <prompt...>       Continue a finished run's own session
   baton runs [<run-id>]                   Recent runs, or one run in detail
+  baton duel <a> <b> <prompt...>          Blind A/B; the outputs carry no names
+      --category <c> --cwd <dir> --timeout <ms>
+  baton duel report <duel-id> <A|B|tie>   Judge, then reveal which was which
+  baton duel list                         Recent duels and their status
+  baton adapters list                     Built-in and discovered adapters
+  baton adapters review <app>             The exact binary, argv and env names
+  baton adapters approve <app> [--no-canary] | reject <app> [reason...]
+  baton adapters canary <app|--all> [--structural]   Conformance suite
+  baton serve --http [--port <n>]         HTTP MCP daemon for this scope
   baton instance add <app> <name> --env KEY=VAL
   baton instance list
   baton instance remove <app> <name>
@@ -796,6 +1400,7 @@ Usage:
   baton ratings [publish]                 Show ratings, or refresh ratings.yaml
   baton grade <run-id> <1-5> [notes...]   Grade a run after using its result
   baton profile import <file> [--name <n>] [--activate] [--yes]
+  baton profile export [--profile <n>] [--out <file>]
   baton set <key> <value>                 ${validKeys()}
   baton install <host> [--dir <dir>] [--with-eval]
       hosts: ${INSTALL_HOSTS.join(", ")}
