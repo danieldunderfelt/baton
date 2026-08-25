@@ -142,7 +142,8 @@ describe("openStore — schema and migrations", () => {
     const paths = scopePaths("upgrade");
     const first = openStore(paths.dbPath);
     insertRun(first, { id: "run_pre_v2" });
-    // Rewind to a genuine v1 database: undo v2's column and v3's tables.
+    // Rewind to a genuine v1 database: undo v4/v2's columns and v3's tables.
+    first.exec("ALTER TABLE attempts DROP COLUMN owner_pid");
     first.exec("ALTER TABLE runs DROP COLUMN payload_hash");
     for (const t of [
       "grades",
@@ -162,7 +163,7 @@ describe("openStore — schema and migrations", () => {
     expect(runColumns(upgraded)).toContain("payload_hash");
     expect(
       upgraded.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations").get()!.n,
-    ).toBe(3);
+    ).toBe(4);
     expect(countRuns(upgraded)).toBe(1);
     upgraded.close();
   });

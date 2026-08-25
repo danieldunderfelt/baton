@@ -295,13 +295,17 @@ export class Supervisor {
   recoverOrphans(): void {
     const rows = this.db
       .query<OrphanRow, []>(
-        `SELECT a.id, a.run_id, a.pid, a.status, r.created_at
+        `SELECT a.id, a.run_id, a.pid, a.owner_pid, a.status, r.created_at
          FROM attempts a JOIN runs r ON r.id = a.run_id
          WHERE a.status IN ('queued','running')`,
       )
       .all();
     for (const row of rows) {
       if (this.live.has(row.id)) continue;
+      // Several Baton processes share a scope (a CLI run + a callee's own MCP
+      // server, both against the same DB). An attempt whose owning process is
+      // alive is not abandoned — it is simply someone else's.
+      if (row.owner_pid !== null && row.owner_pid > 0 && !isGone(row.owner_pid)) continue;
       const reason = orphanReason(row);
       if (reason === null) continue;
       const now = nowIso();
@@ -564,9 +568,9 @@ export class Supervisor {
         }
         this.db
           .query(
-            "INSERT INTO attempts (id, run_id, seq, target, status, started_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            "INSERT INTO attempts (id, run_id, seq, target, status, started_at, owner_pid) VALUES (?, ?, ?, ?, 'running', ?, ?)",
           )
-          .run(o.next.attemptId, ctx.runId, o.next.seq, o.next.fingerprint, now);
+          .run(o.next.attemptId, ctx.runId, o.next.seq, o.next.fingerprint, now, process.pid);
         // The run now belongs to the instance actually carrying it — resumes
         // and session affinity follow the attempt that answers.
         this.db
@@ -675,9 +679,9 @@ export class Supervisor {
           );
         this.db
           .query(
-            "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, ?, 'queued')",
+            "INSERT INTO attempts (id, run_id, seq, target, status, owner_pid) VALUES (?, ?, 1, ?, 'queued', ?)",
           )
-          .run(a.attemptId, a.runId, a.fingerprint);
+          .run(a.attemptId, a.runId, a.fingerprint, process.pid);
       })
       .immediate();
   }
@@ -857,6 +861,7 @@ interface OrphanRow {
   id: string;
   run_id: string;
   pid: number | null;
+  owner_pid: number | null;
   status: RunStatus;
   created_at: string;
 }

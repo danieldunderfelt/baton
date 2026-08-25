@@ -885,7 +885,7 @@ describe("waitForRun", () => {
 describe("recoverOrphans", () => {
   function seedAttempt(
     db: Database,
-    o: { pid?: number | null; status?: RunStatus; ageMs?: number } = {},
+    o: { pid?: number | null; status?: RunStatus; ageMs?: number; ownerPid?: number | null } = {},
   ): string {
     const status = o.status ?? "running";
     const runId = newId("run");
@@ -895,8 +895,15 @@ describe("recoverOrphans", () => {
        VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', ?, ?, ?)`,
     ).run(runId, status, created, created);
     db.query(
-      "INSERT INTO attempts (id, run_id, seq, target, status, pid, started_at) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', ?, ?, ?)",
-    ).run(newId("att"), runId, status, o.pid ?? null, status === "queued" ? null : created);
+      "INSERT INTO attempts (id, run_id, seq, target, status, pid, started_at, owner_pid) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', ?, ?, ?, ?)",
+    ).run(
+      newId("att"),
+      runId,
+      status,
+      o.pid ?? null,
+      status === "queued" ? null : created,
+      o.ownerPid ?? null,
+    );
     return runId;
   }
 
@@ -945,6 +952,35 @@ describe("recoverOrphans", () => {
     process.kill(-child.pid!, "SIGKILL");
     expect(await isDead(child.pid!)).toBe(true);
   }, 20_000);
+
+  test("leaves an attempt owned by another live Baton process untouched", async () => {
+    // The dogfood bug: a callee Claude Code spawned its own `baton mcp` against
+    // the same scope DB, whose recovery orphaned the CLI's in-flight run.
+    const db = newDb();
+    const owner = spawn(BUN, ["-e", "setTimeout(() => {}, 10_000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    owner.unref();
+    const runId = seedAttempt(db, { pid: 999_999_999, ownerPid: owner.pid! });
+
+    const sup = supervisorFor(evalTarget("process.stdout.write('ok')"), { db });
+    expect(sup.getRun(runId)!.status).toBe("running");
+
+    // Same row, owner now dead: recovery may claim it.
+    process.kill(-owner.pid!, "SIGKILL");
+    expect(await isDead(owner.pid!)).toBe(true);
+    sup.recoverOrphans();
+    expect(sup.getRun(runId)!.status).toBe("orphaned");
+  }, 20_000);
+
+  test("a queued attempt of a live foreign owner survives past the grace period", () => {
+    const db = newDb();
+    // process.pid is a live process that is not this supervisor: good enough.
+    const runId = seedAttempt(db, { status: "queued", ageMs: 120_000, ownerPid: process.pid });
+    const sup = supervisorFor(evalTarget("process.stdout.write('ok')"), { db });
+    expect(sup.getRun(runId)!.status).toBe("queued");
+  });
 
   test("sweeps a queued attempt abandoned before launch", () => {
     const db = newDb();

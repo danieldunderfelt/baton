@@ -138,6 +138,10 @@ const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL
   );
   `,
+  // v4 — multi-process ownership: several Baton processes legitimately share a
+  // scope (a CLI run + a callee's own MCP server), so orphan recovery must know
+  // which process owns an in-flight attempt before declaring it abandoned.
+  `ALTER TABLE attempts ADD COLUMN owner_pid INTEGER;`,
 ];
 
 /** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */
