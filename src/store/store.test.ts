@@ -143,6 +143,7 @@ describe("openStore — schema and migrations", () => {
     const first = openStore(paths.dbPath);
     // A v6-shaped edge: written before Σw² was kept.
     first.exec("ALTER TABLE bt_edges DROP COLUMN mass2");
+    first.exec("DROP TABLE route_blocks");
     first
       .query(
         `INSERT INTO bt_edges (model_a, model_b, category, wins_a, wins_b, ties, as_of)
@@ -180,6 +181,7 @@ describe("openStore — schema and migrations", () => {
       "duels",
       "bt_edges",
       "discovered_adapters",
+      "route_blocks",
     ]) {
       first.exec(`DROP TABLE ${t}`);
     }

@@ -212,6 +212,17 @@ const MIGRATIONS: string[] = [
   // again; they are days old and decay, so no backfill is attempted (a backfill
   // would have to invent the event weights that are exactly what was not kept).
   `ALTER TABLE bt_edges ADD COLUMN mass2 REAL NOT NULL DEFAULT 0;`,
+  // v8 — the user-owned route deny list (PLAN.md §Registry: route blocks).
+  // Baton cannot tell whose subscription a route spends, so the user can name
+  // the ones it must never spend; written only through the trusted CLI, like
+  // the authority ceiling.
+  `
+  CREATE TABLE route_blocks (
+    pattern    TEXT PRIMARY KEY,
+    reason     TEXT,
+    created_at TEXT NOT NULL
+  );
+  `,
 ];
 
 /** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */

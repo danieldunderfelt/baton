@@ -528,6 +528,58 @@ describe("pool", () => {
   });
 });
 
+describe("block", () => {
+  test("add, list and remove round-trip, and the add names what it blocks", async () => {
+    const scope = tmp("block");
+    expect((await baton(scope, "block", "list")).stdout).toContain("No blocked routes");
+
+    const add = await baton(
+      scope,
+      "block",
+      "add",
+      "opencode/github-copilot/*",
+      "client",
+      "enterprise",
+      "subscription",
+    );
+    expect(add.code).toBe(0);
+    expect(add.stdout).toContain("Blocked opencode:*/github-copilot/* (client enterprise subscription)");
+    // The confirmation is the routes it covers right now, not just the pattern.
+    expect(add.stdout).toContain("opencode:default/github-copilot/gemini-3.1-pro-preview");
+    expect(add.stdout).not.toContain("opencode/x-preview-f-free");
+
+    const list = await baton(scope, "block", "list");
+    expect(list.stdout).toMatch(/opencode:\*\/github-copilot\/\*\s+1\s+client enterprise subscription/);
+
+    // The blocked model is unavailable with the user's own reason attached...
+    const models = await baton(scope, "models");
+    expect(models.stdout).toMatch(/gemini-3.1-pro.*client enterprise subscription/);
+    // ...and the app's other route is untouched.
+    expect(models.stdout).not.toMatch(/ox-alpha.*client enterprise subscription/);
+
+    expect((await baton(scope, "block", "remove", "opencode:*/github-copilot/*")).code).toBe(0);
+    const gone = await baton(scope, "block", "remove", "opencode/github-copilot/*");
+    expect(gone.code).toBe(1);
+    expect(gone.stderr).toContain("no block 'opencode:*/github-copilot/*'");
+  });
+
+  test("a pattern matching nothing known is kept, but says so", async () => {
+    const scope = tmp("block-nomatch");
+    const add = await baton(scope, "block", "add", "opencode/typo-provider/*");
+    expect(add.code).toBe(0);
+    expect(add.stdout).toContain("matches no route this scope currently knows");
+    expect((await baton(scope, "block", "list")).stdout).toContain("opencode:*/typo-provider/*");
+  });
+
+  test("an unusable pattern is refused at the CLI", async () => {
+    const scope = tmp("block-bad");
+    const bad = await baton(scope, "block", "add", "opencode/");
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("names no slug");
+    expect((await baton(scope, "block", "list")).stdout).toContain("No blocked routes");
+  });
+});
+
 describe("set (phase-2 keys)", () => {
   test("preciousness lands on the pool member it names", async () => {
     const scope = tmp("precious");

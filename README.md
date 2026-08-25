@@ -103,6 +103,20 @@ From then on every delegation to an opus or sonnet model picks an account automa
 
 Per-account spending policy: `baton set preciousness:claude-code:personal-2 conserve` (levels: `burn`, `conserve`, `emergency`). An `emergency` account is only picked when every other account is unavailable, which is how "keep the work account out of my hobby projects" becomes one line of config.
 
+## Blocking a route
+
+Some routes are reachable and still off limits — a client's enterprise seat that happens to be logged into an app on this machine, a provider you would rather not send work to. Baton does not verify identity, so it cannot know that on its own; you tell it:
+
+```sh
+baton block add 'opencode/github-copilot/*' client enterprise subscription
+baton block add 'opencode/github-copilot/gemini-3.1-pro-preview'   # just one model
+baton block add cursor-agent                                       # a whole app
+```
+
+A pattern addresses a route the way Baton names one internally — `<app>[:<instance>]/<slug>`, with `*` matching anything. Leave the instance off and it covers every account; name one (`codex:work/*`) and it covers only that account. `baton block add` prints the routes it matches right now, so a typo shows up immediately.
+
+A blocked route is never selected: not when it is the only route for a model, not as a last resort when everything else is rate-limited, not when resuming a session that already ran on it, and not by the conformance canary. `list_models` reports it as unavailable with your reason attached, so a delegating agent sees the refusal before it tries. Blocks are written only from your terminal — `baton block list`, `baton block remove <pattern>` — never through an MCP tool.
+
 ## Separate worlds
 
 `BATON_CONFIG_DIR` relocates everything Baton knows: config, accounts, pools, quota history, ratings, the database. Set it per directory with direnv and a work checkout gets a Baton that only knows work accounts, while your personal projects get another that only knows personal ones. The two cannot leak into each other because neither knows the other exists.
@@ -122,7 +136,7 @@ If the app's binary is later upgraded, the adapter is marked stale and re-verifi
 
 ## What Baton does not do
 
-- It does not verify identity. Environment separation is your direnv setup's job; Baton just inherits what it is given.
+- It does not verify identity. Environment separation is your direnv setup's job; Baton just inherits what it is given. `baton block` is the escape hatch for routes you know must not be spent — a rule you state, not one Baton infers.
 - It does not sandbox callees beyond the autonomy flags each CLI itself offers. You choose what your agents may do.
 - It cannot stop a full-permission local agent from doing what you yourself could do in a terminal, including approving adapters. The approval step protects against accidents, not against an agent you have already given full access to your shell.
 - Raw prompts stay on your machine, in a capped ring buffer (about 2,000 runs). Only aggregate ratings are shareable.

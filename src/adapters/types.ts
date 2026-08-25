@@ -10,6 +10,14 @@ export type Autonomy = "readonly" | "edits" | "full";
 
 export const AUTONOMY_ORDER: Autonomy[] = ["readonly", "edits", "full"];
 
+/**
+ * The instance meaning "the inherited environment as-is". Always exists, for
+ * every app — including the ones with no `identityEnv`, where it is the only
+ * instance there can be. It lives here, with the adapter vocabulary, because
+ * both the registry and discovery's canary have to name it.
+ */
+export const DEFAULT_INSTANCE = "default";
+
 export interface RouteSpec {
   /** Canonical model id, e.g. "kimi-k3", "gpt-5.6-sol". */
   model: string;

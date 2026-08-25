@@ -179,7 +179,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       title: "List delegatable models",
       description:
         "Models this Baton scope can delegate to, with the app that would run each one and whether that app's binary is on PATH right now (unavailable entries are listed so you can see what is missing). " +
-        "A model that cannot be used right now carries degradedReason (its app's binary is not on PATH, or this scope's authority ceiling is one the adapter cannot express). " +
+        "A model that cannot be used right now carries degradedReason (its app's binary is not on PATH, this scope's authority ceiling is one the adapter cannot express, or the user has blocked that route — a standing 'never spend this' decision, liftable only by them in their terminal, never by a tool call). " +
         "Also reports the scope: Baton's world is partitioned by BATON_CONFIG_DIR, so a scope only knows the instances, settings and evidence its own config dir defines. " +
         "scores keeps provenance visible instead of merging it: observed (your own graded runs, decayed, worth nEff observations), prior (the active profile's seeded or imported opinion), and blended — what selection ranks on. rating is 'unrated' until either exists; grade runs with report_result to make it move. " +
         "pool, where an app has one, is the per-instance quota view selection spreads across: headroom 1 = untouched, and coolingUntil marks an instance parked after an admission failure. maxAutonomy is this scope's user-owned ceiling for that app. " +
@@ -224,7 +224,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "idempotency_key is retry-safe and payload-bound: the same key with the same request returns the existing run (deduplicated:true) instead of launching a second one, so a transport retry cannot double-spend quota; the same key with a changed prompt, cwd or options is an error, so use a NEW key for anything you actually changed. " +
         "cwd defaults to this host's working directory; pointing the delegated agent at another checkout is allowed and deliberate — note that concurrent delegates mutating the same checkout can conflict. " +
         "options.autonomy narrows what the callee may do (readonly | edits | full); it can only narrow the user's per-app ceiling, never raise it. options.timeoutMs bounds the callee. " +
-        "Errors (unknown model, no installed app for it, delegation-depth refusal) come back as tool errors, not as a failed run. " +
+        "Errors (unknown model, no installed app for it, a route the user has blocked, delegation-depth refusal) come back as tool errors, not as a failed run; a block names itself in the message and is not something to route around — pick another model. " +
         "So does hitting this scope's concurrency cap ('max_concurrent'): that one means too many attempts are already running, so let one finish instead of retrying in a loop — launch with wait:false and poll get_run rather than holding calls open.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       inputSchema: z.object({

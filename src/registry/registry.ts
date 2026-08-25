@@ -1,7 +1,12 @@
 import type { Database } from "bun:sqlite";
 import { statSync } from "node:fs";
 
-import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy } from "../adapters/types.ts";
+import {
+  AUTONOMY_ORDER,
+  DEFAULT_INSTANCE,
+  type AdapterSpec,
+  type Autonomy,
+} from "../adapters/types.ts";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
 import { activeDiscoveredSpecs, listDiscovered } from "../discovery/discovery.ts";
 import type { DiscoveredAdapter } from "../discovery/types.ts";
@@ -12,6 +17,13 @@ import { snapshot } from "../quota/quota.ts";
 import type { Preciousness } from "../quota/types.ts";
 import { nowIso } from "../store/store.ts";
 import { SETTING_MAX_AUTONOMY_PREFIX } from "../supervisor/types.ts";
+import {
+  blockFor,
+  blockReason as routeBlockReason,
+  listBlocks,
+  routeKey,
+  type RouteBlock,
+} from "./blocks.ts";
 
 /**
  * Registry: canonical model → routes → execution target (PLAN.md §Registry).
@@ -24,8 +36,7 @@ import { SETTING_MAX_AUTONOMY_PREFIX } from "../supervisor/types.ts";
  */
 export const POLICY_VERSION = 2;
 
-/** Instance meaning "the inherited environment as-is". Always exists. */
-export const DEFAULT_INSTANCE = "default";
+export { DEFAULT_INSTANCE };
 
 export interface DetectedApp {
   app: string;
@@ -58,7 +69,7 @@ export interface Target extends Route {
 }
 
 /** Why a candidate was skipped in the first pass (see selectTarget's relaxation). */
-type Block = "tried" | "undefined-instance" | "cooling" | "emergency";
+type Block = "blocked" | "tried" | "undefined-instance" | "cooling" | "emergency";
 
 export interface Considered {
   app: string;
@@ -269,6 +280,15 @@ export function targetFor(
       `Cannot resume a '${ref.app}' run: '${spec.binary}' is not on PATH in this scope.`,
     );
   }
+  // Session affinity does not outrank a deny list: a route blocked after the
+  // original run is one the user has said must not be spent again, and a resume
+  // spends it exactly as a fresh run would.
+  const blocked = db ? blockFor(listBlocks(db), ref.app, ref.instance, ref.slug) : undefined;
+  if (blocked) {
+    throw new Error(
+      `Cannot resume this run: ${routeKey(ref.app, ref.instance, ref.slug)} is ${routeBlockReason(blocked)}. Remove it with 'baton block remove ${blocked.pattern}' if that is no longer what you want.`,
+    );
+  }
   return {
     spec,
     slug: ref.slug,
@@ -335,6 +355,7 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
   const now = opts.nowIso ?? nowIso();
   const tried = new Set(opts.exclude ?? []);
   const rating = ratingLens(db, model, opts.category ?? "", now);
+  const blocks = listBlocks(db);
   const candidates: Candidate[] = [];
   const blockedRoutes: string[] = [];
 
@@ -362,15 +383,21 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     // lens can ask for evidence produced at that same level.
     const autonomy = clampAutonomy(opts.autonomy, ceiling, route.spec.defaultAutonomy);
     candidatesFor(db, app, poolInstance(route.spec, opts.instance), now).forEach((c, memberIndex) => {
-      const block: Block | undefined = tried.has(candidateKey(app, c.instance))
-        ? "tried"
-        : !c.defined
-          ? "undefined-instance"
-          : c.coolingUntil
-            ? "cooling"
-            : c.excludedUnlessLastResort
-              ? "emergency"
-              : undefined;
+      // A deny-listed route is reported as its own exclusion rather than
+      // folded into another: it is the user's standing decision, and it is the
+      // one reason that survives every relaxation below.
+      const denied = blockFor(blocks, app, c.instance, route.slug);
+      const block: Block | undefined = denied
+        ? "blocked"
+        : tried.has(candidateKey(app, c.instance))
+          ? "tried"
+          : !c.defined
+            ? "undefined-instance"
+            : c.coolingUntil
+              ? "cooling"
+              : c.excludedUnlessLastResort
+                ? "emergency"
+                : undefined;
       const fingerprint = targetFingerprint(
         app,
         c.instance,
@@ -391,7 +418,9 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
         headroom: c.headroom,
         preciousness: c.preciousness,
         ...(c.coolingUntil ? { coolingUntil: c.coolingUntil } : {}),
-        ...(block ? { block, excluded: blockReason(block, c.coolingUntil) } : {}),
+        ...(block
+          ? { block, excluded: denied ? routeBlockReason(denied) : blockReason(block, c.coolingUntil) }
+          : {}),
       });
     });
   }
@@ -455,6 +484,9 @@ function onGrid(weight: number): number {
 
 function blockReason(block: Block, until: string | undefined): string {
   switch (block) {
+    case "blocked":
+      // Never reached: a route block carries the pattern and the user's reason.
+      return "blocked by this scope's route deny list";
     case "tried":
       return "already attempted by this run";
     case "undefined-instance":
@@ -569,7 +601,14 @@ function noCandidate(model: string, blockedRoutes: string[], candidates: Candida
   if (earliest) {
     hints.push(`All instances cooling; earliest retry ${hhmm(earliest)} (${earliest}).`);
   }
-  if (candidates.length > 0) {
+  // A blocked route is not a spent one: nothing frees it but the user, so the
+  // "wait or add an instance" advice would be wrong.
+  if (candidates.some((c) => c.block === "blocked")) {
+    hints.push(
+      "Routes on this scope's deny list are never selected, not even as a last resort ('baton block list' shows them).",
+    );
+  }
+  if (candidates.some((c) => c.block !== "blocked")) {
     hints.push(
       "Every pool candidate is spent: wait for a cooldown to expire, or add an instance with 'baton instance add <app> <name> --env ...'.",
     );
@@ -652,14 +691,15 @@ export function listModels(db: Database, at = nowIso()): ModelListing[] {
       ),
   );
   const rows: ModelListing[] = [];
-  for (const spec of routableAdapters(db)) rows.push(...routeRows(db, spec, scores, at));
+  const blocks = listBlocks(db);
+  for (const spec of routableAdapters(db)) rows.push(...routeRows(db, spec, scores, at, blocks));
   // A quarantined adapter routes nowhere, but hiding it would hide the thing
   // the user is being asked to review — same for one waiting on a canary or
   // gone stale after a version bump. A rejected one is a decision, not a hint.
   for (const record of listDiscovered(db)) {
     if (record.status === "active" || record.status === "rejected") continue;
     if (!Array.isArray(record.spec?.models)) continue; // unvalidated row on disk
-    rows.push(...routeRows(db, record.spec, scores, at, quarantineHint(record)));
+    rows.push(...routeRows(db, record.spec, scores, at, blocks, quarantineHint(record)));
   }
   return rows.sort((a, b) => a.model.localeCompare(b.model) || a.app.localeCompare(b.app));
 }
@@ -669,12 +709,12 @@ function routeRows(
   spec: AdapterSpec,
   scores: Map<string, ModelScores>,
   at: string,
+  blocks: RouteBlock[],
   forcedReason?: string,
 ): ModelListing[] {
   const ceiling = ceilingFor(db, spec.app);
-  const degradedReason =
-    forcedReason ??
-    (resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling));
+  const appReason =
+    resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling);
   // Only a pool makes per-instance headroom meaningful: without one there is
   // nothing to spread across, and 'default' is the whole story.
   const pool = spec.identityEnv
@@ -687,8 +727,16 @@ function routeRows(
         };
       })
     : undefined;
+  const instances = pool && pool.length > 0 ? pool.map((p) => p.instance) : [DEFAULT_INSTANCE];
   return spec.models.map((route) => {
     const score = scores.get(route.model);
+    // A block only makes the route unusable when it covers every instance the
+    // route could run on; a partial block just steers selection, and saying
+    // "unavailable" would be a lie the pool view right beside it contradicts.
+    const denied = instances.map((i) => blockFor(blocks, spec.app, i, route.slug));
+    const degradedReason =
+      forcedReason ??
+      (denied[0] && denied.every(Boolean) ? routeBlockReason(denied[0]) : appReason);
     return {
       model: route.model,
       app: spec.app,

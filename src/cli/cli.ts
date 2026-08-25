@@ -5,7 +5,12 @@ import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
 import { executeAdapter, killProcessGroup } from "../adapters/executor.ts";
-import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy } from "../adapters/types.ts";
+import {
+  AUTONOMY_ORDER,
+  DEFAULT_INSTANCE,
+  type AdapterSpec,
+  type Autonomy,
+} from "../adapters/types.ts";
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
 import {
   approveDiscovered,
@@ -64,6 +69,17 @@ import {
   setPool,
 } from "../quota/pools.ts";
 import { PRECIOUSNESS_FACTOR, SETTING_PRECIOUSNESS_PREFIX } from "../quota/types.ts";
+import {
+  addBlock,
+  blockFor,
+  blockReason as routeBlockReason,
+  canarySlug,
+  listBlocks,
+  normalizePattern,
+  removeBlock,
+  routeKey,
+  type RouteBlock,
+} from "../registry/blocks.ts";
 import { detectApps, listModels, routableAdapters } from "../registry/registry.ts";
 import { nowIso, openStore, withBusyRetry } from "../store/store.ts";
 import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
@@ -120,6 +136,8 @@ export async function runCli(command: string, args: string[]): Promise<number> {
         return instance(args);
       case "pool":
         return pool(args);
+      case "block":
+        return block(args);
       case "ratings":
         return ratings(args);
       case "profile":
@@ -190,9 +208,17 @@ function detect(): number {
 
 function models(): number {
   const db = openDb();
-  const rows: string[][] = [["MODEL", "ROUTE", "AVAILABLE", "MAX AUTONOMY"]];
+  // "no" on its own sends the user hunting: the reason is the actionable half,
+  // and for a blocked route it is the user's own words coming back to them.
+  const rows: string[][] = [["MODEL", "ROUTE", "AVAILABLE", "MAX AUTONOMY", "WHY NOT"]];
   for (const m of listModels(db)) {
-    rows.push([m.model, `${m.app}/${m.slug}`, m.available ? "yes" : "no", m.maxAutonomy]);
+    rows.push([
+      m.model,
+      `${m.app}/${m.slug}`,
+      m.available ? "yes" : "no",
+      m.maxAutonomy,
+      m.degradedReason ?? "-",
+    ]);
   }
   console.log(table(rows));
   return 0;
@@ -856,7 +882,14 @@ async function liveCanary(
   // Not installed is not a conformance failure: this scope simply cannot reach
   // that app, which `detect` already reports.
   if (!target.binaryPath) return { failed: false, detail: "skipped (not on PATH)" };
-  const slug = target.spec.models[0]?.slug;
+  // The canary is a real call on a real subscription, so it obeys the deny
+  // list: it canaries the first route the user has not blocked, and refuses
+  // rather than spending one they have.
+  const route = canarySlug(listBlocks(db), target.app, target.spec.models, DEFAULT_INSTANCE);
+  if (route && "blocked" in route) {
+    return { failed: false, detail: `skipped (${routeBlockReason(route.blocked)})` };
+  }
+  const slug = route?.slug;
   const autonomy = AUTONOMY_ORDER.find((level) => target.spec.autonomyFlags[level]);
   if (!slug || !autonomy) return { failed: true, detail: "declares no runnable route" };
 
@@ -1093,6 +1126,114 @@ function poolClear(args: string[]): number {
   }
   console.log(`Cleared pool for ${app} (selection falls back to 'default').`);
   return 0;
+}
+
+/**
+ * Route blocks: the deny list for routes Baton can reach but must not spend
+ * (PLAN.md §Registry: route blocks). Baton still does not verify identity —
+ * this is the user saying which reachable routes are off limits, and Baton
+ * obeying without pretending to know whose account is behind one.
+ */
+function block(args: string[]): number {
+  const sub = args[0];
+  switch (sub) {
+    case "add":
+      return blockAdd(args.slice(1));
+    case "list":
+      return blockList();
+    case "remove":
+      return blockRemove(args.slice(1));
+    default:
+      return usage("block takes: add <pattern> [reason...] | list | remove <pattern>");
+  }
+}
+
+/**
+ * The confirmation is the routes it blocks right now — a deny list that
+ * silently matches nothing is worse than no deny list, and a typo in a slug is
+ * invisible otherwise.
+ */
+function blockAdd(args: string[]): number {
+  const [pattern, ...reason] = args;
+  if (!pattern) {
+    return usage(
+      "block add needs: <pattern> [reason...], e.g. baton block add 'opencode/github-copilot/*' client subscription",
+    );
+  }
+  const db = openDb();
+  const saved = addBlock(db, pattern, reason.length > 0 ? reason.join(" ") : undefined);
+  console.log(`Blocked ${saved.pattern}${saved.reason ? ` (${saved.reason})` : ""}`);
+  printMatches(db, saved.pattern);
+  return 0;
+}
+
+function blockList(): number {
+  const db = openDb();
+  const blocks = listBlocks(db);
+  if (blocks.length === 0) {
+    console.log(
+      "No blocked routes in this scope. 'baton block add <app>[:<instance>]/<slug>' adds one ('*' wildcards).",
+    );
+    return 0;
+  }
+  const rows: string[][] = [["PATTERN", "ROUTES", "REASON"]];
+  for (const b of blocks) {
+    rows.push([b.pattern, String(matchingRoutes(db, b.pattern).length), b.reason ?? "-"]);
+  }
+  console.log(table(rows));
+  return 0;
+}
+
+function blockRemove(args: string[]): number {
+  const pattern = args[0];
+  if (!pattern) return usage("block remove needs: <pattern> (as 'baton block list' shows it)");
+  const db = openDb();
+  if (!removeBlock(db, pattern)) {
+    console.error(
+      `baton: no block '${normalizePattern(pattern)}' in this scope. 'baton block list' shows them.`,
+    );
+    return 1;
+  }
+  console.log(`Unblocked ${normalizePattern(pattern)}`);
+  return 0;
+}
+
+/** Routes this scope knows that the pattern covers, as `app:instance/slug`. */
+function matchingRoutes(db: Database, pattern: string): string[] {
+  const one: RouteBlock[] = [{ pattern, createdAt: "" }];
+  const keys: string[] = [];
+  for (const spec of routableAdapters(db)) {
+    const instances = [
+      DEFAULT_INSTANCE,
+      ...(spec.identityEnv ? instanceNames(db, spec.app) : []),
+    ];
+    for (const route of spec.models) {
+      for (const instance of instances) {
+        if (blockFor(one, spec.app, instance, route.slug)) {
+          keys.push(routeKey(spec.app, instance, route.slug));
+        }
+      }
+    }
+  }
+  return keys;
+}
+
+function printMatches(db: Database, pattern: string): void {
+  const matches = matchingRoutes(db, pattern);
+  if (matches.length === 0) {
+    console.log(
+      "It matches no route this scope currently knows — check the app and slug against 'baton models', or leave it as a standing rule for a route that does not exist yet.",
+    );
+    return;
+  }
+  for (const key of matches) console.log(`  ${key}`);
+}
+
+function instanceNames(db: Database, app: string): string[] {
+  return db
+    .query<{ name: string }, [string]>("SELECT name FROM instances WHERE app = ? ORDER BY name")
+    .all(app)
+    .map((r) => r.name);
 }
 
 /**
@@ -1483,6 +1624,9 @@ Usage:
   baton instance remove <app> <name>
   baton pool set <app> <instance...>      Load-balance an app across instances
   baton pool list | pool clear <app>
+  baton block add <pattern> [reason...]   Never route to <app>[:<instance>]/<slug>
+      e.g. 'opencode/github-copilot/*'    ('*' wildcards; bare app blocks it all)
+  baton block list | block remove <pattern>
   baton ratings [publish]                 Show ratings, or refresh ratings.yaml
   baton grade <run-id> <1-5> [notes...]   Grade a run after using its result
   baton profile import <file> [--name <n>] [--activate] [--yes]

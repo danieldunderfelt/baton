@@ -5,7 +5,19 @@ import { z } from "zod";
 
 import { getAdapter } from "../adapters/builtin/index.ts";
 import { executeAdapter } from "../adapters/executor.ts";
-import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy, type ExecRequest, type ExecResult } from "../adapters/types.ts";
+import {
+  AUTONOMY_ORDER,
+  DEFAULT_INSTANCE,
+  type AdapterSpec,
+  type Autonomy,
+  type ExecRequest,
+  type ExecResult,
+} from "../adapters/types.ts";
+import {
+  blockReason as routeBlockReason,
+  canarySlug,
+  listBlocks,
+} from "../registry/blocks.ts";
 import { nowIso, withBusyRetry } from "../store/store.ts";
 import {
   CANARY_TOKEN,
@@ -611,7 +623,21 @@ export async function canaryDiscovered(
     };
   }
   const spec = record.spec;
-  const slug = spec.models[0]?.slug;
+  // A discovered adapter has no instances (they are defined per app in the
+  // trusted CLI, and this one is not routable yet), so the canary spends the
+  // inherited environment — DEFAULT_INSTANCE is the identity a block is
+  // matched against here.
+  const route = canarySlug(listBlocks(db), app, spec.models, DEFAULT_INSTANCE);
+  if (route && "blocked" in route) {
+    return {
+      ok: false,
+      record,
+      errors: [
+        `refusing to canary '${app}': every route it declares is ${routeBlockReason(route.blocked)}. A canary is a real call on a real subscription.`,
+      ],
+    };
+  }
+  const slug = route?.slug;
   // Least authority that can still answer: a canary needs no write access.
   const autonomy = AUTONOMY_ORDER.find((level) => spec.autonomyFlags[level]);
   if (!slug || !autonomy) {
