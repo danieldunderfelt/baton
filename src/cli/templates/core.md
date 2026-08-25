@@ -15,6 +15,7 @@ Baton hands a self-contained task to a model running in another agent CLI on thi
    - `cwd` — defaults to your working directory; set it to aim the callee at another checkout.
    - `idempotency_key` — one stable string per logical task, bound to the payload. Reuse it only for a byte-identical retry of the same request; a changed prompt, `cwd` or `options` under the old key comes back as an error, so mint a new key whenever the request changed.
    - `wait: false` for anything long-running, then poll `get_run(run_id)` and do something else meanwhile.
+   - Delegation depth is capped (two hops by default, `BATON_HOPS`): a callee may delegate onward once, then `run_model` refuses — plan chains accordingly instead of discovering the refusal at runtime.
 3. The callee is a real agent with tools and it will edit files. Run one writer per checkout at a time, and give parallel delegations `options.autonomy: "readonly"` so reviews and analysis cannot collide. An adapter that cannot express the level you asked for refuses the run rather than quietly running at another one — `kimi` is non-interactive at `full` only, so readonly work goes to `codex`, `claude-code` or `cursor-agent`.
 
 ### Models to start from

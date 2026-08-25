@@ -89,6 +89,18 @@ export interface RunView {
 /** Key inside a run's `options` JSON naming the run it resumed. */
 export const RESUMED_FROM = "resumed_from";
 
+/**
+ * Keys inside a run's `options` JSON pinning the adapter revision the run
+ * executed under. A session handle only means something to the invocation that
+ * minted it, so a resume must check that the app's adapter has not been
+ * replaced underneath it (PLAN.md §Session affinity). Built-ins are identified
+ * by `adapterVersion` alone — they are pinned in the binary and bump it when
+ * they change — while a discovered spec is content-addressed, so its digest is
+ * recorded too.
+ */
+export const ADAPTER_VERSION = "adapter_version";
+export const ADAPTER_DIGEST = "adapter_digest";
+
 /** Recursion guard: injected into every callee environment. */
 export const HOPS_ENV = "BATON_HOPS";
 export const DEFAULT_MAX_HOPS = 2;

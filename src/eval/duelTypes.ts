@@ -21,6 +21,11 @@ export interface DuelView {
  * One decayed pairwise edge. Stored with model_a < model_b lexicographically;
  * wins decay with the same half-life as grades (write-side decay-forward,
  * per-edge as_of).
+ *
+ * Exactly one unit of comparison mass per judged duel: a decisive verdict is a
+ * whole win on one side, a tie is a whole `ties`. The fitter is what splits a
+ * tie TIE_WEIGHT each way — storing the split as well would make one tie count
+ * for two comparisons.
  */
 export interface BtEdge {
   modelA: string;
@@ -29,18 +34,34 @@ export interface BtEdge {
   winsA: number;
   winsB: number;
   ties: number;
+  /** Σw² over the events behind this edge (decayed by the square) — for nEff. */
+  mass2: number;
   asOf: string;
+}
+
+/** A resolved prior for one (model, category): mean plus its pseudo-edge weight. */
+export interface BtPrior {
+  /** On the grade scale (1–5). */
+  mean: number;
+  /** Effective pseudo-edge mass — see `btRatings` for how it is resolved. */
+  weight: number;
 }
 
 export interface BtRating {
   model: string;
   category: string;
-  /** Log-strength from the regularized fit, anchored for identifiability. */
+  /**
+   * Log-strength from the regularized fit. Anchored, never recentered:
+   * 0 is the fixed neutral opponent (grade 3), so a prior-only model sits
+   * exactly on its prior and other models' duels cannot move it.
+   */
   theta: number;
-  /** Approximate posterior sd of theta. */
+  /** Marginal posterior sd of the anchored theta (full-covariance diagonal). */
   se: number;
-  /** Decayed comparison mass this model participated in. */
+  /** Effective number of comparisons behind it: (Σw)²/Σw² over its edges. */
   nEff: number;
+  /** False when the MM fit hit maxIter — thetas/ses are then approximate. */
+  converged: boolean;
 }
 
 /**

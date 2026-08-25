@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Client } from "@modelcontextprotocol/client";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { adaptersApprove } from "../src/cli/cli.ts";
 import type { AdapterSpec } from "../src/adapters/types.ts";
 
 /**
@@ -26,15 +27,22 @@ import type { AdapterSpec } from "../src/adapters/types.ts";
  */
 
 const REPO = resolve(import.meta.dir, "..");
-const BINARY = join(REPO, "dist", "baton");
 /**
- * The compiled artifact when it exists, the source entry point otherwise: this
- * test must run in the default suite on a fresh checkout, and both are the same
- * CLI reached through a real subprocess.
+ * The source entry point, always — reached through a real subprocess, so these
+ * are still the real MCP and CLI surfaces.
+ *
+ * This deliberately does NOT prefer `dist/baton` when it happens to exist. One
+ * step of this flow (approval) can only run in-process, because it refuses
+ * without a terminal; mixing a compiled subprocess with in-process source in one
+ * flow makes the result depend on when the binary was last built, and a stale
+ * `dist/baton` then reports the OLD CLI's behaviour as green. The compiled
+ * artifact has its own coverage in test/binary.test.ts, which is where a build
+ * that never happened should fail.
  */
-const CLI: { command: string; args: string[] } = existsSync(BINARY)
-  ? { command: BINARY, args: [] }
-  : { command: process.execPath, args: [join(REPO, "src", "index.ts")] };
+const CLI: { command: string; args: string[] } = {
+  command: process.execPath,
+  args: [join(REPO, "src", "index.ts")],
+};
 
 const APP = "fake-onboarding";
 const MODEL = "fabulous-1";
@@ -54,6 +62,8 @@ let scope: string;
 let workdir: string;
 let binaryPath: string;
 let client: Client;
+/** Copied out of the review the user read, exactly as a human would. */
+let reviewedDigest: string;
 
 /** The unknown app: an absolute, executable CLI this machine has never seen. */
 function installFakeCli(): string {
@@ -117,6 +127,33 @@ async function baton(...args: string[]): Promise<{ code: number; stdout: string;
     proc.exited,
   ]);
   return { code, stdout, stderr };
+}
+
+/**
+ * The one step that cannot go through a subprocess: approval refuses unless
+ * stdin is a terminal, and a spawned process never has one. The refusal is
+ * asserted against the real subprocess below; granting runs the same handler
+ * in-process with only the interactivity gate injected, against the same scope.
+ */
+async function approveAtATerminal(
+  ...args: string[]
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const previous = process.env.BATON_CONFIG_DIR;
+  process.env.BATON_CONFIG_DIR = scope;
+  const out: string[] = [];
+  const err: string[] = [];
+  const { log, error } = console;
+  console.log = (...parts: unknown[]): void => void out.push(parts.join(" "));
+  console.error = (...parts: unknown[]): void => void err.push(parts.join(" "));
+  try {
+    const code = await adaptersApprove(args, { isInteractive: () => true });
+    return { code, stdout: out.join("\n"), stderr: err.join("\n") };
+  } finally {
+    console.log = log;
+    console.error = error;
+    if (previous === undefined) delete process.env.BATON_CONFIG_DIR;
+    else process.env.BATON_CONFIG_DIR = previous;
+  }
 }
 
 /**
@@ -212,17 +249,36 @@ describe("phase-3 exit criterion: onboarding an unknown agent app", () => {
     const review = await baton("adapters", "review", APP);
     expect(review.code, review.stderr).toBe(0);
 
-    // Everything the approval decision rests on, verbatim.
+    // Everything the approval decision rests on, verbatim. argv is printed as a
+    // JSON array because where one element ends and the next begins is the
+    // difference between one program and another.
     expect(review.stdout).toContain(binaryPath);
-    expect(review.stdout).toContain("run --model {slug} --format jsonl {autonomyFlags}");
+    expect(review.stdout).toContain('["run","--model","{slug}","--format","jsonl","{autonomyFlags}"]');
     expect(review.stdout).toContain("prompt via: stdin");
     expect(review.stdout).toContain(`${MODEL} → ${SLUG}`);
     expect(review.stdout).toContain("Nothing from this spec has been executed");
     expect(review.stdout).toContain("untrusted CLI output");
+
+    // The digest the approval has to quote back: it binds consent to the spec
+    // printed above, not to the app name the agent picked.
+    const quoted = /^digest:\s+([0-9a-f]{12})\b/m.exec(review.stdout);
+    expect(quoted).not.toBeNull();
+    reviewedDigest = quoted?.[1] ?? "";
+    expect(review.stdout).toContain(
+      `baton adapters approve ${APP} --digest ${reviewedDigest}`,
+    );
   });
 
   test("5. approval runs the canary, and the canary activates the adapter", async () => {
-    const approve = await baton("adapters", "approve", APP);
+    // A program cannot take this step. The agent that submitted the spec can
+    // reach this exact command, and the real binary refuses it.
+    const byProgram = await baton("adapters", "approve", APP, "--digest", reviewedDigest);
+    expect(byProgram.code).toBe(1);
+    expect(byProgram.stderr).toContain("stdin is not a terminal");
+    expect((await baton("adapters", "list")).stdout).toContain("quarantined");
+
+    // The user, at their own terminal, quoting the digest they just read.
+    const approve = await approveAtATerminal(APP, "--digest", reviewedDigest);
     expect(approve.code, approve.stderr).toBe(0);
     expect(approve.stdout).toContain(`Approved ${APP}`);
     // The canary asked the real binary for the token and read it back through

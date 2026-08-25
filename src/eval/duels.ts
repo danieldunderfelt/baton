@@ -4,8 +4,15 @@ import { newId, nowIso, withBusyRetry } from "../store/store.ts";
 import type { RunOptions, RunRequest, RunStatus, RunView } from "../supervisor/types.ts";
 import { fitBradleyTerry } from "./bradleyTerry.ts";
 import { decayFactor, laterOf, weightAt } from "./decay.ts";
-import { TIE_WEIGHT, type BtEdge, type BtRating, type DuelView } from "./duelTypes.ts";
-import { activePriors, bumpRevision, halfLifeMsFor } from "./evalStore.ts";
+import {
+  BT_SHRINKAGE_WEIGHT,
+  type BtEdge,
+  type BtPrior,
+  type BtRating,
+  type DuelView,
+} from "./duelTypes.ts";
+import { activePriors, bumpRevision, halfLifeMsFor, profileWeight } from "./evalStore.ts";
+import { PRIOR_WEIGHT_CAP } from "./types.ts";
 
 /**
  * Blind duels (PLAN.md §Evaluation): both sides run through the ordinary
@@ -119,6 +126,41 @@ export function duelView(db: Database, supervisor: DuelSupervisor, duelId: strin
   return viewOf(row, duelStatus(row, (id) => supervisor.getRun(id)?.status));
 }
 
+/**
+ * The duel a run is still hidden inside, if any. Blindness belongs to the duel,
+ * not to the run: `report_duel` is what ends it, so this is a live query and
+ * never a stored flag — a judged duel's runs describe themselves in full again.
+ *
+ * Every surface that renders a run owes this check. A run view carries the
+ * model, the app, the instance and the target fingerprint, so handing one back
+ * while the duel is unjudged reveals the mapping the labels exist to hide.
+ */
+export function blindDuelOf(db: Database, runId: string): string | undefined {
+  return db
+    .query<{ id: string }, [string, string]>(
+      "SELECT id FROM duels WHERE winner IS NULL AND (run_a = ? OR run_b = ?)",
+    )
+    .get(runId, runId)?.id;
+}
+
+/**
+ * The same rule over every run at once — run id to the duel still hiding it —
+ * so a renderer paging over runs asks once instead of per row.
+ */
+export function blindRuns(db: Database): Map<string, string> {
+  const rows = db
+    .query<{ id: string; run_a: string; run_b: string }, []>(
+      "SELECT id, run_a, run_b FROM duels WHERE winner IS NULL",
+    )
+    .all();
+  return new Map(
+    rows.flatMap((row) => [
+      [row.run_a, row.id] as const,
+      [row.run_b, row.id] as const,
+    ]),
+  );
+}
+
 function viewOf(row: DuelRow, status: DuelView["status"]): DuelView {
   return {
     duelId: row.id,
@@ -181,6 +223,10 @@ export function reportDuel(
     const previous = readDuel(db, duelId).winner;
     const before = previous ? outcome(previous, map, modelA) : ZERO;
     const after = outcome(winner, map, modelA);
+    // Σw² mirrors the accumulator's discipline: it decays by the SQUARE of the
+    // factor, and a retraction removes exactly w² — the same w the original
+    // event's contribution has decayed to by now — so nEff stays honest.
+    const mass2 = edge.mass2 * f * f + w * w * (total(after) - total(before));
     saveEdge(db, {
       modelA,
       modelB,
@@ -188,6 +234,7 @@ export function reportDuel(
       winsA: clamp(edge.winsA * f + w * (after.a - before.a)),
       winsB: clamp(edge.winsB * f + w * (after.b - before.b)),
       ties: clamp(edge.ties * f + w * (after.ties - before.ties)),
+      mass2: clamp(mass2),
       asOf: now,
     });
     db.query("UPDATE duels SET winner = ?, reported_at = ? WHERE id = ?").run(winner, at, duelId);
@@ -204,6 +251,7 @@ interface EdgeState {
   winsA: number;
   winsB: number;
   ties: number;
+  mass2: number;
   asOf: string;
 }
 
@@ -216,14 +264,21 @@ interface Contribution {
 const ZERO: Contribution = { a: 0, b: 0, ties: 0 };
 
 /**
- * One judgment as edge mass, in the edge's own (lexicographic) orientation. A
- * tie is half a win each way (TIE_WEIGHT) and is also counted as a tie, which
- * is what the comparison mass behind a BT fit is made of.
+ * One judgment as edge mass, in the edge's own (lexicographic) orientation, and
+ * always exactly one unit of it: a decisive verdict is one win, a tie is one
+ * tie and NO wins. The fitter is the single place that splits a tie TIE_WEIGHT
+ * each way — recording the split here as well made one tie weigh twice what a
+ * decisive duel weighs.
  */
 function outcome(winner: Winner, map: LabelMap, modelA: string): Contribution {
-  if (winner === "tie") return { a: TIE_WEIGHT, b: TIE_WEIGHT, ties: 1 };
+  if (winner === "tie") return { a: 0, b: 0, ties: 1 };
   const won = map[winner];
   return won === modelA ? { a: 1, b: 0, ties: 0 } : { a: 0, b: 1, ties: 0 };
+}
+
+/** The comparison mass of a contribution — 1 for any verdict, 0 for none. */
+function total(c: Contribution): number {
+  return c.a + c.b + c.ties;
 }
 
 interface DuelRow {
@@ -284,6 +339,7 @@ interface EdgeRow {
   wins_a: number;
   wins_b: number;
   ties: number;
+  mass2: number;
   as_of: string;
 }
 
@@ -292,7 +348,7 @@ interface EdgeRow {
 function loadEdge(db: Database, modelA: string, modelB: string, category: string): EdgeState {
   const row = db
     .query<EdgeRow, [string, string, string]>(
-      `SELECT wins_a, wins_b, ties, as_of FROM bt_edges
+      `SELECT wins_a, wins_b, ties, mass2, as_of FROM bt_edges
        WHERE model_a = ? AND model_b = ? AND category = ?`,
     )
     .get(modelA, modelB, category);
@@ -303,18 +359,28 @@ function loadEdge(db: Database, modelA: string, modelB: string, category: string
     winsA: row?.wins_a ?? 0,
     winsB: row?.wins_b ?? 0,
     ties: row?.ties ?? 0,
+    mass2: row?.mass2 ?? 0,
     asOf: row?.as_of ?? new Date(0).toISOString(),
   };
 }
 
 function saveEdge(db: Database, edge: EdgeState): void {
   db.query(
-    `INSERT INTO bt_edges (model_a, model_b, category, wins_a, wins_b, ties, as_of)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO bt_edges (model_a, model_b, category, wins_a, wins_b, ties, mass2, as_of)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (model_a, model_b, category) DO UPDATE SET
-       wins_a = excluded.wins_a, wins_b = excluded.wins_b,
-       ties = excluded.ties, as_of = excluded.as_of`,
-  ).run(edge.modelA, edge.modelB, edge.category, edge.winsA, edge.winsB, edge.ties, edge.asOf);
+       wins_a = excluded.wins_a, wins_b = excluded.wins_b, ties = excluded.ties,
+       mass2 = excluded.mass2, as_of = excluded.as_of`,
+  ).run(
+    edge.modelA,
+    edge.modelB,
+    edge.category,
+    edge.winsA,
+    edge.winsB,
+    edge.ties,
+    edge.mass2,
+    edge.asOf,
+  );
 }
 
 /**
@@ -325,19 +391,8 @@ function saveEdge(db: Database, edge: EdgeState): void {
 export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
   const hl = halfLifeMsFor(db);
   return db
-    .query<
-      {
-        model_a: string;
-        model_b: string;
-        category: string;
-        wins_a: number;
-        wins_b: number;
-        ties: number;
-        as_of: string;
-      },
-      []
-    >(
-      `SELECT model_a, model_b, category, wins_a, wins_b, ties, as_of
+    .query<EdgeRow, []>(
+      `SELECT model_a, model_b, category, wins_a, wins_b, ties, mass2, as_of
        FROM bt_edges ORDER BY category, model_a, model_b`,
     )
     .all()
@@ -350,6 +405,8 @@ export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
         winsA: row.wins_a * f,
         winsB: row.wins_b * f,
         ties: row.ties * f,
+        // Σw² decays by the square of the factor (PLAN.md §Decay).
+        mass2: row.mass2 * f * f,
         asOf: at,
       };
     });
@@ -359,23 +416,68 @@ export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
  * The regularized Bradley-Terry fit over the current edges, shrunk toward the
  * active profile's canonical priors. Reported as a SEPARATE signal from the
  * grade EMAs — never merged into `blended` (PLAN.md §Layering and sharing).
+ *
+ * Fitted one category at a time, because a prior is per (model, category): a
+ * model seeded 5 for implementation and 1 for review must not be shrunk toward
+ * one flattened mean in both.
  */
 export function btRatings(db: Database, at = nowIso()): BtRating[] {
-  return fitBradleyTerry(currentEdges(db, at), priorMeans(db));
+  const edges = currentEdges(db, at);
+  const priors = priorIndex(db, at);
+  const ratings: BtRating[] = [];
+  for (const category of [...new Set(edges.map((e) => e.category))].sort()) {
+    ratings.push(
+      ...fitBradleyTerry(
+        edges.filter((e) => e.category === category),
+        priorsFor(priors, category),
+      ),
+    );
+  }
+  return ratings;
+}
+
+interface PriorIndex {
+  /** category -> model -> prior. "" is the uncategorised fallback. */
+  byCategory: Map<string, Map<string, BtPrior>>;
 }
 
 /**
- * Prior mean per model for the shrinkage pseudo-edge. The fit takes one mean
- * per model, not per category, so an uncategorised seed ("kimi-k3 is a 4")
- * wins; a model seeded only per category lends its first such opinion rather
- * than dropping to the neutral anchor.
+ * The active profile's priors as pseudo-edges, resolved at read time.
+ *
+ * A prior's effective pseudo-edge mass is
+ *
+ *     BT_SHRINKAGE_WEIGHT × (stored weight / PRIOR_WEIGHT_CAP)
+ *                         × 2^(−(now − as_of)/half-life)
+ *                         × profile_weight
+ *
+ * so it says exactly what the stored opinion is worth: a full-cap, fresh prior
+ * under the default profile weight gets the whole shrinkage budget, and a thin,
+ * stale or down-weighted one gets proportionally less of it — the fit falls back
+ * to the neutral anchor for the rest. Without this every prior, however faded,
+ * pulled with identical force (PLAN.md §Decay: priors decay from *their* as_of).
  */
-function priorMeans(db: Database): Map<string, number> {
-  const means = new Map<string, number>();
+function priorIndex(db: Database, at: string): PriorIndex {
+  const hl = halfLifeMsFor(db);
+  const scale = profileWeight(db);
+  const byCategory = new Map<string, Map<string, BtPrior>>();
   for (const prior of activePriors(db)) {
-    if (prior.category === "" || !means.has(prior.model)) means.set(prior.model, prior.mean);
+    const weight =
+      BT_SHRINKAGE_WEIGHT *
+      (Math.min(prior.weight, PRIOR_WEIGHT_CAP) / PRIOR_WEIGHT_CAP) *
+      decayFactor(prior.asOf, at, hl) *
+      scale;
+    const bucket = byCategory.get(prior.category) ?? new Map<string, BtPrior>();
+    bucket.set(prior.model, { mean: prior.mean, weight });
+    byCategory.set(prior.category, bucket);
   }
-  return means;
+  return { byCategory };
+}
+
+/** The category's own priors over the uncategorised ones, per model. */
+function priorsFor(index: PriorIndex, category: string): Map<string, BtPrior> {
+  const resolved = new Map(index.byCategory.get("") ?? []);
+  for (const [model, prior] of index.byCategory.get(category) ?? []) resolved.set(model, prior);
+  return resolved;
 }
 
 /** Floating-point residue after a retraction is not evidence. */

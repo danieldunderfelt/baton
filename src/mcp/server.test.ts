@@ -742,6 +742,18 @@ interface BtRow {
   nEff: number;
 }
 
+/**
+ * Whole-payload scan: a leak that moved from `model` into an attempt target or
+ * an error string is the same leak, so the assertion is over the JSON, not over
+ * a list of fields the redactor happens to know about today.
+ */
+function expectNamesNobody(payload: unknown): void {
+  const text = JSON.stringify(payload);
+  for (const name of ["gpt-5.6", "codex", "@a1", "kimi"]) {
+    expect(text, `blind payload named ${name}`).not.toContain(name);
+  }
+}
+
 describe("run_duel / report_duel", () => {
   let duelSession: Session;
   let db: Database;
@@ -783,16 +795,74 @@ describe("run_duel / report_duel", () => {
     expect(JSON.stringify(started)).not.toContain("gpt-5.6");
 
     // Both sides really launched, under the same prompt and category.
-    for (const run of runs) {
-      const view = await callJson(duelSession.client, "get_run", { run_id: run.runId });
-      expect(view.status).toBe("running");
-      expect(view.app).toBe("codex");
-    }
     const launched = db
       .query<{ model: string; prompt: string }, []>("SELECT model, prompt FROM runs ORDER BY model")
       .all();
     expect(launched.map((r) => r.model)).toEqual(["gpt-5.6-luna", "gpt-5.6-sol"]);
     expect(new Set(launched.map((r) => r.prompt)).size).toBe(1);
+  });
+
+  test("polling a side reports its state and withholds everything identifying", async () => {
+    for (const run of runs) {
+      const view = await callJson(duelSession.client, "get_run", { run_id: run.runId });
+      expect(view.status).toBe("running");
+      expect(view.blind).toBe(true);
+      expect(view.duel_id).toBe(duelId);
+      // The judge still gets what judging needs: the handle, the state, timing.
+      expect(view.runId).toBe(run.runId);
+      expect(view.createdAt).toBeString();
+      expect((view.attempts as unknown[]).length).toBeGreaterThan(0);
+      // ...and nothing that names the side. Whole-payload scan, because the
+      // identity used to arrive in model/app/instance/slug AND in every
+      // attempt's target fingerprint.
+      expectNamesNobody(view);
+      for (const field of ["model", "app", "slug", "instance"]) {
+        expect(view[field]).toBeUndefined();
+      }
+      for (const attempt of view.attempts as Record<string, unknown>[]) {
+        expect(attempt.target).toBeUndefined();
+        expect(attempt.sessionRef).toBeUndefined();
+      }
+    }
+  });
+
+  test("a side cannot be resumed while the duel is unjudged", async () => {
+    const { isError, text } = await call(duelSession.client, "resume_run", {
+      run_id: runs[0]!.runId,
+      prompt: "and now defend your answer",
+      wait: false,
+    });
+    // Resuming would show the judge which app answered — through the refusal's
+    // own error text if nothing else, and through the callee's behaviour after.
+    expect(isError).toBe(true);
+    expect(text).toContain(duelId);
+    expect(text).toContain("report_duel");
+    expect(text).not.toContain("codex");
+    expect(text).not.toContain("gpt-5.6");
+    // Nothing was launched: still the two sides of the duel.
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()?.n).toBe(2);
+  });
+
+  test("a side cannot be graded while the duel is unjudged", async () => {
+    const { isError, text } = await call(duelSession.client, "report_result", {
+      run_id: runs[0]!.runId,
+      grade: 5,
+    });
+    // report_result answers with the model that ran; that is the same reveal.
+    expect(isError).toBe(true);
+    expect(text).toContain(duelId);
+    expect(text).not.toContain("gpt-5.6");
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM grades").get()?.n).toBe(0);
+  });
+
+  test("duel sides carry no idempotency key, so run_model cannot dedup onto one", async () => {
+    // Dedup is the other door into a blind run's identity: run_model returns
+    // model/app/instance for a deduplicated run. It only ever looks up a
+    // caller-supplied key, and startDuel supplies none.
+    const keyed = db
+      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs WHERE idempotency_key IS NOT NULL")
+      .get();
+    expect(keyed?.n).toBe(0);
   });
 
   test("the same model twice is refused before anything is launched", async () => {
@@ -830,6 +900,27 @@ describe("run_duel / report_duel", () => {
     expect(edge.ties).toBe(0);
   });
 
+  test("once reported, the sides describe themselves in full again", async () => {
+    // Blindness is the duel's, not the run's: judging ends it, and the run is
+    // an ordinary run again — including for resume and grading.
+    for (const [label, run] of runs.map((r) => [r.label, r] as const)) {
+      const view = await callJson(duelSession.client, "get_run", { run_id: run.runId });
+      expect(view.blind).toBeUndefined();
+      expect(view.model).toBe(revealed[label as "A" | "B"]);
+      expect(view.app).toBe("codex");
+      expect((view.attempts as Record<string, unknown>[])[0]!.target).toBeString();
+    }
+    const { isError, text } = await call(duelSession.client, "resume_run", {
+      run_id: runs[0]!.runId,
+      prompt: "and now defend your answer",
+      wait: false,
+    });
+    // Refused for its own reason now — the fake callee reported no session —
+    // and not for being blind.
+    expect(isError).toBe(true);
+    expect(text).not.toContain("report_duel");
+  });
+
   test("get_ratings reports Bradley-Terry as its own signal, never merged into blended", async () => {
     const res = await callJson(duelSession.client, "get_ratings");
     const bt = res.bt as BtRow[];
@@ -857,14 +948,17 @@ describe("run_duel / report_duel", () => {
     expect(res.winner).toBe("tie");
 
     const after = edgeRow(db)!;
-    // One duel is one comparison however often it is judged; a tie is half a
-    // win each way.
+    // One duel is one comparison however often it is judged: the win is
+    // retracted and the tie takes its place, so the mass on the edge is
+    // unchanged. A tie is recorded as ONE tie and no wins — the fitter is the
+    // single place that splits it, and recording the split here as well made a
+    // tie weigh twice what a decisive verdict weighs.
     expect(after.wins_a + after.wins_b + after.ties).toBeCloseTo(
-      before.wins_a + before.wins_b + before.ties + 1,
+      before.wins_a + before.wins_b + before.ties,
       6,
     );
-    expect(after.wins_a).toBeCloseTo(0.5, 6);
-    expect(after.wins_b).toBeCloseTo(0.5, 6);
+    expect(after.wins_a).toBeCloseTo(0, 6);
+    expect(after.wins_b).toBeCloseTo(0, 6);
     expect(after.ties).toBeCloseTo(1, 6);
   });
 

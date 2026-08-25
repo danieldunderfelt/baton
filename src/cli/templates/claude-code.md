@@ -16,4 +16,3 @@ When you are driving subagents or a multi-stage workflow, the workers should del
 - Give each bulk stage — the mechanical implementation, the migration, the test sweep — to a cheap model through `run_model`, and keep Claude's context for the parts that need the conversation.
 - Route cross-model review through Baton as well: a worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
 - Tell workers to grade what they actually used. A workflow that fires off a hundred delegations and grades none leaves routing exactly where it started.
-- Depth is capped at two hops by default (`BATON_HOPS`): a callee may delegate onward once, its callee is refused. Plan the chain instead of discovering the refusal.

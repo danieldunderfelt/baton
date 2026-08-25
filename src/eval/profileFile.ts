@@ -57,6 +57,16 @@ export function exportProfile(db: Database, profile: string, at = nowIso()): Pro
   if (entries.length === 0) {
     throw new Error(`Profile "${profile}" has no priors to export.`);
   }
+  // Defense in depth for the portability guarantee: both write paths already
+  // enforce canonical ids, but the export is the boundary where a leak would
+  // become someone else's problem — refuse rather than ship a fingerprint.
+  for (const e of entries) {
+    if (/[:/@]/.test(e.model)) {
+      throw new Error(
+        `Refusing to export: "${e.model}" is not a canonical model id (looks like a target or route). Fix the priors row before sharing.`,
+      );
+    }
+  }
   return { name: profile, exported_at: at, entries };
 }
 

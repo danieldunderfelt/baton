@@ -205,6 +205,13 @@ const MIGRATIONS: string[] = [
   DROP TABLE duels;
   ALTER TABLE duels_v6 RENAME TO duels;
   `,
+  // v7 — Σw² per duel edge, the same sufficient statistic the accumulator keeps
+  // (PLAN.md §Decay: "Σw² decays by the square"). Without it nEff on the BT side
+  // was the raw decayed mass, which calls ten half-faded duels one observation.
+  // Existing edges start at 0 and therefore report nEff 0 until they are judged
+  // again; they are days old and decay, so no backfill is attempted (a backfill
+  // would have to invent the event weights that are exactly what was not kept).
+  `ALTER TABLE bt_edges ADD COLUMN mass2 REAL NOT NULL DEFAULT 0;`,
 ];
 
 /** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */

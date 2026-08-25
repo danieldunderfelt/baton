@@ -377,9 +377,9 @@ export function revision(db: Database): number {
 
 export interface RatingSettingOptions {
   /**
-   * Wipe the accumulator and reliability tables so a new half-life starts from
-   * an empty aggregate. Required to change `half_life_days` once either holds
-   * evidence — see `setRatingSetting`.
+   * Wipe the accumulator, reliability and duel-edge tables so a new half-life
+   * starts from empty aggregates. Required to change `half_life_days` once any
+   * of them holds evidence — see `setRatingSetting`.
    */
   resetEvidence?: boolean;
 }
@@ -396,8 +396,11 @@ export interface RatingSettingOptions {
  * sum under a curve it never followed — and a later re-grade would subtract a
  * weight the original event never carried. So it is refused while evidence
  * exists unless the caller asks to drop that evidence, which happens in this
- * same transaction. The grades ring buffer is private history rather than
- * evidence, and is left alone.
+ * same transaction. The duel edge map (`bt_edges`) stores decayed sums under
+ * exactly the same rule and is therefore part of "evidence" on both sides of
+ * this guard — a scope whose only evidence is duels used to be allowed through,
+ * silently corrupting every edge. The grades ring buffer and duel verdicts are
+ * private history rather than decayed sums, and are left alone.
  */
 export function setRatingSetting(
   db: Database,
@@ -410,9 +413,10 @@ export function setRatingSetting(
       if (opts.resetEvidence) {
         db.exec("DELETE FROM accumulator");
         db.exec("DELETE FROM reliability");
+        db.exec("DELETE FROM bt_edges");
       } else if (hasEvidence(db)) {
         throw new Error(
-          `Cannot change ${SETTING_HALF_LIFE_DAYS} while this scope holds observed evidence: the accumulator stores sums already decayed at the current half-life, and reinterpreting them under a new one corrupts every rating. Re-run with --reset-evidence to discard the accumulator and reliability tables (graded runs themselves are kept).`,
+          `Cannot change ${SETTING_HALF_LIFE_DAYS} while this scope holds observed evidence: the accumulator, the reliability counters and the duel edge map all store sums already decayed at the current half-life, and reinterpreting them under a new one corrupts every rating. Re-run with --reset-evidence to discard those three aggregates (graded runs and duel verdicts themselves are kept).`,
         );
       }
     }
@@ -426,7 +430,9 @@ function hasEvidence(db: Database): boolean {
   return (
     db
       .query<{ n: number }, []>(
-        `SELECT (SELECT COUNT(*) FROM accumulator) + (SELECT COUNT(*) FROM reliability) AS n`,
+        `SELECT (SELECT COUNT(*) FROM accumulator)
+              + (SELECT COUNT(*) FROM reliability)
+              + (SELECT COUNT(*) FROM bt_edges) AS n`,
       )
       .get()!.n > 0
   );

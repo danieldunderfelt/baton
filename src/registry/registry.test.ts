@@ -13,6 +13,7 @@ import { preciousnessKey, setPool } from "../quota/pools.ts";
 import { recordAdmissionFailure, recordRun } from "../quota/quota.ts";
 import { newId, nowIso, openStore } from "../store/store.ts";
 import {
+  DEFAULT_INSTANCE,
   POLICY_VERSION,
   candidateKey,
   ceilingFor,
@@ -22,6 +23,7 @@ import {
   listModels,
   resolveTargets,
   selectTarget,
+  targetFor,
 } from "./registry.ts";
 
 /** A throwaway BATON_CONFIG_DIR scope. Never touches a real Baton dir. */
@@ -346,6 +348,21 @@ describe("selectTarget", () => {
     // evidence, so the version is part of the execution-target identity — and
     // it may not smuggle a '+' or a space into the fingerprint's grammar.
     expect(target.targetFingerprint).toBe("codex:default/gpt-5.6-sol@a1+vcodex-cli-0.42.0");
+  });
+
+  test("a binary replaced under a live process is re-probed, not served from cache", () => {
+    const db = scopeStore("fingerprint-upgrade");
+    const bin = fakeBinary("codex", "codex-cli 0.42.0");
+    const ref = { app: "codex", slug: "gpt-5.6-sol", instance: DEFAULT_INSTANCE };
+    const before = withPath(dirname(bin), () => targetFor(ref, db));
+    expect(before.targetFingerprint).toEndWith("+vcodex-cli-0.42.0");
+
+    // An upgrade lands at the same path while a daemon is running. Memoizing
+    // the probe for the life of the process would file this run's evidence
+    // against a build that no longer exists.
+    writeFileSync(bin, "#!/bin/sh\necho codex-cli 0.43.0-rc1\n", { mode: 0o755 });
+    const after = withPath(dirname(bin), () => targetFor(ref, db));
+    expect(after.targetFingerprint).toEndWith("+vcodex-cli-0.43.0-rc1");
   });
 
   test("an app that will not answer --version is 'unknown', not a failure", () => {

@@ -22,10 +22,18 @@ import { createMcpRuntime } from "./server.ts";
  * Loopback only, plus Host/Origin validation in front of the handler: the SDK
  * entry is deliberately validation-free, and a broker that spawns agent CLIs
  * with the user's subscriptions is exactly what DNS rebinding would want.
+ *
+ * No caller authentication beyond that — the same threat model as stdio (any
+ * local process could equally spawn `baton mcp` itself). Be aware of what the
+ * daemon changes anyway: it turns that transient capability into a STANDING
+ * loopback endpoint that any local process can drive at full autonomy on the
+ * user's subscriptions for as long as it runs.
  */
 
 /** Default daemon port. Arbitrary, unassigned, and stable across restarts. */
 export const DEFAULT_HTTP_PORT = 7317;
+/** Grace for in-flight handlers between stop-accepting and forced teardown. */
+const SHUTDOWN_DRAIN_MS = 10_000;
 
 export interface HttpDaemon {
   /** Endpoint to register with a host, e.g. http://127.0.0.1:7317/. */
@@ -71,8 +79,12 @@ export function serveHttp(opts: HttpOptions = {}): HttpDaemon {
   async function shutdown(): Promise<void> {
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
-    // Stop accepting first, then tear down: a request admitted mid-shutdown
-    // would find a closed database.
+    // Stop accepting, then DRAIN before tearing down: an in-flight handler
+    // (a `run_model` with wait inside waitForRun, say) that outlives a forced
+    // stop would hit the closed database in dispose. Bounded — a handler that
+    // will not finish inside the grace window gets cut off after all.
+    const drained = server.stop(false);
+    await Promise.race([drained, Bun.sleep(SHUTDOWN_DRAIN_MS)]);
     await server.stop(true);
     await runtime.dispose(() => handler.close());
   }

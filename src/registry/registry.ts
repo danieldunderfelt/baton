@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { statSync } from "node:fs";
 
 import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy } from "../adapters/types.ts";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
@@ -154,17 +155,46 @@ export function detectApps(opts: { probeVersion?: boolean; db?: Database } = {})
 }
 
 const VERSION_PROBE_MS = 5_000;
-const versionCache = new Map<string, string | undefined>();
+/** How long a probe survives when the binary cannot be stat'ed to revalidate it. */
+const VERSION_TTL_MS = 60_000;
+
+interface VersionEntry {
+  /** mtime+size of the file that was probed, or null when stat failed. */
+  stamp: string | null;
+  at: number;
+  version: string | undefined;
+}
+
+const versionCache = new Map<string, VersionEntry>();
+
+/** The identity of the file at this path right now, or null if it cannot be read. */
+function binaryStamp(binaryPath: string): string | null {
+  try {
+    const s = statSync(binaryPath);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * `<binary> --version`, memoized per binary path for the life of the process.
- * The version is part of the execution-target fingerprint, so selection needs
- * it — but spawning a process per candidate is not acceptable, and a binary
- * cannot change under a running Baton without the next process seeing it.
+ * `<binary> --version`, memoized per binary path — but revalidated against the
+ * file's mtime and size, because Baton also runs as a long-lived daemon: an
+ * upgrade replaces the binary under a live process, and a fingerprint carrying
+ * the old version would file new evidence against a build that is gone
+ * (PLAN.md §Registry: execution target). Where the stat fails the memo is time
+ * bound instead (VERSION_TTL_MS) rather than kept forever.
  * Never throws: an app that will not answer is "unknown", not an error.
  */
 function probeVersion(binaryPath: string): string | undefined {
-  if (versionCache.has(binaryPath)) return versionCache.get(binaryPath);
+  const stamp = binaryStamp(binaryPath);
+  const cached = versionCache.get(binaryPath);
+  if (
+    cached &&
+    (stamp === null ? Date.now() - cached.at < VERSION_TTL_MS : cached.stamp === stamp)
+  ) {
+    return cached.version;
+  }
   let version: string | undefined;
   try {
     const res = Bun.spawnSync({
@@ -178,7 +208,7 @@ function probeVersion(binaryPath: string): string | undefined {
   } catch {
     version = undefined;
   }
-  versionCache.set(binaryPath, version);
+  versionCache.set(binaryPath, { stamp, at: Date.now(), version });
   return version;
 }
 

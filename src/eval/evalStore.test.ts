@@ -81,6 +81,18 @@ function grade(db: Database, o: GradeOverrides = {}): number {
 const ratingFor = (rows: EffectiveRating[], model: string, category = "") =>
   rows.find((r) => r.model === model && r.category === category);
 
+/** A duel edge is decayed sums like the accumulator, without going through duels.ts. */
+const insertEdge = (db: Database, category = "impl") =>
+  db
+    .query(
+      `INSERT INTO bt_edges (model_a, model_b, category, wins_a, wins_b, ties, mass2, as_of)
+       VALUES ('kimi-k3', 'opus-5', ?, 1, 0, 0, 1, ?)`,
+    )
+    .run(category, at(0));
+
+const edgeRows = (db: Database) =>
+  db.query<{ model_a: string; mass2: number }, []>("SELECT model_a, mass2 FROM bt_edges").all();
+
 const accumulatorRows = (db: Database) =>
   db
     .query<{ target: string; category: string; sum_w: number; sum_wg: number }, []>(
@@ -866,6 +878,23 @@ describe("setRatingSetting — changing the half-life", () => {
     );
   });
 
+  /**
+   * Sol #1: the guard counted the accumulator and reliability only, so a scope
+   * whose evidence was duels sailed through and every bt_edges sum — decayed
+   * under the old curve — was silently reinterpreted under the new one.
+   */
+  test("is refused for duel-edge evidence too", () => {
+    const db = scopeStore("halflife-guard-edges");
+    setRatingSetting(db, SETTING_HALF_LIFE_DAYS, "10");
+    insertEdge(db);
+    const before = revision(db);
+
+    expect(() => setRatingSetting(db, SETTING_HALF_LIFE_DAYS, "90")).toThrow(/--reset-evidence/);
+    expect(halfLife(db)).toBe("10");
+    expect(edgeRows(db)).toHaveLength(1);
+    expect(revision(db)).toBe(before);
+  });
+
   test("re-writing the same half-life is not a change and is always allowed", () => {
     const db = scopeStore("halflife-same");
     setRatingSetting(db, SETTING_HALF_LIFE_DAYS, "10");
@@ -879,10 +908,13 @@ describe("setRatingSetting — changing the half-life", () => {
     setRatingSetting(db, SETTING_HALF_LIFE_DAYS, "10");
     grade(db, { grade: 5 });
     recordReliability(db, KIMI, false, at(0));
+    insertEdge(db);
 
     const rev = setRatingSetting(db, SETTING_HALF_LIFE_DAYS, "90", { resetEvidence: true });
     expect(halfLife(db)).toBe("90");
     expect(accumulatorRows(db)).toEqual([]);
+    // The duel edge map holds decayed sums on the same curve, so it goes too.
+    expect(edgeRows(db)).toEqual([]);
     expect(reliabilityFor(db, KIMI, at(0)).rate).toBeNull();
     expect(effectiveRatings(db, at(0))).toEqual([]);
     expect(rev).toBe(revision(db));

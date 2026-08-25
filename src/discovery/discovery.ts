@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
@@ -6,7 +7,14 @@ import { getAdapter } from "../adapters/builtin/index.ts";
 import { executeAdapter } from "../adapters/executor.ts";
 import { AUTONOMY_ORDER, type AdapterSpec, type Autonomy, type ExecRequest, type ExecResult } from "../adapters/types.ts";
 import { nowIso, withBusyRetry } from "../store/store.ts";
-import { CANARY_TOKEN, FORBIDDEN_ARGV_CHARS, type DiscoveredAdapter, type DiscoveredStatus } from "./types.ts";
+import {
+  CANARY_TOKEN,
+  CONTROL_OR_BIDI_CHARS,
+  FORBIDDEN_ARGV_CHARS,
+  printable,
+  type DiscoveredAdapter,
+  type DiscoveredStatus,
+} from "./types.ts";
 
 /**
  * Agentic discovery (PLAN.md §Agentic discovery). The whole module exists to
@@ -126,6 +134,54 @@ export function adapterSpecJsonSchema(): Record<string, unknown> {
 export type Rejection = { ok: false; errors: string[] };
 export type Validated = { ok: true; spec: AdapterSpec } | Rejection;
 
+// ---------------------------------------------------------------------------
+// Spec identity
+// ---------------------------------------------------------------------------
+
+/** Key-sorted JSON: two specs that differ only in key order are the same spec. */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      if (source[key] === undefined) continue;
+      out[key] = canonicalize(source[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** What is stored in the `spec` column, and the digest's preimage. */
+export function canonicalSpecJson(spec: AdapterSpec): string {
+  return JSON.stringify(canonicalize(spec));
+}
+
+/**
+ * The identity of a spec, and therefore of everything decided about it. The
+ * lifecycle is keyed on this rather than on the app name, because the app name
+ * is chosen by the submitting agent and can be reused for different content.
+ */
+export function specDigest(spec: AdapterSpec): string {
+  return createHash("sha256").update(canonicalSpecJson(spec)).digest("hex");
+}
+
+/** How much of the digest a human is asked to copy from the review. */
+export const DIGEST_SHORT_LENGTH = 12;
+
+export function shortDigest(digest: string): string {
+  return digest.slice(0, DIGEST_SHORT_LENGTH);
+}
+
+const QUOTED_DIGEST = new RegExp(`^[0-9a-f]{${DIGEST_SHORT_LENGTH},64}$`);
+
+/** Accepts the short prefix a reviewer typed, or any longer prefix up to full. */
+export function digestMatches(digest: string, given: string): boolean {
+  const quoted = given.trim().toLowerCase();
+  return QUOTED_DIGEST.test(quoted) && digest.startsWith(quoted);
+}
+
 export interface ValidateOptions {
   /**
    * Check shape only, skipping the two rules that are about *provenance*
@@ -162,6 +218,11 @@ const PLACEHOLDERS = ["{slug}", "{prompt}", "{autonomyFlags}", "{sessionRef}"];
 function structuralErrors(spec: AdapterSpec, builtin = false): string[] {
   const errors: string[] = [];
   const push = (msg: string): void => void errors.push(msg);
+
+  // Before anything else: the spec has to survive being printed. Approval is a
+  // human reading these fields in a terminal, and an ESC sequence in any one of
+  // them can erase or forge what that human reads.
+  controlCharErrors(spec, "", errors);
 
   // The binary is spawned by the exact path stored here (never PATH-resolved at
   // run time), which is also what the reviewing human read and approved.
@@ -246,6 +307,27 @@ function structuralErrors(spec: AdapterSpec, builtin = false): string[] {
   return errors;
 }
 
+/** Every string leaf, wherever it sits: field names included in the path. */
+function controlCharErrors(value: unknown, path: string, errors: string[]): void {
+  if (typeof value === "string") {
+    if (CONTROL_OR_BIDI_CHARS.test(value)) {
+      errors.push(
+        `${path || "spec"}: ${q(printable(value))} contains a control, bidi or zero-width character — every field is plain printable text a human has to be able to read before approving`,
+      );
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((element, i) => controlCharErrors(element, `${path}.${i}`, errors));
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      controlCharErrors(child, path ? `${path}.${key}` : key, errors);
+    }
+  }
+}
+
 function occurrences(argv: string[], token: string): number {
   return argv.reduce((n, element) => n + element.split(token).length - 1, 0);
 }
@@ -282,6 +364,8 @@ export function submitSpec(db: Database, raw: unknown, at = nowIso()): Stored {
   const validated = validateSpec(raw);
   if (!validated.ok) return validated;
   const spec = validated.spec;
+  // Canonical, so the stored text IS the digest's preimage: every later
+  // compare-and-swap can then match on the column and mean "the same spec".
   withBusyRetry(() =>
     db
       .query(
@@ -291,13 +375,13 @@ export function submitSpec(db: Database, raw: unknown, at = nowIso()): Stored {
            spec = excluded.spec, status = 'quarantined', submitted_at = excluded.submitted_at,
            reviewed_at = NULL, binary_version = NULL, notes = NULL`,
       )
-      .run(spec.app, JSON.stringify(spec), at),
+      .run(spec.app, canonicalSpecJson(spec), at),
   );
   return { ok: true, record: mustGet(db, spec.app) };
 }
 
 export function getDiscovered(db: Database, app: string): DiscoveredAdapter | undefined {
-  const row = db.query<Row, [string]>(`${SELECT} WHERE app = ?`).get(app);
+  const row = getRow(db, app);
   return row ? toRecord(row) : undefined;
 }
 
@@ -320,6 +404,8 @@ export function activeDiscoveredSpecs(db: Database): AdapterSpec[] {
 
 export interface DiscoveredReview {
   record: DiscoveredAdapter;
+  /** The spec's identity; approval has to quote its first 12 hex characters. */
+  digest: string;
   /** Exactly what would be spawned, in the order it would be spawned. */
   binary: string;
   argv: string[];
@@ -327,8 +413,14 @@ export interface DiscoveredReview {
   /** Env var names this adapter reads — values are never stored or shown. */
   envNames: string[];
   extract: string;
+  /** How a session handle is lifted out of the output, if resume is declared. */
+  sessionRef?: string;
+  /** The second argv this spec can spawn — reviewed as closely as the first. */
+  resumeArgv?: string[];
   models: { model: string; slug: string }[];
   promptVia: "stdin" | "argv";
+  admissionFailurePatterns: string[];
+  workStartedPatterns: string[];
   /** True while approval is still required before anything is executed. */
   needsApproval: boolean;
 }
@@ -340,35 +432,64 @@ export function reviewDiscovered(db: Database, app: string): DiscoveredReview | 
   const spec = record.spec;
   return {
     record,
+    digest: record.digest,
     binary: spec.binary,
     argv: spec.invoke.argv,
     autonomyFlags: spec.autonomyFlags,
     envNames: spec.identityEnv ? [spec.identityEnv] : [],
     extract: describeExtract(spec.invoke.extract),
+    ...(spec.sessionRef ? { sessionRef: describeExtract(spec.sessionRef) } : {}),
+    ...(spec.resume ? { resumeArgv: spec.resume.argv } : {}),
     models: spec.models,
     promptVia: spec.invoke.promptVia,
+    admissionFailurePatterns: spec.admissionFailurePatterns,
+    workStartedPatterns: spec.workStartedPatterns ?? [],
     needsApproval: record.status === "quarantined" || record.status === "rejected",
   };
 }
 
+/**
+ * Everything this spec can make Baton do, rendered so that reading it is
+ * enough. argv is printed as a JSON array because element boundaries are the
+ * review: two elements ["-m", "sol"] and one element ["-m sol"] print the same
+ * joined by spaces and are different programs. Every autonomy level is listed,
+ * including the ones this adapter cannot express; the resume argv is shown
+ * because it is a second thing that gets spawned; and every line is escaped, so
+ * a stored string can neither repaint the terminal nor reorder what it sits on.
+ */
 export function formatReview(review: DiscoveredReview): string {
   const record = review.record;
   const spec = record.spec;
   const lines = [
     `app:        ${record.app} (${record.status}, adapter v${spec.adapterVersion})`,
+    `digest:     ${shortDigest(review.digest)}   (sha256 ${review.digest})`,
     `binary:     ${review.binary}`,
-    `argv:       ${review.argv.join(" ")}`,
+    `argv:       ${JSON.stringify(review.argv)}`,
     `prompt via: ${review.promptVia}`,
-    `autonomy:   ${
-      Object.entries(review.autonomyFlags)
-        .map(([level, flags]) => `${level}=[${(flags ?? []).join(" ")}]`)
-        .join("  ") || "none"
-    } (default ${spec.defaultAutonomy})`,
-    `env:        ${review.envNames.join(", ") || "none (inherited environment only)"}`,
     `extract:    ${review.extract}`,
-    `models:     ${review.models.map((m) => `${m.model} → ${m.slug}`).join(", ")}`,
-    `submitted:  ${record.submittedAt}`,
+    `session:    ${review.sessionRef ?? "not extracted"}`,
+    `resume:     ${
+      review.resumeArgv
+        ? JSON.stringify(review.resumeArgv)
+        : "not supported (Baton refuses to resume rather than guess)"
+    }`,
   ];
+  AUTONOMY_ORDER.forEach((level, i) => {
+    const flags = review.autonomyFlags[level];
+    const value = flags ? JSON.stringify(flags) : "unsupported — Baton refuses to run at this level";
+    const label = i === 0 ? "autonomy:  " : "           ";
+    lines.push(
+      `${label} ${level.padEnd(8)} ${value}${level === spec.defaultAutonomy ? "   (default)" : ""}`,
+    );
+  });
+  lines.push(
+    `env:        ${review.envNames.join(", ") || "none (inherited environment only)"}`,
+    `models:     ${review.models.map((m) => `${m.model} → ${m.slug}`).join(", ")}`,
+    `admission:  ${JSON.stringify(review.admissionFailurePatterns)}`,
+    `work-start: ${JSON.stringify(review.workStartedPatterns)}`,
+    `timeout:    ${spec.defaultTimeoutMs} ms`,
+    `submitted:  ${record.submittedAt}`,
+  );
   if (record.binaryVersion) lines.push(`version:    ${record.binaryVersion}`);
   if (record.notes) lines.push(`notes:      ${record.notes}`);
   if (review.needsApproval) {
@@ -378,7 +499,7 @@ export function formatReview(review: DiscoveredReview): string {
       "reading untrusted CLI output — read it as such before approving.",
     );
   }
-  return lines.join("\n");
+  return lines.map(printable).join("\n");
 }
 
 function describeExtract(extract: AdapterSpec["invoke"]["extract"]): string {
@@ -397,22 +518,54 @@ function describeExtract(extract: AdapterSpec["invoke"]["extract"]): string {
   }
 }
 
+export interface ApproveOptions {
+  /**
+   * The digest the reviewer read, short prefix or full. Required: it is what
+   * makes approval a statement about a spec instead of about an app name, and
+   * it is the only way an approval can notice that the spec was swapped.
+   */
+  digest: string;
+  at?: string;
+}
+
 /** Human approval — the only door to execution. Never reachable from a tool call. */
-export function approveDiscovered(db: Database, app: string, at = nowIso()): Stored {
-  const record = getDiscovered(db, app);
-  if (!record) return unknownApp(app);
+export function approveDiscovered(db: Database, app: string, opts: ApproveOptions): Stored {
+  const row = getRow(db, app);
+  if (!row) return unknownApp(app);
+  const record = toRecord(row);
+  if (!digestMatches(record.digest, opts.digest)) {
+    return {
+      ok: false,
+      errors: [
+        `digest mismatch for '${app}': the stored spec is ${shortDigest(record.digest)}, the approval quoted ${q(printable(opts.digest))}. Re-read 'baton adapters review ${app}' — you are not approving what you reviewed.`,
+      ],
+    };
+  }
   if (record.status === "active" || record.status === "stale") {
     return { ok: false, errors: [`adapter '${app}' is already approved (status ${record.status})`] };
   }
-  setStatus(db, app, "approved", { reviewedAt: at, notes: null });
+  const at = opts.at ?? nowIso();
+  if (!cas(db, app, row.spec, [record.status], "approved", { reviewedAt: at, notes: null })) {
+    return { ok: false, errors: [staleWrite(app, "approval")] };
+  }
   return { ok: true, record: mustGet(db, app) };
 }
 
-/** Rejection also demotes an active adapter: the registry drops it immediately. */
+/**
+ * Rejection also demotes an active adapter: the registry drops it immediately.
+ * The one transition deliberately NOT bound to a digest — it only ever takes
+ * execution rights away, so applying it to whatever spec is stored is the safe
+ * outcome even when the agent swapped the spec a moment ago.
+ */
 export function rejectDiscovered(db: Database, app: string, reason?: string, at = nowIso()): Stored {
-  const record = getDiscovered(db, app);
-  if (!record) return unknownApp(app);
-  setStatus(db, app, "rejected", { reviewedAt: at, notes: reason ?? null });
+  if (!getRow(db, app)) return unknownApp(app);
+  withBusyRetry(() =>
+    db
+      .query(
+        "UPDATE discovered_adapters SET status = 'rejected', reviewed_at = ?, notes = ? WHERE app = ?",
+      )
+      .run(at, reason ?? null, app),
+  );
   return { ok: true, record: mustGet(db, app) };
 }
 
@@ -445,8 +598,9 @@ export async function canaryDiscovered(
   exec: CanaryExec = executeAdapter,
   opts: CanaryOptions = {},
 ): Promise<Canaried> {
-  const record = getDiscovered(db, app);
-  if (!record) return unknownApp(app);
+  const row = getRow(db, app);
+  if (!row) return unknownApp(app);
+  const record = toRecord(row);
   if (record.status === "quarantined" || record.status === "rejected") {
     return {
       ok: false,
@@ -478,17 +632,47 @@ export async function canaryDiscovered(
     timeoutMs: opts.timeoutMs ?? CANARY_TIMEOUT_MS,
   });
 
+  // The run took time, and the row can have been replaced while it did. Every
+  // write below is conditional on the spec and status the canary LAUNCHED for;
+  // if either moved, the result describes a spec that is no longer stored and
+  // must not decide anything about the one that is.
   const output = res.output ?? "";
-  if (!res.ok || !output.includes(CANARY_TOKEN)) {
-    const why = res.ok ? `answered ${q(clip(output))} instead of ${CANARY_TOKEN}` : (res.error ?? "failed");
+  // Exact match: a callee that wrapped the token in prose did not follow the
+  // one instruction the canary gives, and the declared extraction is exactly
+  // what is being tested — "contains it somewhere" would pass an adapter whose
+  // extraction returns the whole transcript.
+  if (!res.ok || output.trim() !== CANARY_TOKEN) {
+    const why = res.ok ? `answered ${q(printable(clip(output)))} instead of ${CANARY_TOKEN}` : (res.error ?? "failed");
     const notes = `canary failed at ${at}: ${why}`;
-    setStatus(db, app, "approved", { notes });
+    if (!cas(db, app, row.spec, [record.status], record.status, { notes })) {
+      return { ok: false, errors: [discarded(app, `it failed: ${why}`)] };
+    }
     return { ok: false, record: mustGet(db, app), errors: [`canary failed for '${app}': ${why}`] };
   }
 
   const version = (opts.probeVersion ?? probeBinaryVersion)(spec.binary);
-  setStatus(db, app, "active", { notes: null, binaryVersion: version ?? null, reviewedAt: record.reviewedAt ?? at });
+  const activated = cas(db, app, row.spec, [record.status], "active", {
+    notes: null,
+    binaryVersion: version ?? null,
+    reviewedAt: record.reviewedAt ?? at,
+  });
+  if (!activated) {
+    const current = getDiscovered(db, app);
+    return {
+      ok: false,
+      ...(current ? { record: current } : {}),
+      errors: [discarded(app, "it passed, and nothing was activated")],
+    };
+  }
   return { ok: true, record: mustGet(db, app), output };
+}
+
+function discarded(app: string, what: string): string {
+  return `canary result for '${app}' discarded: the spec it ran changed while it was running (${what}). Review the spec that is stored now: baton adapters review ${app}`;
+}
+
+function staleWrite(app: string, step: string): string {
+  return `'${app}' changed while the ${step} was being recorded — nothing was written. Re-read 'baton adapters review ${app}'.`;
 }
 
 export interface DiscoveredChange {
@@ -513,14 +697,16 @@ export function detectDiscovered(
 ): DiscoveredChange[] {
   const probe = opts.probeVersion ?? probeBinaryVersion;
   const changes: DiscoveredChange[] = [];
-  for (const record of listDiscovered(db)) {
+  for (const row of db.query<Row, []>(`${SELECT} ORDER BY app`).all()) {
+    const record = toRecord(row);
     if (record.status !== "active") continue;
     const seen = probe(record.spec.binary);
     // No answer means "could not ask" (binary gone, --version unsupported);
     // availability already reports that, and it is not evidence of a change.
     if (!seen || !record.binaryVersion || seen === record.binaryVersion) continue;
     const note = `binary version changed: ${record.binaryVersion} → ${seen}; re-canary required (baton adapters canary ${record.app})`;
-    setStatus(db, record.app, "stale", { notes: note });
+    // Probing took time too: only stale the spec that was probed.
+    if (!cas(db, record.app, row.spec, ["active"], "stale", { notes: note })) continue;
     changes.push({ app: record.app, from: "active", to: "stale", note });
   }
   return changes;
@@ -600,6 +786,12 @@ reviews the exact binary, argv and env names with \`baton adapters review ${app}
 approves; only then does Baton run its canary ("reply with exactly ${CANARY_TOKEN}") and
 activate the adapter. If you change the spec, it returns to quarantine.
 
+Approval is theirs to give and cannot be given from here: it has to be typed at a
+terminal, and it has to quote the digest that the review printed for the spec that is
+stored at that moment. Resubmitting changes the digest, so a spec submitted after they
+read the review is refused rather than approved by mistake. Tell them the command; do
+not run it.
+
 ## Spec JSON Schema
 \`\`\`json
 ${JSON.stringify(adapterSpecJsonSchema(), null, 2)}
@@ -611,12 +803,22 @@ ${JSON.stringify(adapterSpecJsonSchema(), null, 2)}
 // Row helpers
 // ---------------------------------------------------------------------------
 
-function setStatus(
+/**
+ * Compare-and-swap on (app, spec, status): a single UPDATE, so it is atomic
+ * against every other Baton process in the scope without needing a transaction
+ * of its own. The stored `spec` text is the digest's canonical preimage, so
+ * matching on it is matching on the digest — one statement, and SQLite needs no
+ * hash function. False means the row moved, which always means "discard this
+ * decision": it was made about a spec that is no longer stored.
+ */
+function cas(
   db: Database,
   app: string,
+  spec: string,
+  from: DiscoveredStatus[],
   status: DiscoveredStatus,
   fields: { reviewedAt?: string; notes?: string | null; binaryVersion?: string | null } = {},
-): void {
+): boolean {
   const sets = ["status = ?"];
   const params: (string | null)[] = [status];
   const set = (column: string, value: string | null | undefined): void => {
@@ -627,15 +829,28 @@ function setStatus(
   set("reviewed_at", fields.reviewedAt);
   set("notes", fields.notes);
   set("binary_version", fields.binaryVersion);
-  withBusyRetry(() =>
-    db.query(`UPDATE discovered_adapters SET ${sets.join(", ")} WHERE app = ?`).run(...params, app),
+  const changes = withBusyRetry(
+    () =>
+      db
+        .query(
+          `UPDATE discovered_adapters SET ${sets.join(", ")}
+           WHERE app = ? AND spec = ? AND status IN (${from.map(() => "?").join(", ")})`,
+        )
+        .run(...params, app, spec, ...from).changes,
   );
+  return changes === 1;
+}
+
+function getRow(db: Database, app: string): Row | undefined {
+  return db.query<Row, [string]>(`${SELECT} WHERE app = ?`).get(app) ?? undefined;
 }
 
 function toRecord(row: Row): DiscoveredAdapter {
+  const spec = safeParse(row.spec) as AdapterSpec;
   return {
     app: row.app,
-    spec: safeParse(row.spec) as AdapterSpec,
+    spec,
+    digest: specDigest(spec),
     status: row.status,
     submittedAt: row.submitted_at,
     ...(row.reviewed_at ? { reviewedAt: row.reviewed_at } : {}),

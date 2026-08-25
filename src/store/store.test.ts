@@ -138,6 +138,28 @@ describe("openStore — schema and migrations", () => {
     expect(runColumns(db)).toContain("payload_hash");
   });
 
+  test("v7 adds bt_edges.mass2, defaulting existing edges to no retained Σw²", () => {
+    const paths = scopePaths("edge-mass2");
+    const first = openStore(paths.dbPath);
+    // A v6-shaped edge: written before Σw² was kept.
+    first.exec("ALTER TABLE bt_edges DROP COLUMN mass2");
+    first
+      .query(
+        `INSERT INTO bt_edges (model_a, model_b, category, wins_a, wins_b, ties, as_of)
+         VALUES ('kimi-k3', 'opus-5', 'impl', 1, 0, 0, ?)`,
+      )
+      .run(nowIso());
+    first.query("DELETE FROM schema_migrations WHERE version > 6").run();
+    first.close();
+
+    const upgraded = openStore(paths.dbPath);
+    const edge = upgraded
+      .query<{ wins_a: number; mass2: number }, []>("SELECT wins_a, mass2 FROM bt_edges")
+      .get()!;
+    expect(edge).toEqual({ wins_a: 1, mass2: 0 });
+    upgraded.close();
+  });
+
   test("a database left at v1 is upgraded in place without losing data", () => {
     const paths = scopePaths("upgrade");
     const first = openStore(paths.dbPath);

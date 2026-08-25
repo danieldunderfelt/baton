@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 
+import { builtinAdapters } from "../adapters/builtin/index.ts";
 import { classifyFailure, executeAdapter } from "../adapters/executor.ts";
 import {
   AUTONOMY_ORDER,
@@ -8,6 +9,7 @@ import {
   type ExecRequest,
   type ExecResult,
 } from "../adapters/types.ts";
+import { specDigest } from "../discovery/discovery.ts";
 import { recordReliability } from "../eval/evalStore.ts";
 import {
   clearCooldown,
@@ -28,6 +30,8 @@ import {
 } from "../registry/registry.ts";
 import { newId, nowIso, withBusyRetry } from "../store/store.ts";
 import {
+  ADAPTER_DIGEST,
+  ADAPTER_VERSION,
   DEFAULT_MAX_CONCURRENT,
   DEFAULT_MAX_HOPS,
   HOPS_ENV,
@@ -224,7 +228,7 @@ export class Supervisor {
           ...(req.category ? { category: req.category } : {}),
           ...(key !== undefined ? { idempotencyKey: key } : {}),
           payloadHash,
-          options: { autonomy, timeoutMs },
+          options: { autonomy, timeoutMs, ...adapterIdentity(target.spec) },
         }),
       );
     } catch (err) {
@@ -292,11 +296,17 @@ export class Supervisor {
         `Cannot resume run '${req.runId}': the '${origin.app}' adapter declares no non-interactive resume, so its session can only be continued by hand. Start a new run with the context it needs.`,
       );
     }
+    const drift = adapterDrift(parseOptions(origin.options), target.spec);
+    if (drift) {
+      throw new Error(
+        `Cannot resume run '${req.runId}': the '${origin.app}' adapter changed since this session was created (${drift}). The new adapter's resume invocation was never the one that minted this session handle, so Baton refuses to hand it over. Start a new run with the context it needs.`,
+      );
+    }
     // Fail closed: without the definition the overlay is gone, and running
     // without it would hand the session to whatever identity the bare
     // environment supplies — a different account than the one holding it.
     const overlay = this.overlay(origin.app, origin.instance, { strict: true });
-    const options = { ...inheritedOptions(origin.options), ...req.options };
+    const options = narrowed(req.options, inheritedOptions(origin.options), target.spec);
     const { autonomy, timeoutMs, fingerprint } = this.resolve(target, options);
     const runId = newId("run");
     const attemptId = newId("att");
@@ -315,7 +325,12 @@ export class Supervisor {
         ...(origin.category ? { category: origin.category } : {}),
         // A resume is a fresh request by definition; nothing may dedup onto it.
         payloadHash: null,
-        options: { autonomy, timeoutMs, [RESUMED_FROM]: req.runId },
+        options: {
+          autonomy,
+          timeoutMs,
+          [RESUMED_FROM]: req.runId,
+          ...adapterIdentity(target.spec),
+        },
       }),
     );
 
@@ -800,6 +815,7 @@ export class Supervisor {
     // must not interleave with another process doing the same.
     this.db
       .transaction(() => {
+        this.guardSessionHolder(a.options[RESUMED_FROM]);
         const cap = this.maxConcurrent();
         // 'queued' counts too: an attempt is inserted queued and only then
         // flipped to running, so counting 'running' alone lets two processes
@@ -843,6 +859,31 @@ export class Supervisor {
           .run(a.attemptId, a.runId, a.fingerprint, process.pid);
       })
       .immediate();
+  }
+
+  /**
+   * One live turn per session. The origin's own terminal status is not enough:
+   * two resumes of the same finished run would both drive the app session it
+   * left behind, and the callee writing that config dir has no idea it is being
+   * raced. The rule is deliberately the narrow, exact one — a non-terminal run
+   * that already names this origin — because a lineage is a chain: resuming the
+   * *resumed* run continues it, and each link is guarded the same way. Runs
+   * launched by another process count, which is why this lives inside the
+   * insert's BEGIN IMMEDIATE.
+   */
+  private guardSessionHolder(resumedFrom: unknown): void {
+    if (typeof resumedFrom !== "string") return;
+    const holder = this.db
+      .query<{ id: string; status: RunStatus }, [string]>(
+        `SELECT id, status FROM runs
+         WHERE status IN ('queued','running') AND json_extract(options, '$.${RESUMED_FROM}') = ?
+         LIMIT 1`,
+      )
+      .get(resumedFrom);
+    if (!holder) return;
+    throw new Error(
+      `Cannot resume run '${resumedFrom}': run ${holder.id} is already continuing that session and is still ${holder.status}. Wait for it to finish (or cancel it), then resume ${holder.id} to carry the conversation on.`,
+    );
   }
 
   private markRunning(runId: string, attemptId: string): void {
@@ -1009,6 +1050,75 @@ function inheritedOptions(optionsJson: string): RunOptions {
       : {}),
     ...(typeof timeoutMs === "number" && timeoutMs > 0 ? { timeoutMs } : {}),
   };
+}
+
+/**
+ * What a resume may actually ask for. A resume continues a conversation the
+ * callee has already been having under a given authority and budget, so its
+ * options may only NARROW that resolution — never raise it. Clamping against
+ * the scope ceiling alone is not enough: a run resolved to `readonly` under a
+ * ceiling that has since been widened would come back as `full` on the same
+ * session (PLAN.md §Precedence). The origin's *resolved* values are the second
+ * ceiling; where a legacy row recorded none, the adapter's default stands in.
+ */
+function narrowed(
+  requested: RunOptions | undefined,
+  origin: RunOptions,
+  spec: AdapterSpec,
+): RunOptions {
+  const originAutonomy = origin.autonomy ?? spec.defaultAutonomy;
+  const originTimeoutMs = origin.timeoutMs ?? spec.defaultTimeoutMs;
+  return {
+    autonomy: narrower(requested?.autonomy ?? originAutonomy, originAutonomy),
+    timeoutMs: Math.min(requested?.timeoutMs ?? originTimeoutMs, originTimeoutMs),
+  };
+}
+
+/** The lower of two authority levels. */
+function narrower(a: Autonomy, b: Autonomy): Autonomy {
+  return AUTONOMY_ORDER.indexOf(a) <= AUTONOMY_ORDER.indexOf(b) ? a : b;
+}
+
+/**
+ * The adapter revision a run executed under, recorded in its options so a later
+ * resume can tell whether the app it is about to re-enter is still the same one
+ * (see ADAPTER_VERSION). Built-ins are pinned in this binary, so their version
+ * number is their identity; a discovered spec is content-addressed, so its
+ * digest is what says "the same adapter".
+ */
+function adapterIdentity(spec: AdapterSpec): Record<string, unknown> {
+  const builtin = builtinAdapters.some((s) => s.app === spec.app);
+  return {
+    [ADAPTER_VERSION]: spec.adapterVersion,
+    ...(builtin ? {} : { [ADAPTER_DIGEST]: specDigest(spec) }),
+  };
+}
+
+/**
+ * How the active adapter differs from the one that minted the session, or "".
+ * A run recorded before this was tracked has nothing to compare against, so it
+ * is left alone rather than made unresumable retroactively.
+ */
+function adapterDrift(options: Record<string, unknown> | undefined, spec: AdapterSpec): string {
+  const version = options?.[ADAPTER_VERSION];
+  if (typeof version !== "number") return "";
+  const digest = options?.[ADAPTER_DIGEST];
+  const now = adapterIdentity(spec);
+  if (version !== now[ADAPTER_VERSION]) {
+    return `it ran under adapter version ${version}, this scope now has ${String(now[ADAPTER_VERSION])}`;
+  }
+  if (typeof digest === "string" && digest !== now[ADAPTER_DIGEST]) {
+    return `it ran under adapter spec ${digest.slice(0, 12)}, this scope now has ${String(now[ADAPTER_DIGEST]).slice(0, 12)}`;
+  }
+  // A discovered adapter that has replaced a built-in (or vice versa) shares
+  // neither identity, and the missing half is the tell.
+  if (typeof digest === "string" && now[ADAPTER_DIGEST] === undefined) {
+    return "it ran under a discovered adapter, this scope now routes that app to a built-in one";
+  }
+  if (digest === undefined && now[ADAPTER_DIGEST] !== undefined) {
+    return "it ran under a built-in adapter, this scope now routes that app to a discovered one";
+  }
+  return "";
 }
 
 function parseOptions(optionsJson: string): Record<string, unknown> | undefined {

@@ -1,6 +1,6 @@
 ## Baton — delegating to other models
 
-This block is always in context; the tools are not. Check that the `baton` MCP server loaded before you plan around it, and never shell out to `codex`, `claude`, `cursor-agent` or `opencode` by hand as a substitute.
+This block is always in context; the tools are not. If the `baton` tools are not visible in this session, Baton was registered after it started — tell the user to start a new session; never shell out to `codex`, `claude`, `cursor-agent` or `opencode` by hand as a substitute.
 
 {core}
 

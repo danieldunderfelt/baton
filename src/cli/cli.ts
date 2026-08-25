@@ -12,15 +12,19 @@ import {
   canaryDiscovered,
   CANARY_PROMPT,
   CANARY_TIMEOUT_MS,
+  DIGEST_SHORT_LENGTH,
   formatReview,
   listDiscovered,
   rejectDiscovered,
   detectDiscovered,
   reviewDiscovered,
+  shortDigest,
   validateSpec,
 } from "../discovery/discovery.ts";
 import { CANARY_TOKEN, type DiscoveredStatus } from "../discovery/types.ts";
 import {
+  blindDuelOf,
+  blindRuns,
   btRatings,
   currentEdges,
   duelView,
@@ -333,10 +337,18 @@ function runs(args: string[]): number {
     return 1;
   }
 
+  // A side of an unjudged duel describes itself by label only: model, route and
+  // attempt targets are exactly what `duel report` reveals (PLAN.md §Evaluation).
+  const blindDuel = blindDuelOf(db, runId);
   console.log(
     table([
       ["run", row.id],
-      ["model", `${row.model} via ${row.app}:${row.instance}/${row.slug}`],
+      [
+        "model",
+        blindDuel === undefined
+          ? `${row.model} via ${row.app}:${row.instance}/${row.slug}`
+          : `${blindLabel(blindDuel)} — 'baton duel report ${blindDuel} <A|B|tie>' reveals it`,
+      ],
       ["status", row.status],
       ["cwd", row.cwd],
       ["category", row.category ?? "-"],
@@ -352,11 +364,12 @@ function runs(args: string[]): number {
     .all(runId);
   console.log("\nattempts:");
   for (const a of attempts) {
-    console.log(`  #${a.seq} ${a.target}`);
+    console.log(`  #${a.seq} ${blindDuel === undefined ? a.target : "(blind)"}`);
     console.log(
       `     ${a.status}  exit=${a.exit_code ?? "-"}  started=${a.started_at ?? "-"}  finished=${a.finished_at ?? "-"}`,
     );
-    if (a.error) console.log(`     error: ${a.error}`);
+    // An error names the binary that produced it, so it is withheld too.
+    if (a.error) console.log(`     error: ${blindDuel === undefined ? a.error : "run failed"}`);
   }
 
   console.log(`\nprompt:\n${indent(row.prompt)}`);
@@ -375,12 +388,25 @@ function runList(db: Database): number {
     console.log("No runs in this scope yet.");
     return 0;
   }
+  const blind = blindRuns(db);
   const table_: string[][] = [["ID", "MODEL", "STATUS", "AGE", "PROMPT"]];
   for (const r of rows) {
-    table_.push([r.id, r.model, r.status, age(r.created_at), preview(r.prompt)]);
+    const duelId = blind.get(r.id);
+    table_.push([
+      r.id,
+      duelId === undefined ? r.model : blindLabel(duelId),
+      r.status,
+      age(r.created_at),
+      preview(r.prompt),
+    ]);
   }
   console.log(table(table_));
   return 0;
+}
+
+/** How an unjudged duel's side names itself everywhere a model would appear. */
+function blindLabel(duelId: string): string {
+  return `duel ${duelId} (blind)`;
 }
 
 /**
@@ -545,7 +571,7 @@ async function adapters(args: string[]): Promise<number> {
       return await adaptersCanary(args.slice(1));
     default:
       return usage(
-        "adapters takes: list | review <app> | approve <app> [--no-canary] | reject <app> [reason...] | canary <app|--all> [--structural]",
+        "adapters takes: list | review <app> | approve <app> --digest <digest> [--no-canary] | reject <app> [reason...] | canary <app|--all> [--structural]",
       );
   }
 }
@@ -588,23 +614,75 @@ function adaptersReview(app: string | undefined): number {
     return 1;
   }
   console.log(formatReview(review));
+  const digest = shortDigest(review.digest);
   console.log(
     review.needsApproval
       ? `\nApprove running this exact binary with this exact argv as '${app}'?
-  baton adapters approve ${app}             approve, run the canary, activate
-  baton adapters approve ${app} --no-canary approve without executing anything yet
-  baton adapters reject ${app} [reason...]  discard it`
+  approve, canary, activate:  baton adapters approve ${app} --digest ${digest}
+  approve, execute nothing:   baton adapters approve ${app} --digest ${digest} --no-canary
+  discard it:                 baton adapters reject ${app} [reason...]
+
+The digest is required so that approval names the spec above and not just the app:
+if the agent resubmits a different spec before you approve, the digest changes and
+the approval is refused. Approval also refuses to run unless it is typed at a
+terminal — which stops a stray tool call or a pasted command, not an agent that
+already holds full shell access on this machine. That agent could fake a terminal;
+what it cannot do is make you read a spec you never read.`
       : `\nAlready approved (${review.record.status}); 'baton adapters reject ${app}' withdraws that approval.`,
   );
   return 0;
 }
 
-async function adaptersApprove(args: string[]): Promise<number> {
-  const { flags, rest } = parseFlags(args, { boolean: ["canary", "no-canary"] });
+/** Injected so the granting path is testable without a pty; never overridable at runtime. */
+export interface ApprovalGate {
+  isInteractive: () => boolean;
+}
+
+const realApprovalGate: ApprovalGate = { isInteractive: () => process.stdin.isTTY === true };
+
+/**
+ * Approval is the one place where a human, not a program, grants execution
+ * rights (PLAN.md §Agentic discovery). Two conditions: the approval quotes the
+ * digest of the spec stored right now — so it is a statement about content and
+ * not about an app name an agent chose — and it is typed at a terminal. The
+ * terminal check is not a security boundary against an agent that already has
+ * full shell access here (it could fake one); it stops the accidental path, and
+ * `adapters review` says so in as many words rather than implying more.
+ */
+export async function adaptersApprove(
+  args: string[],
+  gate: ApprovalGate = realApprovalGate,
+): Promise<number> {
+  const { flags, rest } = parseFlags(args, {
+    boolean: ["canary", "no-canary"],
+    value: ["digest"],
+  });
   const app = rest[0];
-  if (!app) return usage("adapters approve needs: <app> [--canary|--no-canary]");
+  if (!app) return usage("adapters approve needs: <app> --digest <digest> [--no-canary]");
+  const digest = typeof flags.digest === "string" ? flags.digest : undefined;
+  if (!digest) {
+    return usage(
+      `adapters approve needs --digest <first ${DIGEST_SHORT_LENGTH} hex characters of the spec digest>. 'baton adapters review ${app}' prints it, and prints the spec you are approving.`,
+    );
+  }
   const db = openDb();
-  const approved = approveDiscovered(db, app);
+  const review = reviewDiscovered(db, app);
+  if (!review) {
+    console.error(
+      `baton: no discovered adapter '${app}' in this scope. 'baton adapters list' shows what there is.`,
+    );
+    return 1;
+  }
+  if (!gate.isInteractive()) {
+    console.error(
+      `baton: refusing to approve '${app}': stdin is not a terminal, so nobody is here to have read the spec.`,
+    );
+    console.error(
+      "baton: run this command yourself in a terminal. There is no override flag — approval is the only step a program is not allowed to take for you.",
+    );
+    return 1;
+  }
+  const approved = approveDiscovered(db, app, { digest });
   if (!approved.ok) {
     console.error(`baton: ${approved.errors.join("; ")}`);
     return 1;
@@ -793,7 +871,9 @@ async function liveCanary(
     timeoutMs: CANARY_TIMEOUT_MS,
   });
   const output = result.output ?? "";
-  if (result.ok && output.includes(CANARY_TOKEN)) return { failed: false, detail: "passed" };
+  // Exact, like the discovered-adapter canary: extraction that returns the
+  // token wrapped in a transcript has not been verified, it has been guessed at.
+  if (result.ok && output.trim() === CANARY_TOKEN) return { failed: false, detail: "passed" };
   return {
     failed: true,
     detail: result.ok
@@ -1121,6 +1201,12 @@ function profileExport(args: string[]): number {
   const path = resolve(String(flags.out));
   writeFileSync(path, text);
   console.log(`Exported profile '${name}' (${doc.entries.length} priors) to ${path}`);
+  const categories = [...new Set(doc.entries.map((e) => e.category).filter(Boolean))];
+  if (categories.length > 0) {
+    console.log(
+      `Note: category names are free text and export verbatim (${categories.join(", ")}) — check none name a client or project before sharing.`,
+    );
+  }
   return 0;
 }
 
@@ -1389,7 +1475,7 @@ Usage:
   baton duel list                         Recent duels and their status
   baton adapters list                     Built-in and discovered adapters
   baton adapters review <app>             The exact binary, argv and env names
-  baton adapters approve <app> [--no-canary] | reject <app> [reason...]
+  baton adapters approve <app> --digest <d> [--no-canary] | reject <app> [reason...]
   baton adapters canary <app|--all> [--structural]   Conformance suite
   baton serve --http [--port <n>]         HTTP MCP daemon for this scope
   baton instance add <app> <name> --env KEY=VAL
@@ -1416,14 +1502,28 @@ function validKeys(): string {
     .join(", ")} <${AUTONOMY_ORDER.join("|")}>.`;
 }
 
-function knownApps(): string[] {
-  return builtinAdapters.map((spec) => spec.app).sort();
+/**
+ * Apps this scope can address in a setting. Built-ins always; active discovered
+ * adapters too, once a human approved them and the canary activated them — they
+ * are routable, so a ceiling or a preciousness for them is exactly as meaningful
+ * (the registry reads both kinds of setting generically). A `db` is only passed
+ * where one is already open; the bare listing never opens a store to print help.
+ */
+function knownApps(db?: Database): string[] {
+  const discovered = db
+    ? listDiscovered(db)
+        .filter((record) => record.status === "active")
+        .map((record) => record.app)
+    : [];
+  return [...new Set([...builtinAdapters.map((spec) => spec.app), ...discovered])].sort();
 }
 
 function requireKnownApp(app: string, where?: string): void {
   if (getAdapter(app)) return;
+  const db = openDb();
+  if (knownApps(db).includes(app)) return;
   throw new UsageError(
-    `unknown app '${app}'${where ? ` in '${where}'` : ""}. Known apps: ${knownApps().join(", ")}.`,
+    `unknown app '${app}'${where ? ` in '${where}'` : ""}. Known apps: ${knownApps(db).join(", ")}.`,
   );
 }
 

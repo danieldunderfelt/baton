@@ -8,7 +8,7 @@ import { executeAdapter, killProcessGroup } from "../adapters/executor.ts";
 import type { Autonomy } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
 import { discoveryBrief, listDiscovered, submitSpec } from "../discovery/discovery.ts";
-import { btRatings, reportDuel, startDuel } from "../eval/duels.ts";
+import { blindDuelOf, btRatings, reportDuel, startDuel } from "../eval/duels.ts";
 import {
   DEFAULT_PRIOR_WEIGHT,
   activeProfile,
@@ -300,6 +300,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       description:
         "Full state of a run started by run_model: status (queued | running | succeeded | failed | timeout | cancelled | orphaned), the extracted output once it succeeded, the error otherwise, and the per-attempt detail. " +
         "attempts is the failover chain: an instance that refuses admission (rate limit or auth, before the callee started work) hands the run to the next instance in its pool under the same run_id, so several attempts can appear and the last one is the answer. " +
+        "A side of an unjudged duel answers with blind:true and its duel_id instead: status, output and timing only, because model, app, instance and the attempt targets are exactly what report_duel is withholding. Report the duel and the full detail is there. " +
         "This is the polling half of wait:false. Handles are scope-local: a run_id only resolves in the scope that minted it.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: z.object({ run_id: z.string().min(1).describe("Handle returned by run_model.") }),
@@ -311,7 +312,8 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
           `No run '${run_id}' in this scope (${paths.configDir}). Check the run_id, or list recent runs with 'baton runs'.`,
         );
       }
-      return json(view);
+      const duelId = blindDuelOf(db, run_id);
+      return json(duelId === undefined ? view : blindView(view, duelId));
     },
   );
 
@@ -323,6 +325,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Send a follow-up turn into the session a finished run left behind, so the callee still has its own context instead of being re-briefed from scratch. Returns the same shape as run_model — a NEW run_id for the new turn, with the same wait/get_run semantics. " +
         "Affinity is not optional: the resumed turn goes back to the exact app, model and instance that answered the first time, because the session lives in that instance's config dir. It cannot fail over to another account or another route; if that instance is unusable right now, the resume fails rather than continuing someone else's session. " +
         "Only a settled run can be resumed (a still-running one still owns its session), only an app whose adapter declares a non-interactive resume, and only a run whose attempt actually reported a session handle — otherwise you get a tool error saying which of those it was. Start a fresh run_model with the context it needs when resume is refused. " +
+        "A side of an unjudged duel cannot be resumed either: you are its judge, and a follow-up turn would show you which app answered. Report the duel first. " +
         "options may narrow what the original run resolved (autonomy, timeoutMs); the scope's ceiling still clamps it. cwd and category are inherited from the original run and cannot be changed.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       inputSchema: z.object({
@@ -351,6 +354,14 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       }),
     },
     async ({ run_id, prompt, wait, options }) => {
+      // Blindness first: resuming a duel side reveals the app through its own
+      // behaviour, and continuing a side is not something its judge does.
+      const blindDuel = blindDuelOf(db, run_id);
+      if (blindDuel !== undefined) {
+        throw new Error(
+          `Run '${run_id}' is one side of duel ${blindDuel}, which nobody has judged yet. Resuming it would show you which app answered, and the judge does not continue a side. Report the duel with report_duel first, or start a fresh run_model.`,
+        );
+      }
       const { view, settled } = await supervisor.resumeRun({
         runId: run_id,
         prompt,
@@ -371,6 +382,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "grade is 1 (unusable) to 5 (excellent), and it is about how useful the answer was to you, not the model's reputation and not how long it took. " +
         "Only a run that produced an answer can be graded: a failed, timed-out or cancelled run is an infrastructure outcome, not model quality, and Baton has already recorded it as reliability against the execution target — there is nothing for you to report on those, so grading them is refused. " +
         "Upsert, so it is safe on retry: re-reporting the same run_id REPLACES the earlier grade (the old evidence is subtracted, never stacked), which is also how you correct a grade you got wrong. " +
+        "A side of an unjudged duel is refused: the reply names the model, so grading one before report_duel would unblind the comparison. " +
         "The evidence attaches to the execution target that actually answered (app + instance + model + autonomy of the succeeded attempt) and to the run's own category, and rolls up to the canonical model — see get_ratings.",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
       inputSchema: z.object({
@@ -387,6 +399,14 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       }),
     },
     ({ run_id, grade, notes }) => {
+      // The reply names the model that answered, so grading a blind duel side
+      // is the same reveal by another door — and the duel is the evidence here.
+      const blindDuel = blindDuelOf(db, run_id);
+      if (blindDuel !== undefined) {
+        throw new Error(
+          `Run '${run_id}' is one side of duel ${blindDuel}, which nobody has judged yet — grading it would reveal which model answered. Call report_duel first; a duel verdict is the evidence for a comparison, and you can grade the side afterwards.`,
+        );
+      }
       const graded = gradedAttempt(db, run_id, paths.configDir);
       const revision = recordGrade(db, {
         runId: run_id,
@@ -715,6 +735,36 @@ function waitBudget(db: Database, view: RunView, options: RunOptions | undefined
   const adapterDefault = spec?.defaultTimeoutMs ?? FALLBACK_TIMEOUT_MS;
   return Math.min(options?.timeoutMs ?? adapterDefault, MAX_WAIT_MS) + WAIT_MARGIN_MS;
 }
+
+/**
+ * A run of an unjudged duel, as its judge is allowed to see it: the answer, how
+ * it went and when — never who wrote it. Everything identifying is dropped
+ * rather than blanked (model, app, slug, instance, attempt targets, session
+ * handles), and the error text goes with them: "codex exited 1" names the app
+ * as surely as the model field does. Reporting the duel restores the full view.
+ */
+function blindView(view: RunView, duelId: string): Record<string, unknown> {
+  return {
+    runId: view.runId,
+    status: view.status,
+    blind: true,
+    duel_id: duelId,
+    ...(view.output === undefined ? {} : { output: view.output }),
+    ...(view.error === undefined ? {} : { error: BLIND_ERROR }),
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt,
+    attempts: view.attempts.map((a) => ({
+      seq: a.seq,
+      status: a.status,
+      ...(a.startedAt === undefined ? {} : { startedAt: a.startedAt }),
+      ...(a.finishedAt === undefined ? {} : { finishedAt: a.finishedAt }),
+    })),
+    note: `Side of duel ${duelId}. Identity is withheld until you judge it with report_duel.`,
+  };
+}
+
+const BLIND_ERROR =
+  "run failed — the duel is void, and why is withheld until it is reported (report_duel, then get_run)";
 
 function summary(view: RunView): Record<string, unknown> {
   return {

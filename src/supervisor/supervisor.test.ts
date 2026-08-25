@@ -1093,6 +1093,32 @@ describe("resumeRun", () => {
     return { sup, runId: view.runId };
   }
 
+  /** A run started with explicit options, so a resume has something to narrow. */
+  async function originWith(
+    db: Database,
+    options: { autonomy?: "readonly" | "edits" | "full"; timeoutMs?: number },
+  ): Promise<{ sup: Supervisor; runId: string }> {
+    const t = target(resumableSpec());
+    const sup = affinitySupervisor(db, affinityResolver(t, [t]));
+    const { view, settled } = await sup.startRun({
+      model: "fake-model",
+      prompt: "first prompt",
+      options,
+    });
+    await settled;
+    return { sup, runId: view.runId };
+  }
+
+  function optionsOf(db: Database, runId: string): Record<string, unknown> {
+    return JSON.parse(
+      db.query<{ options: string }, [string]>("SELECT options FROM runs WHERE id = ?").get(runId)!
+        .options,
+    );
+  }
+
+  const runCount = (db: Database): number =>
+    db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n;
+
   test("pins the original instance even when the pool would pick another", async () => {
     const db = newDb();
     defineInstance(db, "acct-a", { FAKE_ACCOUNT: "a" });
@@ -1220,22 +1246,19 @@ describe("resumeRun", () => {
     const REFUSAL = "usage limit reached";
     defineInstance(db, "acct-a", { FAKE_ACCOUNT: "a" });
     defineInstance(db, "acct-b", { FAKE_ACCOUNT: "b" });
-    const { runId } = await originRun(
-      db,
-      "acct-a",
-      resumableSpec({ admissionFailurePatterns: [REFUSAL] }),
-    );
+    // ONE adapter, whose first turn answers and whose resume turn is refused:
+    // swapping the spec between the origin and the resume would be a different
+    // app holding the session, which is its own refusal (see adapter revision).
+    const spec = resumableSpec({
+      admissionFailurePatterns: [REFUSAL],
+      resume: {
+        argv: ["-e", `process.stderr.write('${REFUSAL}\\n');process.exit(1)`, "{sessionRef}"],
+      },
+    });
+    const { runId } = await originRun(db, "acct-a", spec);
 
-    const refusing = target(
-      resumableSpec({
-        admissionFailurePatterns: [REFUSAL],
-        resume: {
-          argv: ["-e", `process.stderr.write('${REFUSAL}\\n');process.exit(1)`, "{sessionRef}"],
-        },
-      }),
-      "acct-a",
-    );
-    const roomier = target(resumableSpec({ admissionFailurePatterns: [REFUSAL] }), "acct-b");
+    const refusing = target(spec, "acct-a");
+    const roomier = target(spec, "acct-b");
     const sup = affinitySupervisor(db, affinityResolver(roomier, [refusing, roomier]));
 
     const { view, settled } = await sup.resumeRun({ runId, prompt: "again" });
@@ -1246,6 +1269,113 @@ describe("resumeRun", () => {
     expect(final.attempts).toHaveLength(1);
     expect(final.instance).toBe("acct-a");
     expect(final.error).toContain("stays on the instance holding its session");
+  }, 30_000);
+
+  test("a resume cannot raise the authority the session was created under", async () => {
+    const db = newDb();
+    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run("max_autonomy:fake", "readonly");
+    const { sup, runId } = await originRun(db, "default");
+    expect(sup.getRun(runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
+
+    // The scope's ceiling is widened after the fact. The session is still the
+    // one a readonly turn created, so continuing it stays readonly: options may
+    // only narrow what the original run resolved.
+    db.query("UPDATE settings SET value = 'full' WHERE key = ?").run("max_autonomy:fake");
+    const { view, settled } = await sup.resumeRun({
+      runId,
+      prompt: "again",
+      options: { autonomy: "full" },
+    });
+    await settled;
+
+    expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
+    expect(optionsOf(db, view.runId).autonomy).toBe("readonly");
+  }, 30_000);
+
+  test("a resume may still narrow the original authority", async () => {
+    const db = newDb();
+    const { sup, runId } = await originWith(db, { autonomy: "full" });
+
+    const { view, settled } = await sup.resumeRun({
+      runId,
+      prompt: "again",
+      options: { autonomy: "readonly" },
+    });
+    await settled;
+    expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
+  }, 30_000);
+
+  test("a resume cannot extend the original run's budget, only shorten it", async () => {
+    const db = newDb();
+    const { sup, runId } = await originWith(db, { timeoutMs: 9_000 });
+
+    const longer = await sup.resumeRun({ runId, prompt: "again", options: { timeoutMs: 600_000 } });
+    await longer.settled;
+    expect(optionsOf(db, longer.view.runId).timeoutMs).toBe(9_000);
+
+    const shorter = await sup.resumeRun({ runId, prompt: "again", options: { timeoutMs: 5_000 } });
+    await shorter.settled;
+    expect(optionsOf(db, shorter.view.runId).timeoutMs).toBe(5_000);
+  }, 30_000);
+
+  test("only one live turn per session: a concurrent resume is refused", async () => {
+    const db = newDb();
+    /** A resume turn slow enough to still be running when the next call lands. */
+    const slow = resumableSpec({
+      resume: {
+        argv: [
+          "-e",
+          `setTimeout(() => process.stdout.write(JSON.stringify({session_id:'${SESSION}',text:'later'})), 600)`,
+          "{sessionRef}",
+        ],
+      },
+    });
+    const { sup, runId } = await originRun(db, "default", slow);
+
+    const first = await sup.resumeRun({ runId, prompt: "second prompt" });
+    // The callee is mid-turn against that session; a second one would race it.
+    await expect(sup.resumeRun({ runId, prompt: "racing" })).rejects.toThrow(
+      new RegExp(`run ${first.view.runId} is already continuing that session`),
+    );
+    expect(runCount(db)).toBe(2);
+    await first.settled;
+    expect(sup.getRun(first.view.runId)!.status).toBe("succeeded");
+
+    // Once that turn settles the session is free again...
+    const second = await sup.resumeRun({ runId, prompt: "third prompt" });
+    await second.settled;
+    expect(sup.getRun(second.view.runId)!.status).toBe("succeeded");
+
+    // ...and so is the lineage tip: resuming the resumed run continues the chain.
+    const third = await sup.resumeRun({ runId: second.view.runId, prompt: "fourth prompt" });
+    await third.settled;
+    const final = sup.getRun(third.view.runId)!;
+    expect(final.status).toBe("succeeded");
+    expect(final.resumedFrom).toBe(second.view.runId);
+  }, 40_000);
+
+  test("refuses to resume through an adapter that changed since the session was created", async () => {
+    const db = newDb();
+    const { runId } = await originRun(db, "default");
+
+    // Same app name, later-activated spec: its resume argv never minted this
+    // handle, so running it would aim the old session at a new invocation.
+    const swapped = target(
+      resumableSpec({ resume: { argv: ["-e", RESUMED, "{sessionRef}", "{slug}", "--new"] } }),
+    );
+    const sup = affinitySupervisor(db, affinityResolver(swapped, [swapped]));
+    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /adapter changed since this session was created/,
+    );
+
+    // A bumped adapter version is the same refusal for the built-in case.
+    const bumped = target(resumableSpec({ adapterVersion: 2 }));
+    const bumpedSup = affinitySupervisor(db, affinityResolver(bumped, [bumped]));
+    await expect(bumpedSup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
+      /adapter version 1, this scope now has 2/,
+    );
+    // Nothing was launched: both refusals happen before a run row exists.
+    expect(runCount(db)).toBe(1);
   }, 30_000);
 
   test("the concurrency cap counts a resume like any other launch", async () => {
