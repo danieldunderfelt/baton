@@ -26,7 +26,16 @@ export const opencodeAdapter: AdapterSpec = {
   app: "opencode",
   adapterVersion: 1,
   binary: "opencode",
-  models: [{ model: "ox-alpha", slug: "opencode/x-preview-f-free" }],
+  // OpenCode is a multi-provider host: what it can actually serve depends on
+  // which providers this machine has logged in ('opencode models' lists them,
+  // 'baton detect' shows what resolves). These routes are the ones that earn
+  // their place here: models no other installed app can reach. Claude/GPT
+  // models also appear via opencode's copilot provider but route better
+  // through their native apps, so they are deliberately not listed.
+  models: [
+    { model: "ox-alpha", slug: "opencode/x-preview-f-free" },
+    { model: "gemini-3.1-pro", slug: "github-copilot/gemini-3.1-pro-preview" },
+  ],
   invoke: {
     argv: ["run", "-m", "{slug}", "--format", "json", "{autonomyFlags}", "{prompt}"],
     promptVia: "argv",
