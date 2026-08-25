@@ -597,7 +597,7 @@ async function adapters(args: string[]): Promise<number> {
       return await adaptersCanary(args.slice(1));
     default:
       return usage(
-        "adapters takes: list | review <app> | approve <app> --digest <digest> [--no-canary] | reject <app> [reason...] | canary <app|--all> [--structural]",
+        "adapters takes: list | review <app> | approve <app> --digest <digest> [--no-canary] | reject <app> [reason...] (a built-in too: it blocks every route it has) | canary <app|--all> [--structural]",
       );
   }
 }
@@ -605,12 +605,20 @@ async function adapters(args: string[]): Promise<number> {
 function adaptersList(): number {
   const db = openDb();
   const detected = detectedBinaries();
+  const blocks = listBlocks(db);
   const rows: string[][] = [["APP", "PROVENANCE", "STATUS", "BINARY"]];
+  // A built-in is pinned in the binary and cannot be un-pinned; what "rejected"
+  // means for one is that the user has blocked every route it has, so the app
+  // is out of service in this scope. The status column says so rather than
+  // reporting a pinned adapter as though it were routable.
+  const rejected: { app: string; block: RouteBlock }[] = [];
   for (const spec of builtinAdapters) {
+    const block = appBlock(db, spec, blocks);
+    if (block) rejected.push({ app: spec.app, block });
     rows.push([
       spec.app,
       "builtin",
-      "pinned",
+      block ? "rejected" : "pinned",
       detected.get(spec.app) ?? "not on PATH in this scope",
     ]);
   }
@@ -619,6 +627,12 @@ function adaptersList(): number {
     rows.push([record.app, "discovered", record.status, record.spec.binary]);
   }
   console.log(table(rows));
+
+  for (const { app, block } of rejected) {
+    console.log(
+      `\n${app}: ${routeBlockReason(block)}. Nothing routes to it here. Restore it with: baton block remove '${block.pattern}'`,
+    );
+  }
 
   const pending = discovered.filter((r) => r.status === "quarantined").map((r) => r.app);
   if (pending.length > 0) {
@@ -736,17 +750,60 @@ export async function adaptersApprove(
   return 0;
 }
 
+/**
+ * Two provenances, two meanings. Rejecting a DISCOVERED adapter is a verdict on
+ * a submitted spec: the quarantine store keeps it, and nothing from it ever
+ * runs. A BUILT-IN has no such row — it is pinned in this binary and cannot be
+ * un-pinned — so rejecting one is the user taking the whole app out of service
+ * in this scope, which is precisely a route block over every route it has. Same
+ * word, one mechanism each, and `adapters list` reports both as `rejected`.
+ */
 function adaptersReject(args: string[]): number {
   const [app, ...reason] = args;
   if (!app) return usage("adapters reject needs: <app> [reason...]");
   const db = openDb();
-  const rejected = rejectDiscovered(db, app, reason.length > 0 ? reason.join(" ") : undefined);
+  const notes = reason.length > 0 ? reason.join(" ") : undefined;
+  const builtin = getAdapter(app);
+  if (builtin && !listDiscovered(db).some((r) => r.app === app)) {
+    return rejectBuiltin(db, builtin, notes);
+  }
+  const rejected = rejectDiscovered(db, app, notes);
   if (!rejected.ok) {
     console.error(`baton: ${rejected.errors.join("; ")}`);
     return 1;
   }
   console.log(`Rejected ${app}. It is out of the registry and nothing from its spec runs.`);
   return 0;
+}
+
+function rejectBuiltin(db: Database, spec: AdapterSpec, reason?: string): number {
+  const saved = addBlock(db, `${spec.app}:*/*`, reason);
+  const routes = spec.models.map((m) => m.model).join(", ");
+  console.log(
+    `Rejected ${spec.app}${saved.reason ? ` (${saved.reason})` : ""}. Nothing routes to it in this scope: ${routes}.`,
+  );
+  console.log(
+    `A built-in stays pinned in the binary — the block '${saved.pattern}' is what refuses it, including on resume and in the canary. Undo with: baton block remove '${saved.pattern}'`,
+  );
+  return 0;
+}
+
+/**
+ * The block that takes an entire app out of service: every route of it, on
+ * every instance this scope defines. A partial block steers selection and is
+ * not a rejection, so it is deliberately not reported as one.
+ */
+function appBlock(db: Database, spec: AdapterSpec, blocks: RouteBlock[]): RouteBlock | undefined {
+  const instances = [DEFAULT_INSTANCE, ...(spec.identityEnv ? instanceNames(db, spec.app) : [])];
+  let first: RouteBlock | undefined;
+  for (const instance of instances) {
+    for (const route of spec.models) {
+      const block = blockFor(blocks, spec.app, instance, route.slug);
+      if (!block) return undefined;
+      first ??= block;
+    }
+  }
+  return first;
 }
 
 /**
@@ -1616,7 +1673,9 @@ Usage:
   baton duel list                         Recent duels and their status
   baton adapters list                     Built-in and discovered adapters
   baton adapters review <app>             The exact binary, argv and env names
-  baton adapters approve <app> --digest <d> [--no-canary] | reject <app> [reason...]
+  baton adapters approve <app> --digest <d> [--no-canary]
+  baton adapters reject <app> [reason...]  Discovered: a verdict on its spec
+                                          Built-in: blocks every route it has
   baton adapters canary <app|--all> [--structural]   Conformance suite
   baton serve --http [--port <n>]         HTTP MCP daemon for this scope
   baton instance add <app> <name> --env KEY=VAL

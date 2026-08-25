@@ -115,6 +115,13 @@ baton block add cursor-agent                                       # a whole app
 
 A pattern addresses a route the way Baton names one internally — `<app>[:<instance>]/<slug>`, with `*` matching anything. Leave the instance off and it covers every account; name one (`codex:work/*`) and it covers only that account. `baton block add` prints the routes it matches right now, so a typo shows up immediately.
 
+To take a whole app out of service, reject it — this works on the built-in apps too, not just discovered ones:
+
+```sh
+baton adapters reject opencode client machine   # blocks every route it has
+baton block remove 'opencode:*/*'               # and back again
+```
+
 A blocked route is never selected: not when it is the only route for a model, not as a last resort when everything else is rate-limited, not when resuming a session that already ran on it, and not by the conformance canary. `list_models` reports it as unavailable with your reason attached, so a delegating agent sees the refusal before it tries. Blocks are written only from your terminal — `baton block list`, `baton block remove <pattern>` — never through an MCP tool.
 
 ## Separate worlds

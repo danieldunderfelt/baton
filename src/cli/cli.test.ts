@@ -563,6 +563,36 @@ describe("block", () => {
     expect(gone.stderr).toContain("no block 'opencode:*/github-copilot/*'");
   });
 
+  test("rejecting a built-in takes the whole app out of service", async () => {
+    const scope = tmp("reject-builtin");
+    const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
+    expect(reject.code).toBe(0);
+    expect(reject.stdout).toContain("Rejected opencode (client machine)");
+    expect(reject.stdout).toContain("ox-alpha, gemini-3.1-pro");
+    expect(reject.stdout).toContain("baton block remove 'opencode:*/*'");
+
+    const list = await baton(scope, "adapters", "list");
+    expect(list.stdout).toMatch(/opencode\s+builtin\s+rejected/);
+    expect(list.stdout).toMatch(/codex\s+builtin\s+pinned/);
+    expect(list.stdout).toContain("Restore it with: baton block remove 'opencode:*/*'");
+
+    const models = await baton(scope, "models");
+    expect(models.stdout).toMatch(/ox-alpha.*client machine/);
+    expect(models.stdout).toMatch(/gemini-3.1-pro.*client machine/);
+    expect(models.stdout).not.toMatch(/gpt-5.6-sol.*client machine/);
+
+    // The restore path the output promises actually restores it.
+    expect((await baton(scope, "block", "remove", "opencode:*/*")).code).toBe(0);
+    expect((await baton(scope, "adapters", "list")).stdout).toMatch(/opencode\s+builtin\s+pinned/);
+  });
+
+  test("rejecting an app that is neither built-in nor discovered still says so", async () => {
+    const scope = tmp("reject-unknown");
+    const bad = await baton(scope, "adapters", "reject", "vim");
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("no discovered adapter 'vim'");
+  });
+
   test("a pattern matching nothing known is kept, but says so", async () => {
     const scope = tmp("block-nomatch");
     const add = await baton(scope, "block", "add", "opencode/typo-provider/*");

@@ -55,6 +55,8 @@ Identity stays delegated to the environment: Baton runs what it inherits and nev
 
 A block is a glob over the route's own name, `<app>[:<instance>]/<slug>` (`*` matches anything; an omitted instance means every instance; a bare app means all of its routes). `baton block add 'opencode/github-copilot/*' client enterprise subscription` blocks a provider through one host; naming the slug blocks one model on it.
 
+**Rejecting a built-in is a whole-app block.** `baton adapters reject <app>` used to answer "no discovered adapter" for a pinned one, which was true and useless: a built-in cannot be un-pinned from the binary, but the user can still want the app out of service here. So the same verb does the honest thing for each provenance — a discovered spec gets a review verdict in the quarantine store, a built-in gets a block over every route it has — and `adapters list` reports both as `rejected`, with the command that restores it.
+
 **A block is absolute within its scope.** Selection excludes blocked candidates and never relaxes onto them — not as the last resort the emergency tier gets, not when it is the model's only route. Session affinity does not outrank it either: a resume onto a since-blocked route is refused, because a resume spends the account exactly as a fresh run would. The conformance canary picks an unblocked route or refuses. `list_models` reports a route blocked on every instance it could use as unavailable, carrying the pattern and the user's own reason, so a delegating agent sees the refusal before it spends a call on it. A partially blocked route (one pool member of several) is not called unavailable — it is simply never selected there.
 
 ### Instance mechanics
