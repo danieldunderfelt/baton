@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check tag version
+        run: |
+          package_version=$(bun -e 'console.log(JSON.parse(await Bun.file("package.json").text()).version)')
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$package_version" || {
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $package_version" >&2
+            exit 1
+          }
+
+      - name: Build release binaries
+        run: bun run build:all
+
+      - name: Create checksums
+        run: cd dist && sha256sum baton-* > SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/baton-darwin-arm64
+            dist/baton-darwin-x64
+            dist/baton-linux-arm64
+            dist/baton-linux-x64
+            dist/SHA256SUMS

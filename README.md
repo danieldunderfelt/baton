@@ -22,14 +22,28 @@ When a run comes in, Baton picks a route for the requested model, spawns that ap
 
 ## Install
 
-Building needs [Bun](https://bun.sh); the resulting binary is self-contained and needs nothing.
+The easiest install uses the latest self-contained release. It needs `curl`, but not Bun or a checkout:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/danieldunderfelt/baton/main/install.sh | sh
+```
+
+The installer detects macOS or Linux and arm64 or x64, verifies the release checksum, and puts `baton` in `~/.local/bin`. Set `BATON_INSTALL_DIR` to choose another directory. Set `BATON_VERSION=v0.1.0` to pin a release. Check the install with:
+
+```sh
+baton --version
+```
+
+The release installer supports macOS and Linux on arm64 and x64. There is no Windows build because Baton's process-tree cleanup relies on POSIX process groups.
+
+To build from a checkout, install [Bun](https://bun.sh) and run:
 
 ```sh
 git clone <this-repo> && cd baton
-./install.sh               # builds and installs to ~/.local/bin/baton
+./install.sh               # builds from source and installs to ~/.local/bin/baton
 ```
 
-Set `BATON_INSTALL_DIR` to install somewhere else. `bun run build:all` cross-compiles standalone binaries for macOS and Linux (arm64 and x64) into `dist/` if you want to copy one to another machine. No Windows build: Baton's process-tree cleanup relies on POSIX process groups.
+Contributors can build all release targets with `bun run build:all`. A version tag matching `package.json` publishes the four binaries and their `SHA256SUMS` file through GitHub Actions.
 
 Then register Baton with the apps you use:
 
