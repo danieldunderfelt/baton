@@ -52,7 +52,8 @@ Usage:
   baton profile import <file>    Import a shared priors profile (--yes to commit)
   baton profile export           Print the active profile as a portable file
   baton set <key> <value>        Set a scope setting (e.g. max_autonomy:codex full)
-  baton install <host>           Register Baton with a host app (claude-code, codex, kimi, opencode)
+  baton install [host...]        Register Baton with the host apps on PATH (--user: once, globally)
+  baton update                   Replace this binary with the latest release
   baton status                   Show scope, resolved identity env vars, DB path
 `);
 }

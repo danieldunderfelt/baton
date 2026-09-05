@@ -148,7 +148,7 @@ describe("resolveTargets", () => {
     const routes = withPath(NO_PATH, () => resolveTargets("claude-fable-5-1"));
     expect(routes.map((r) => `${r.spec.app}/${r.slug}`)).toEqual(["claude-code/claude-fable-5-1"]);
     // The pinned alias still wins for the canonical id.
-    expect(withPath(NO_PATH, () => resolveTargets("fable-5"))[0]!.slug).toBe("fable");
+    expect(withPath(NO_PATH, () => resolveTargets("fable-5.1"))[0]!.slug).toBe("fable");
   });
 
   test("a model the app reports routes under its own slug, and is listed", () => {

@@ -109,9 +109,6 @@ case ":$PATH:" in
 esac
 
 echo
-echo "Next, register Baton with the agent apps you use:"
-echo "  baton install claude-code --with-eval"
-echo "  baton install codex --with-eval"
-echo "  baton install kimi --with-eval"
-echo "  baton install opencode --with-eval"
-echo "Then check what this machine can reach:  baton detect"
+echo "Next, register Baton with every agent app on this machine, once:"
+echo "  baton install --user"
+echo "Later, 'baton update' fetches the latest release."

@@ -29,15 +29,12 @@ export const opencodeAdapter: AdapterSpec = {
   // OpenCode is a multi-provider host: what it can actually serve depends on
   // which providers this machine has logged in. `opencode models` reports the
   // whole set, one `provider/model` slug per line, and every one of them is a
-  // route under that name. The two pinned here are the canonical ids Baton's
+  // route under that name. The one pinned here is the canonical id Baton's
   // ratings already use. Claude/GPT models also appear via opencode's copilot
   // provider; they route better through their native apps, and a user who
   // wants them out of the way blocks them ('baton block add
   // opencode/github-copilot/*').
-  models: [
-    { model: "ox-alpha", slug: "opencode/x-preview-f-free" },
-    { model: "gemini-3.1-pro", slug: "github-copilot/gemini-3.1-pro-preview" },
-  ],
+  models: [{ model: "ox-alpha", slug: "opencode/x-preview-f-free" }],
   listModels: { argv: ["models"], extract: { kind: "lines" } },
   invoke: {
     argv: ["run", "-m", "{slug}", "--format", "json", "{autonomyFlags}", "{prompt}"],

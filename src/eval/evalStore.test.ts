@@ -307,7 +307,7 @@ describe("seedPriors", () => {
       db,
       "daniel",
       [
-        { model: "fable-5", mean: 4.8, weight: 50 },
+        { model: "fable-5.1", mean: 4.8, weight: 50 },
         { model: "kimi-k3", category: "implementation", mean: 4.2 },
       ],
       at(0),
@@ -316,14 +316,14 @@ describe("seedPriors", () => {
     expect(seeded.revision).toBe(1);
     // The echo is the store's own answer: input order, defaults and cap applied.
     expect(seeded.entries).toEqual([
-      { model: "fable-5", category: "", mean: 4.8, weight: PRIOR_WEIGHT_CAP },
+      { model: "fable-5.1", category: "", mean: 4.8, weight: PRIOR_WEIGHT_CAP },
       { model: "kimi-k3", category: "implementation", mean: 4.2, weight: DEFAULT_PRIOR_WEIGHT },
     ]);
     expect(activeProfile(db)).toBe("daniel");
     expect(activePriors(db)).toEqual([
       {
         profile: "daniel",
-        model: "fable-5",
+        model: "fable-5.1",
         category: "",
         mean: 4.8,
         weight: PRIOR_WEIGHT_CAP,
@@ -375,7 +375,7 @@ describe("seedPriors", () => {
 describe("importPriors", () => {
   const entries = [
     { model: "opus-5", mean: 4 },
-    { model: "fable-5", mean: 5, weight: 3 },
+    { model: "fable-5.1", mean: 5, weight: 3 },
   ];
 
   test("tags provenance, never auto-activates, and reports every row as added", () => {
@@ -386,7 +386,7 @@ describe("importPriors", () => {
     expect(diff.source).toBe("teammate");
     expect(diff.added).toEqual([
       { model: "opus-5", category: "", mean: 4, weight: DEFAULT_PRIOR_WEIGHT },
-      { model: "fable-5", category: "", mean: 5, weight: 3 },
+      { model: "fable-5.1", category: "", mean: 5, weight: 3 },
     ]);
     expect(diff.changed).toEqual([]);
     expect(diff.unchanged).toEqual([]);
@@ -403,7 +403,7 @@ describe("importPriors", () => {
       "shared",
       [
         { model: "opus-5", mean: 4 },
-        { model: "fable-5", mean: 4.5, weight: 3 },
+        { model: "fable-5.1", mean: 4.5, weight: 3 },
         { model: "grok-4.6", mean: 3 },
       ],
       "teammate-v2",
@@ -429,7 +429,7 @@ describe("importPriors", () => {
         },
       },
       {
-        model: "fable-5",
+        model: "fable-5.1",
         category: "",
         mean: 4.5,
         weight: 3,

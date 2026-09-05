@@ -17,7 +17,7 @@ import { nowIso, withBusyRetry } from "../store/store.ts";
  * `<app>:<instance>/<slug>` — with `*` matching any run of characters:
  *
  *   opencode/github-copilot/*   every copilot route through opencode
- *   opencode/github-copilot/gemini-3.1-pro-preview   just that one
+ *   opencode/github-copilot/<slug>   just that one
  *   opencode                    the whole app
  *   codex:work/*                one instance of one app
  *

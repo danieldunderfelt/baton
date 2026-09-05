@@ -6,6 +6,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
@@ -16,10 +17,11 @@ import CORE_TEMPLATE from "./templates/core.md" with { type: "text" };
 import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
 
 /**
- * `baton install <host>` (PLAN.md §Installers): register the MCP server in the
- * host's own config and render the instruction layer in the host's dialect —
- * a skill for Claude Code, a markered `AGENTS.md` block for the AGENTS.md
- * family. The substance is one shared core; each host wraps it in its own
+ * `baton install [host...]`: register the MCP server in the host's own config
+ * and render the instruction layer in the host's dialect — a skill for Claude
+ * Code, a markered `AGENTS.md` block for the AGENTS.md family. The project
+ * scope keeps an install inside one checkout; the user scope (`--user`) writes
+ * the host's global configs once, for every project. The substance is one shared core; each host wraps it in its own
  * framing, because what changes per host is how the file gets read (a skill
  * that must earn its trigger vs. a block that is always in context) and what
  * that host is usually good for.
@@ -28,9 +30,8 @@ import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
  * - **Merge, never replace.** Other servers and other instructions in those
  *   files are not ours; only our own entry and our own markered block move.
  * - **Atomic.** tmp + rename, so a crashed install never leaves half a file.
- * - **Project scope where the host has one.** Every host here reads a
- *   project-level config, which keeps a Baton install scoped to a checkout
- *   instead of the user's whole machine.
+ * - **Two scopes, same files' shapes.** Every host reads both a project-level
+ *   and a user-level config of the same format; only the paths differ.
  */
 
 export const SERVER_NAME = "baton";
@@ -42,13 +43,22 @@ export function isInstallHost(host: string): host is InstallHost {
   return (INSTALL_HOSTS as readonly string[]).includes(host);
 }
 
+export type InstallScope = "project" | "user";
+
 export interface InstallOptions {
-  /** Append the grading + onboarding-interview section (PLAN.md: eval is opt-in). */
+  /** "project" writes into `dir`; "user" writes into the host's own home configs. */
+  scope?: InstallScope;
+  /** Project directory; ignored for the user scope. Defaults to cwd. */
+  dir?: string;
+  /** Append the grading + onboarding-interview section. On unless refused. */
   withEval?: boolean;
+  /** Environment to resolve home directories from. For tests. */
+  env?: Record<string, string | undefined>;
 }
 
 export interface InstallResult {
   host: InstallHost;
+  scope: InstallScope;
   /** Where the MCP registration landed. Every host here takes one. */
   mcpPath: string;
   /** Anything the user has to know for the registration to actually apply. */
@@ -68,9 +78,21 @@ interface Registration {
   mcpNote?: string;
 }
 
+interface Location {
+  mcpPath: string;
+  instructionsPath: string;
+  mcpNote?: string;
+}
+
+type Env = Record<string, string | undefined>;
+
 interface HostInstaller {
-  register(dir: string, command: string, args: string[]): Registration;
-  writeInstructions(dir: string, body: string): string;
+  /** Where the registration and the instructions go, per scope. */
+  locate(scope: InstallScope, dir: string, env: Env): Location;
+  /** The host's own MCP config format. */
+  merge(path: string, command: string, args: string[]): Registration;
+  /** A skill file is written whole; an AGENTS.md block is merged into the file. */
+  instructions: "skill" | "agents";
   /** Host variant: the shared core goes where its `{core}` placeholder is. */
   template: string;
   restart: string;
@@ -78,59 +100,117 @@ interface HostInstaller {
 
 const AGENTS_FILE = "AGENTS.md";
 
+function home(env: Env): string {
+  return env.HOME || homedir();
+}
+
+/**
+ * The user scope is the host's own global config: the place its docs say a
+ * machine-wide MCP server and a global instruction file live, honouring the
+ * same env var the host itself honours to relocate it.
+ */
 const HOSTS: Record<InstallHost, HostInstaller> = {
   "claude-code": {
-    register: (dir, command, args) => mergeMcpJson(join(dir, ".mcp.json"), command, args),
-    writeInstructions: (dir, body) => {
-      const path = join(dir, ".claude", "skills", SERVER_NAME, "SKILL.md");
-      mkdirSync(dirname(path), { recursive: true });
-      atomicWrite(path, body);
-      return path;
+    locate: (scope, dir, env) => {
+      if (scope === "project") {
+        return {
+          mcpPath: join(dir, ".mcp.json"),
+          instructionsPath: join(dir, ".claude", "skills", SERVER_NAME, "SKILL.md"),
+        };
+      }
+      const config = env.CLAUDE_CONFIG_DIR || join(home(env), ".claude");
+      return {
+        mcpPath: join(dirname(config), ".claude.json"),
+        instructionsPath: join(config, "skills", SERVER_NAME, "SKILL.md"),
+      };
     },
+    merge: mergeMcpJson,
+    instructions: "skill",
     template: CLAUDE_CODE_TEMPLATE,
-    restart: "Restart Claude Code in that directory to pick both up.",
+    restart: "Restart Claude Code to pick both up.",
   },
   codex: {
-    register: (dir, command, args) => ({
-      ...mergeCodexToml(join(dir, ".codex", "config.toml"), command, args),
-      mcpNote: `Codex applies a project's .codex/config.toml only to trusted projects: accept the trust prompt on first run in ${dir}, or add projects."${dir}".trust_level = "trusted" to ~/.codex/config.toml.`,
-    }),
-    writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    locate: (scope, dir, env) => {
+      if (scope === "project") {
+        return {
+          mcpPath: join(dir, ".codex", "config.toml"),
+          instructionsPath: join(dir, AGENTS_FILE),
+          mcpNote: `Codex applies a project's .codex/config.toml only to trusted projects: accept the trust prompt on first run in ${dir}, or add projects."${dir}".trust_level = "trusted" to ~/.codex/config.toml.`,
+        };
+      }
+      const config = env.CODEX_HOME || join(home(env), ".codex");
+      return { mcpPath: join(config, "config.toml"), instructionsPath: join(config, AGENTS_FILE) };
+    },
+    merge: mergeCodexToml,
+    instructions: "agents",
     template: AGENTS_TEMPLATE,
-    restart: "Start a new codex session in that directory to pick both up.",
+    restart: "Start a new codex session to pick both up.",
   },
   kimi: {
-    register: (dir, command, args) => registerKimi(dir, command, args),
-    writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    locate: (scope, dir, env) => {
+      if (scope === "project") return locateKimiProject(dir);
+      const config = env.KIMI_CODE_HOME || join(home(env), ".kimi-code");
+      return { mcpPath: join(config, "mcp.json"), instructionsPath: join(config, AGENTS_FILE) };
+    },
+    merge: mergeMcpJson,
+    instructions: "agents",
     template: AGENTS_TEMPLATE,
-    restart: "MCP servers load at session start: start a new kimi session in that directory.",
+    restart: "MCP servers load at session start: start a new kimi session.",
   },
   opencode: {
-    register: (dir, command, args) => mergeOpencodeJson(join(dir, "opencode.json"), command, args),
-    writeInstructions: (dir, body) => writeMarkedBlock(join(dir, AGENTS_FILE), body),
+    locate: (scope, dir, env) => {
+      if (scope === "project") {
+        return { mcpPath: join(dir, "opencode.json"), instructionsPath: join(dir, AGENTS_FILE) };
+      }
+      const config = join(env.XDG_CONFIG_HOME || join(home(env), ".config"), "opencode");
+      return { mcpPath: join(config, "opencode.json"), instructionsPath: join(config, AGENTS_FILE) };
+    },
+    merge: mergeOpencodeJson,
+    instructions: "agents",
     template: AGENTS_TEMPLATE,
-    restart: "Start a new opencode session in that directory to pick both up.",
+    restart: "Start a new opencode session to pick both up.",
   },
 };
 
-export function installHost(
-  host: InstallHost,
-  targetDir: string,
-  opts: InstallOptions = {},
-): InstallResult {
-  const dir = resolve(targetDir);
-  if (!existsSync(dir)) throw new Error(`Target directory does not exist: ${dir}`);
+/** The host CLIs on PATH: what a bare `baton install` registers with. */
+export function detectedHosts(env: Env = process.env): InstallHost[] {
+  const binary: Record<InstallHost, string> = {
+    "claude-code": "claude",
+    codex: "codex",
+    kimi: "kimi",
+    opencode: "opencode",
+  };
+  return INSTALL_HOSTS.filter((host) => Bun.which(binary[host], { PATH: env.PATH ?? "" }) !== null);
+}
+
+export function installHost(host: InstallHost, opts: InstallOptions = {}): InstallResult {
+  const scope = opts.scope ?? "project";
+  const env = opts.env ?? process.env;
+  const dir = resolve(opts.dir ?? process.cwd());
+  if (scope === "project" && !existsSync(dir)) {
+    throw new Error(`Target directory does not exist: ${dir}`);
+  }
 
   const installer = HOSTS[host];
   const { command, args } = serverCommand();
-  const registration = installer.register(dir, command, args);
-  const body = instructionText(host, opts.withEval ?? false);
-  const instructionsPath = installer.writeInstructions(dir, body);
+  const location = installer.locate(scope, dir, env);
+  mkdirSync(dirname(location.mcpPath), { recursive: true });
+  const registration = installer.merge(location.mcpPath, command, args);
+  const body = instructionText(host, opts.withEval ?? true);
+  if (installer.instructions === "skill") {
+    mkdirSync(dirname(location.instructionsPath), { recursive: true });
+    atomicWrite(location.instructionsPath, body);
+  } else {
+    mkdirSync(dirname(location.instructionsPath), { recursive: true });
+    writeMarkedBlock(location.instructionsPath, body);
+  }
 
   return {
     host,
+    scope,
     ...registration,
-    instructionsPath,
+    ...(location.mcpNote ? { mcpNote: location.mcpNote } : {}),
+    instructionsPath: location.instructionsPath,
     command,
     args,
     restart: installer.restart,
@@ -171,7 +251,7 @@ function serverCommand(): { command: string; args: string[] } {
   return { command: "bun", args: ["run", join(root, "src", "index.ts"), "mcp"] };
 }
 
-/** Claude Code and Kimi Code: `mcpServers.<name>` in the project `.mcp.json`. */
+/** Claude Code and Kimi Code: `mcpServers.<name>` in an `.mcp.json`-shaped file. */
 function mergeMcpJson(path: string, command: string, args: string[]): Registration {
   const doc = readJsonObject(path);
   const servers = isRecord(doc.mcpServers) ? { ...doc.mcpServers } : {};
@@ -195,18 +275,19 @@ function mergeMcpJson(path: string, command: string, args: string[]): Registrati
  * project-local file is the one that loads, so that is where the registration
  * goes.
  */
-function registerKimi(dir: string, command: string, args: string[]): Registration {
+function locateKimiProject(dir: string): Location {
+  const instructionsPath = join(dir, AGENTS_FILE);
   if (existsSync(join(dir, ".git"))) {
     return {
-      ...mergeMcpJson(join(dir, ".mcp.json"), command, args),
+      mcpPath: join(dir, ".mcp.json"),
+      instructionsPath,
       mcpNote:
         "Kimi Code reads the project-root .mcp.json (the Claude-compatible file), so this one registration serves both hosts.",
     };
   }
-  const path = join(dir, ".kimi-code", "mcp.json");
-  mkdirSync(dirname(path), { recursive: true });
   return {
-    ...mergeMcpJson(path, command, args),
+    mcpPath: join(dir, ".kimi-code", "mcp.json"),
+    instructionsPath,
     mcpNote: `${dir} is not a repository root, so Kimi Code would look for the Claude-compatible .mcp.json somewhere else entirely; this went to Kimi's own project-local file, which loads for sessions started in ${dir}. Re-run the install at the repository root to register once for both hosts.`,
   };
 }
@@ -241,7 +322,6 @@ function mergeOpencodeJson(path: string, command: string, args: string[]): Regis
  * which would leave codex with a config it rejects wholesale.
  */
 function mergeCodexToml(path: string, command: string, args: string[]): Registration {
-  mkdirSync(dirname(path), { recursive: true });
   const raw = existsSync(path) ? readFileSync(path, "utf8") : "";
 
   const kept: string[] = [];

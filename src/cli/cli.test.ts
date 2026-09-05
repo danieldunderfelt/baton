@@ -42,7 +42,7 @@ async function batonOnPath(
 }
 
 async function spawnBaton(
-  env: Record<string, string>,
+  env: Record<string, string | undefined>,
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, "run", ENTRY, ...args], {
@@ -271,23 +271,16 @@ describe("install claude-code", () => {
     expect(res.stderr).toContain("codex");
   });
 
-  test("--with-eval appends grading and the onboarding interview", async () => {
+  test("grading and the onboarding interview are included unless --no-eval", async () => {
     const plain = tmp("install-plain");
-    await baton(tmp("install-plain-scope"), "install", "claude-code", "--dir", plain);
+    await baton(tmp("install-plain-scope"), "install", "claude-code", "--dir", plain, "--no-eval");
     const without = readFileSync(join(plain, ".claude", "skills", "baton", "SKILL.md"), "utf8");
     // The core tells every host to grade what it used; the grading rubric and
-    // the seeding interview are what --with-eval adds on top.
+    // the seeding interview are what the eval section adds on top.
     expect(without).not.toContain("seed_ratings");
 
     const target = tmp("install-eval");
-    const res = await baton(
-      tmp("install-eval-scope"),
-      "install",
-      "claude-code",
-      "--dir",
-      target,
-      "--with-eval",
-    );
+    const res = await baton(tmp("install-eval-scope"), "install", "claude-code", "--dir", target);
     expect(res.code).toBe(0);
     expect(res.stdout).toContain("grading + onboarding");
     const skill = readFileSync(join(target, ".claude", "skills", "baton", "SKILL.md"), "utf8");
@@ -297,6 +290,75 @@ describe("install claude-code", () => {
     expect(skill).toContain("seed_ratings");
     expect(skill).toContain("Echo the normalized entries back");
     expect(skill).toContain("`report_duel` is an upsert too");
+  });
+});
+
+describe("install --user", () => {
+  /** A home of its own: nothing here may touch the developer's real configs. */
+  function fakeHome(): string {
+    return tmp("home");
+  }
+
+  test("registers every host CLI on PATH in its global config, once", async () => {
+    const home = fakeHome();
+    const bin = pinnedOnlyBin();
+    const res = await spawnBaton(
+      {
+        BATON_CONFIG_DIR: tmp("install-user-scope"),
+        PATH: bin,
+        HOME: home,
+        // Empty, not unset: a shell exports these as "" often enough that an
+        // empty value has to mean "the default", never "the current directory".
+        CLAUDE_CONFIG_DIR: "",
+        CODEX_HOME: "",
+        KIMI_CODE_HOME: "",
+        XDG_CONFIG_HOME: "",
+      },
+      ["install", "--user"],
+    );
+    expect(res.code).toBe(0);
+    for (const host of ["claude-code", "codex", "kimi", "opencode"]) {
+      expect(res.stdout).toContain(`${host}: registered in `);
+    }
+
+    const claude = (await Bun.file(join(home, ".claude.json")).json()) as {
+      mcpServers: Record<string, { args: string[] }>;
+    };
+    expect(claude.mcpServers.baton?.args.at(-1)).toBe("mcp");
+    expect(existsSync(join(home, ".claude", "skills", "baton", "SKILL.md"))).toBe(true);
+    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toContain("[mcp_servers.baton]");
+    expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toContain("baton:begin");
+    const kimi = (await Bun.file(join(home, ".kimi-code", "mcp.json")).json()) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(Object.keys(kimi.mcpServers)).toEqual(["baton"]);
+    expect(existsSync(join(home, ".kimi-code", "AGENTS.md"))).toBe(true);
+    const opencode = (await Bun.file(join(home, ".config", "opencode", "opencode.json")).json()) as {
+      mcp: Record<string, unknown>;
+    };
+    expect(Object.keys(opencode.mcp)).toEqual(["baton"]);
+    expect(existsSync(join(home, ".config", "opencode", "AGENTS.md"))).toBe(true);
+  });
+
+  test("a bare install registers only the hosts on PATH, and says so when there are none", async () => {
+    const home = fakeHome();
+    const bin = tmp("only-codex-bin");
+    writeFileSync(join(bin, "codex"), `#!/bin/sh\n${VERSION_SHIM}\nexit 1\n`, { mode: 0o755 });
+    const env = { BATON_CONFIG_DIR: tmp("install-detect-scope"), HOME: home, CODEX_HOME: undefined };
+    const some = await spawnBaton({ ...env, PATH: bin }, ["install", "--user"]);
+    expect(some.code).toBe(0);
+    expect(some.stdout).toContain("codex: registered in ");
+    expect(some.stdout).not.toContain("claude-code:");
+
+    const none = await spawnBaton({ ...env, PATH: tmp("empty-bin") }, ["install"]);
+    expect(none.code).toBe(2);
+    expect(none.stderr).toContain("none of the supported host CLIs is on PATH");
+  });
+
+  test("--user takes no --dir", async () => {
+    const res = await baton(tmp("install-user-dir"), "install", "codex", "--user", "--dir", "/tmp");
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("takes no --dir");
   });
 });
 
@@ -542,10 +604,21 @@ function pinnedOnlyBin(): string {
   return bin;
 }
 
+/** The pinned roster, plus one model opencode reports: `fake-provider/fake-model`. */
+function reportedBin(): string {
+  const bin = pinnedOnlyBin();
+  writeFileSync(
+    join(bin, "opencode"),
+    '#!/bin/sh\ncase "$1" in --version) echo "fake 1.0.0"; exit 0;; models) echo fake-provider/fake-model; exit 0;; esac\nexit 1\n',
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
 describe("block", () => {
   test("add, list and remove round-trip, and the add names what it blocks", async () => {
     const scope = tmp("block");
-    const bin = pinnedOnlyBin();
+    const bin = reportedBin();
     const baton = (s: string, ...args: string[]) => batonOnPath(s, bin, ...args);
     expect((await baton(scope, "block", "list")).stdout).toContain("No blocked routes");
 
@@ -553,40 +626,40 @@ describe("block", () => {
       scope,
       "block",
       "add",
-      "opencode/github-copilot/*",
+      "opencode/fake-provider/*",
       "client",
       "enterprise",
       "subscription",
     );
     expect(add.code).toBe(0);
-    expect(add.stdout).toContain("Blocked opencode:*/github-copilot/* (client enterprise subscription)");
+    expect(add.stdout).toContain("Blocked opencode:*/fake-provider/* (client enterprise subscription)");
     // The confirmation is the routes it covers right now, not just the pattern.
-    expect(add.stdout).toContain("opencode:default/github-copilot/gemini-3.1-pro-preview");
+    expect(add.stdout).toContain("opencode:default/fake-provider/fake-model");
     expect(add.stdout).not.toContain("opencode/x-preview-f-free");
 
     const list = await baton(scope, "block", "list");
-    expect(list.stdout).toMatch(/opencode:\*\/github-copilot\/\*\s+1\s+client enterprise subscription/);
+    expect(list.stdout).toMatch(/opencode:\*\/fake-provider\/\*\s+1\s+client enterprise subscription/);
 
     // The blocked model is unavailable with the user's own reason attached...
     const models = await baton(scope, "models");
-    expect(models.stdout).toMatch(/gemini-3.1-pro.*client enterprise subscription/);
+    expect(models.stdout).toMatch(/fake-provider\/fake-model.*client enterprise subscription/);
     // ...and the app's other route is untouched.
     expect(models.stdout).not.toMatch(/ox-alpha.*client enterprise subscription/);
 
-    expect((await baton(scope, "block", "remove", "opencode:*/github-copilot/*")).code).toBe(0);
-    const gone = await baton(scope, "block", "remove", "opencode/github-copilot/*");
+    expect((await baton(scope, "block", "remove", "opencode:*/fake-provider/*")).code).toBe(0);
+    const gone = await baton(scope, "block", "remove", "opencode/fake-provider/*");
     expect(gone.code).toBe(1);
-    expect(gone.stderr).toContain("no block 'opencode:*/github-copilot/*'");
+    expect(gone.stderr).toContain("no block 'opencode:*/fake-provider/*'");
   });
 
   test("rejecting a built-in takes the whole app out of service", async () => {
     const scope = tmp("reject-builtin");
-    const bin = pinnedOnlyBin();
+    const bin = reportedBin();
     const baton = (s: string, ...args: string[]) => batonOnPath(s, bin, ...args);
     const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
     expect(reject.code).toBe(0);
     expect(reject.stdout).toContain("Rejected opencode (client machine)");
-    expect(reject.stdout).toContain("ox-alpha, gemini-3.1-pro");
+    expect(reject.stdout).toContain("ox-alpha, nor anything the app reports");
     expect(reject.stdout).toContain("baton block remove 'opencode:*/*'");
 
     const list = await baton(scope, "adapters", "list");
@@ -596,7 +669,7 @@ describe("block", () => {
 
     const models = await baton(scope, "models");
     expect(models.stdout).toMatch(/ox-alpha.*client machine/);
-    expect(models.stdout).toMatch(/gemini-3.1-pro.*client machine/);
+    expect(models.stdout).toMatch(/fake-provider\/fake-model.*client machine/);
     expect(models.stdout).not.toMatch(/gpt-5.6-sol.*client machine/);
 
     // The restore path the output promises actually restores it.
@@ -1594,7 +1667,7 @@ describe("detect and unknown commands", () => {
     );
     const scope = tmp("detect-reported");
     const detect = await batonOnPath(scope, bin, "detect");
-    expect(detect.stdout).toMatch(/opencode.*ox-alpha, gemini-3.1-pro \+1 reported by the app/);
+    expect(detect.stdout).toMatch(/opencode.*ox-alpha \+1 reported by the app/);
     const models = await batonOnPath(scope, bin, "models");
     expect(models.stdout).toMatch(/zeta\/new-model\s+opencode\/zeta\/new-model\s+yes/);
     // And a block pattern sees it like any other route.

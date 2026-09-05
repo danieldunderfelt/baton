@@ -22,41 +22,28 @@ When a run comes in, Baton picks a route for the requested model, spawns that ap
 
 ## Install
 
-The easiest install uses the latest self-contained release. It needs `curl`, but not Bun or a checkout:
+Two commands, once per machine:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/danieldunderfelt/baton/main/install.sh | sh
+baton install --user
 ```
 
-The installer detects macOS or Linux and arm64 or x64, verifies the release checksum, and puts `baton` in `~/.local/bin`. Set `BATON_INSTALL_DIR` to choose another directory. Set `BATON_VERSION=v0.1.0` to pin a release. Check the install with:
+The first puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second registers Baton with every supported agent app found on PATH — Claude Code, Codex, Kimi Code, OpenCode — in each app's own global config, and writes the instructions that teach its agent when to delegate and how to grade what comes back. Start a new session in any app and the `baton` tools are there.
+
+To update:
 
 ```sh
-baton --version
+baton update
 ```
 
-The release installer supports macOS and Linux on arm64 and x64. There is no Windows build because Baton's process-tree cleanup relies on POSIX process groups.
+That replaces the binary with the latest release (or rebuilds it, if you run from a checkout). Sessions already running keep the old server until they restart.
 
-To build from a checkout, install [Bun](https://bun.sh) and run:
-
-```sh
-git clone <this-repo> && cd baton
-./install.sh               # builds from source and installs to ~/.local/bin/baton
-```
-
-Contributors can build all release targets with `bun run build:all`. A version tag matching `package.json` publishes the four binaries and their `SHA256SUMS` file through GitHub Actions.
-
-Then register Baton with the apps you use:
-
-```sh
-baton install claude-code   # .mcp.json + a skill that teaches Claude when to delegate
-baton install codex         # .codex/config.toml + an AGENTS.md block
-baton install kimi          # .mcp.json (which Kimi also reads) + the AGENTS.md block
-baton install opencode      # opencode.json + the AGENTS.md block
-```
-
-Each installer writes the host's native config plus an instruction block in the host's own dialect, so the agent knows when and how to delegate without being told. Add `--with-eval` to also install the grading instructions (recommended; ratings do not improve without grades).
+To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory: it writes `.mcp.json`, `.codex/config.toml`, `opencode.json` and the instruction files there. `--no-eval` leaves out the grading section; the default includes it, because ratings do not improve without grades.
 
 `baton detect` shows which app CLIs are installed and which models they serve. `baton status` shows where Baton's state lives and which identity variables are set.
+
+Contributors: clone the repo, install [Bun](https://bun.sh), and `./install.sh` builds from source into `~/.local/bin`. `bun run build:all` builds every release target; a version tag matching `package.json` publishes them with a `SHA256SUMS` file through GitHub Actions. There is no Windows build because Baton's process-tree cleanup relies on POSIX process groups.
 
 ## Delegating
 
@@ -128,7 +115,7 @@ Some routes are reachable and still off limits — a client's enterprise seat th
 
 ```sh
 baton block add 'opencode/github-copilot/*' client enterprise subscription
-baton block add 'opencode/github-copilot/gemini-3.1-pro-preview'   # just one model
+baton block add 'opencode/github-copilot/<slug>'                   # just one model
 baton block add cursor-agent                                       # a whole app
 ```
 

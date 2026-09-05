@@ -25,13 +25,22 @@ function scopeStore(name: string): Database {
   return openStore(paths.dbPath);
 }
 
-/** A PATH holding one fake binary, so availability is hermetic. */
+/**
+ * A route opencode reports rather than one Baton pins: blocks address what the
+ * app serves right now, and a reported slug is the common case.
+ */
+const REPORTED = "fake-provider/fake-model";
+
+/**
+ * A PATH holding one fake binary, so availability is hermetic. It answers the
+ * version probe; opencode's fake also reports REPORTED as its one listed model.
+ */
 function fakeBinary(name: string): string {
   const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
-  // Answers the version probe and refuses the model listing: pinned routes only.
+  const listing = name === "opencode" ? ` models) echo ${REPORTED}; exit 0;;` : "";
   writeFileSync(
     join(dir, name),
-    '#!/bin/sh\ncase "$1" in --version) echo 9.9.9; exit 0;; esac\nexit 1\n',
+    `#!/bin/sh\ncase "$1" in --version) echo 9.9.9; exit 0;;${listing} esac\nexit 1\n`,
     { mode: 0o755 },
   );
   return join(dir, name);
@@ -46,8 +55,6 @@ function withFakeBinary<T>(name: string, fn: () => T): T {
     process.env.PATH = prev;
   }
 }
-
-const COPILOT_GEMINI = "github-copilot/gemini-3.1-pro-preview";
 
 describe("normalizePattern", () => {
   test("a bare app blocks every route of it, on every instance", () => {
@@ -64,7 +71,7 @@ describe("normalizePattern", () => {
   });
 
   test("slugs keep their slashes — only the first one splits", () => {
-    expect(normalizePattern(`opencode/${COPILOT_GEMINI}`)).toBe(`opencode:*/${COPILOT_GEMINI}`);
+    expect(normalizePattern(`opencode/${REPORTED}`)).toBe(`opencode:*/${REPORTED}`);
   });
 
   test("refuses patterns that cannot match anything real", () => {
@@ -79,13 +86,13 @@ describe("normalizePattern", () => {
 
 describe("blockFor", () => {
   const blocks = [
-    { pattern: normalizePattern("opencode/github-copilot/*"), createdAt: nowIso() },
+    { pattern: normalizePattern("opencode/fake-provider/*"), createdAt: nowIso() },
     { pattern: normalizePattern("codex:work/*"), createdAt: nowIso() },
   ];
 
   test("matches the routes the pattern covers", () => {
-    expect(blockFor(blocks, "opencode", "default", COPILOT_GEMINI)?.pattern).toBe(
-      "opencode:*/github-copilot/*",
+    expect(blockFor(blocks, "opencode", "default", REPORTED)?.pattern).toBe(
+      "opencode:*/fake-provider/*",
     );
   });
 
@@ -110,8 +117,8 @@ describe("blockFor", () => {
   });
 
   test("routeKey is the fingerprint's own prefix", () => {
-    expect(routeKey("opencode", "default", COPILOT_GEMINI)).toBe(
-      `opencode:default/${COPILOT_GEMINI}`,
+    expect(routeKey("opencode", "default", REPORTED)).toBe(
+      `opencode:default/${REPORTED}`,
     );
   });
 });
@@ -143,10 +150,10 @@ describe("the block store", () => {
 describe("selection", () => {
   test("a blocked route is excluded, and never relaxed onto", () => {
     const db = scopeStore("blocks-select");
-    addBlock(db, "opencode/github-copilot/*", "client enterprise subscription");
-    expect(() =>
-      withFakeBinary("opencode", () => selectTarget(db, "gemini-3.1-pro")),
-    ).toThrow(/client enterprise subscription/);
+    addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
+    expect(() => withFakeBinary("opencode", () => selectTarget(db, REPORTED))).toThrow(
+      /client enterprise subscription/,
+    );
   });
 
   test("the refusal does not advise waiting for quota that would never free it", () => {
@@ -164,7 +171,7 @@ describe("selection", () => {
 
   test("the app's unblocked routes still route", () => {
     const db = scopeStore("blocks-select-sibling");
-    addBlock(db, "opencode/github-copilot/*");
+    addBlock(db, "opencode/fake-provider/*");
     const target = withFakeBinary("opencode", () => selectTarget(db, "ox-alpha"));
     expect(target.slug).toBe("opencode/x-preview-f-free");
   });
@@ -192,8 +199,8 @@ describe("selection", () => {
 describe("resume", () => {
   test("session affinity does not outrank a block added since", () => {
     const db = scopeStore("blocks-resume");
-    addBlock(db, "opencode/github-copilot/*", "client enterprise subscription");
-    const ref = { app: "opencode", slug: COPILOT_GEMINI, instance: "default" };
+    addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
+    const ref = { app: "opencode", slug: REPORTED, instance: "default" };
     expect(() => withFakeBinary("opencode", () => targetFor(ref, db))).toThrow(
       /Cannot resume this run.*client enterprise subscription/s,
     );
@@ -201,7 +208,7 @@ describe("resume", () => {
 
   test("an unblocked route of the same app still resumes", () => {
     const db = scopeStore("blocks-resume-sibling");
-    addBlock(db, "opencode/github-copilot/*");
+    addBlock(db, "opencode/fake-provider/*");
     const ref = { app: "opencode", slug: "opencode/x-preview-f-free", instance: "default" };
     expect(withFakeBinary("opencode", () => targetFor(ref, db)).slug).toBe(
       "opencode/x-preview-f-free",
@@ -212,19 +219,17 @@ describe("resume", () => {
 describe("list_models", () => {
   test("a fully blocked route is unavailable, with the pattern and reason", () => {
     const db = scopeStore("blocks-list");
-    addBlock(db, "opencode/github-copilot/*", "client enterprise subscription");
-    const row = withFakeBinary("opencode", () => listModels(db)).find(
-      (m) => m.model === "gemini-3.1-pro",
-    )!;
+    addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
+    const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === REPORTED)!;
     expect(row.available).toBe(false);
     expect(row.degradedReason).toBe(
-      "blocked by 'opencode:*/github-copilot/*' (client enterprise subscription)",
+      "blocked by 'opencode:*/fake-provider/*' (client enterprise subscription)",
     );
   });
 
   test("the app's other routes are unaffected", () => {
     const db = scopeStore("blocks-list-sibling");
-    addBlock(db, "opencode/github-copilot/*");
+    addBlock(db, "opencode/fake-provider/*");
     const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === "ox-alpha")!;
     expect(row.available).toBe(true);
     expect(row.degradedReason).toBeUndefined();
@@ -249,12 +254,12 @@ describe("list_models", () => {
 describe("canarySlug", () => {
   const models = [
     { model: "ox-alpha", slug: "opencode/x-preview-f-free" },
-    { model: "gemini-3.1-pro", slug: COPILOT_GEMINI },
+    { model: REPORTED, slug: REPORTED },
   ];
 
   test("picks the first route the user has not blocked", () => {
     const blocks = [{ pattern: normalizePattern("opencode/opencode/*"), createdAt: nowIso() }];
-    expect(canarySlug(blocks, "opencode", models, "default")).toEqual({ slug: COPILOT_GEMINI });
+    expect(canarySlug(blocks, "opencode", models, "default")).toEqual({ slug: REPORTED });
   });
 
   test("refuses when every route is blocked", () => {

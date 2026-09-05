@@ -31,7 +31,7 @@ export const claudeCodeAdapter: AdapterSpec = {
   binary: "claude",
   identityEnv: "CLAUDE_CONFIG_DIR",
   models: [
-    { model: "fable-5", slug: "fable" },
+    { model: "fable-5.1", slug: "fable" },
     { model: "opus-5", slug: "opus" },
     { model: "sonnet-5", slug: "sonnet" },
   ],

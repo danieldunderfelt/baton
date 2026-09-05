@@ -97,7 +97,15 @@ import {
   type RunStatus,
   type RunView,
 } from "../supervisor/types.ts";
-import { INSTALL_HOSTS, installHost, isInstallHost } from "./install.ts";
+import {
+  INSTALL_HOSTS,
+  detectedHosts,
+  installHost,
+  isInstallHost,
+  type InstallHost,
+  type InstallScope,
+} from "./install.ts";
+import { CURRENT_VERSION, selfUpdate } from "./update.ts";
 
 /**
  * The trusted face of Baton: the only place the authority ceiling and instance
@@ -157,6 +165,9 @@ export async function runCli(command: string, args: string[]): Promise<number> {
         return set(args);
       case "install":
         return install(args);
+      case "update":
+      case "upgrade":
+        return await update();
       default:
         return usage(`unknown command '${command}'`);
     }
@@ -1655,23 +1666,69 @@ function writeSetting(
   return 0;
 }
 
+/**
+ * `baton install [host...] [--user] [--dir <d>] [--no-eval]`. No host means
+ * every supported host whose CLI is on PATH; `--user` writes each host's global
+ * config once instead of one checkout's. Grading instructions are included
+ * unless refused: ratings do not improve without grades.
+ */
 function install(args: string[]): number {
-  const { flags, rest } = parseFlags(args, { value: ["dir"], boolean: ["with-eval"] });
-  const host = rest[0];
-  if (!host) return usage(`install needs a host: ${INSTALL_HOSTS.join(", ")}`);
-  if (!isInstallHost(host)) {
-    return usage(`unsupported host '${host}'. Supported: ${INSTALL_HOSTS.join(", ")}.`);
+  const { flags, rest } = parseFlags(args, {
+    value: ["dir"],
+    boolean: ["with-eval", "no-eval", "user"],
+  });
+  const scope: InstallScope = flags.user === true ? "user" : "project";
+  if (scope === "user" && flags.dir !== undefined) {
+    return usage("--user writes the hosts' own global configs; it takes no --dir");
+  }
+  for (const host of rest) {
+    if (!isInstallHost(host)) {
+      return usage(`unsupported host '${host}'. Supported: ${INSTALL_HOSTS.join(", ")}.`);
+    }
+  }
+  const hosts: InstallHost[] = rest.length > 0 ? rest.filter(isInstallHost) : detectedHosts();
+  if (hosts.length === 0) {
+    return usage(
+      `none of the supported host CLIs is on PATH (${INSTALL_HOSTS.join(", ")}); name one: baton install <host>`,
+    );
   }
 
-  const target = flags.dir === undefined ? process.cwd() : resolve(String(flags.dir));
-  const res = installHost(host, target, { withEval: flags["with-eval"] === true });
-  console.log(`Registered MCP server 'baton' in ${res.mcpPath}`);
-  console.log(`  command: ${[res.command, ...res.args].join(" ")}`);
-  if (res.preserved.length > 0) console.log(`  kept: ${res.preserved.join(", ")}`);
-  console.log(`Wrote instructions to ${res.instructionsPath}`);
-  if (flags["with-eval"] === true) console.log("  including the grading + onboarding section");
-  if (res.mcpNote) console.log(`Note: ${res.mcpNote}`);
-  console.log(res.restart);
+  const dir = flags.dir === undefined ? process.cwd() : resolve(String(flags.dir));
+  const restarts = new Set<string>();
+  let command = "";
+  for (const host of hosts) {
+    const res = installHost(host, { scope, dir, withEval: flags["no-eval"] !== true });
+    command = [res.command, ...res.args].join(" ");
+    console.log(`${host}: registered in ${res.mcpPath}`);
+    if (res.preserved.length > 0) console.log(`  kept: ${res.preserved.join(", ")}`);
+    console.log(`  instructions: ${res.instructionsPath}`);
+    if (res.mcpNote) console.log(`  note: ${res.mcpNote}`);
+    restarts.add(res.restart);
+  }
+  console.log(`command: ${command}`);
+  console.log(
+    flags["no-eval"] === true
+      ? "Instructions written without the grading section."
+      : "Instructions include the grading + onboarding section.",
+  );
+  for (const restart of restarts) console.log(restart);
+  return 0;
+}
+
+/** `baton update`: the latest release over this binary, or a rebuild in a checkout. */
+async function update(): Promise<number> {
+  const res = await selfUpdate();
+  if (!res.changed) {
+    console.log(`Baton ${res.from} is the latest release.`);
+    return 0;
+  }
+  console.log(
+    res.source === "release"
+      ? `Updated ${res.path}: ${res.from} → ${res.to}.`
+      : `Rebuilt ${res.path} from the checkout: ${res.from} → ${res.to}.`,
+  );
+  for (const note of res.notes) if (note) console.log(note);
+  console.log("Running agent sessions keep the old server until they restart.");
   return 0;
 }
 
@@ -1711,7 +1768,9 @@ Usage:
   baton profile import <file> [--name <n>] [--activate] [--yes]
   baton profile export [--profile <n>] [--out <file>]
   baton set <key> <value>                 ${validKeys()}
-  baton install <host> [--dir <dir>] [--with-eval]
+  baton install [host...] [--user] [--dir <dir>] [--no-eval]
+                                          No host: every host CLI on PATH. --user: global configs
+  baton update                            Replace this binary with the latest release
       hosts: ${INSTALL_HOSTS.join(", ")}
 `);
   return 2;
