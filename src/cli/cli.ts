@@ -102,11 +102,14 @@ import { INSTALL_HOSTS, installHost, isInstallHost } from "./install.ts";
 /**
  * Identity vars printed by `status`: the env overlays that actually move an
  * app's credentials. Deliberately wider than the registry (status reports the
- * environment the user is standing in), but not wider than the truth — opencode
- * is absent because it has no such var, so printing one would invite a scope
- * separation that does not exist.
+ * environment the user is standing in), but not wider than the truth.
  */
-const IDENTITY_ENV = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"] as const;
+const IDENTITY_ENV = [
+  "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
+  "KIMI_CODE_HOME",
+  "XDG_DATA_HOME",
+] as const;
 
 const RUNS_LIMIT = 20;
 const PROMPT_PREVIEW_CHARS = 60;

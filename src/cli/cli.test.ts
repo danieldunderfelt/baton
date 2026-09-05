@@ -70,15 +70,16 @@ describe("status", () => {
     expect(res.stdout).toContain(join(scope, "state", "baton.db"));
     expect(res.stdout).toContain("CLAUDE_CONFIG_DIR");
     expect(res.stdout).toContain("KIMI_CODE_HOME");
+    expect(res.stdout).toContain("XDG_DATA_HOME");
     expect(res.stdout).toContain("adapters:");
   });
 
   test("marks absent identity vars as (unset) and hop depth as 0", async () => {
     const res = await baton(tmp("unset"), "status");
     expect(res.stdout).toMatch(/CODEX_HOME\s+\(unset\)/);
-    // opencode has no identity var to report; claiming one would invite a
-    // scope separation that does not exist.
+    // OpenCode's profile variable is unset by default in this test process.
     expect(res.stdout).not.toContain("OPENCODE_CONFIG_DIR");
+    expect(res.stdout).toMatch(/XDG_DATA_HOME\s+\(unset\)/);
     expect(res.stdout).toContain("0 (BATON_HOPS=unset)");
   });
 });
@@ -153,16 +154,16 @@ describe("instance", () => {
 
   test("rejects an app with no identity env var, and an overlay that ignores it", async () => {
     const scope = tmp("inst-identity");
-    // opencode's credentials follow neither a config-dir var nor HOME, so a
-    // second 'instance' of it is the same account under another name.
+    // Cursor's credentials follow no relocatable identity variable, so a
+    // second instance would be the same account under another name.
     const noIdentity = await baton(
       scope,
       "instance",
       "add",
-      "opencode",
+      "cursor-agent",
       "work",
       "--env",
-      "OPENCODE_CONFIG_DIR=/tmp/oc",
+      "CURSOR_API_ENDPOINT=/tmp/oc",
     );
     expect(noIdentity.code).toBe(2);
     expect(noIdentity.stderr).toContain("no identity env var");

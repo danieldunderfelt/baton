@@ -1,17 +1,16 @@
 import type { AdapterSpec } from "../types.ts";
 
 /**
- * opencode 1.18.22 (probed live on this machine).
+ * opencode 1.18.25 (probed live on this machine).
  *
  * Notes that are not obvious from the flags:
  * - `--format json` is required: the default formatted mode prints ANSI text
  *   and never prints the session id.
  * - The prompt is the `run` positional; there is no stdin prompt mode.
- * - No `identityEnv`: credentials live at a fixed `~/.local/share/opencode/
- *   auth.json`. `OPENCODE_CONFIG_DIR` (which PLAN.md assumed) does not exist,
- *   and `XDG_*`/`HOME` overrides did not move the credential store, so opencode
- *   instances can only ever be the inherited-environment `default`. Verified by
- *   probe, not assumed.
+ * - `XDG_DATA_HOME` relocates OpenCode's data root, including its auth.json,
+ *   so it is the identity environment for named profiles. The profile overlay
+ *   may also set `OPENCODE_CONFIG` and the other XDG roots, but XDG_DATA_HOME
+ *   is the required account boundary.
  * - Only `full` is declared. `opencode run` is already non-interactive, and
  *   `--auto` is its one permission flag — there is no readonly/edits tier
  *   outside `opencode.json`. As with kimi, declaring the level Baton cannot
@@ -26,6 +25,7 @@ export const opencodeAdapter: AdapterSpec = {
   app: "opencode",
   adapterVersion: 1,
   binary: "opencode",
+  identityEnv: "XDG_DATA_HOME",
   // OpenCode is a multi-provider host: what it can actually serve depends on
   // which providers this machine has logged in ('opencode models' lists them,
   // 'baton detect' shows what resolves). These routes are the ones that earn

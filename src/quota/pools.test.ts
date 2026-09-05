@@ -89,11 +89,12 @@ describe("setPool", () => {
 
   test("rejects a pool for an app whose identity cannot be relocated", () => {
     const db = scopeStore("pool-no-identity");
-    // opencode's credentials follow neither a config-dir var nor HOME, so two
-    // 'instances' of it would be one account balancing against itself.
-    expect(() => setPool(db, "opencode", ["default"])).toThrow(/no identity env var/);
-    expect(getPool(db, "opencode")).toBeUndefined();
-    // Apps that do have one are unaffected.
+    // Cursor's credentials do not follow a relocatable identity variable, so
+    // two instances would be one account balancing against itself.
+    expect(() => setPool(db, "cursor-agent", ["default"])).toThrow(/no identity env var/);
+    expect(getPool(db, "cursor-agent")).toBeUndefined();
+    // Apps that do have one, including OpenCode profiles, are unaffected.
+    expect(setPool(db, "opencode", ["default"]).members).toEqual(["default"]);
     expect(setPool(db, "kimi", ["default"]).members).toEqual(["default"]);
   });
 

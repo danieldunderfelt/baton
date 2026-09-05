@@ -30,9 +30,9 @@ const count = (argv: string[], token: string): number =>
 
 /**
  * Apps with no config-dir style identity var, so no instances and no pool
- * (probed: see opencode.ts and cursor.ts).
+ * (probed: see cursor.ts).
  */
-const NO_IDENTITY_ENV = new Set(["opencode", "cursor-agent"]);
+const NO_IDENTITY_ENV = new Set(["cursor-agent"]);
 
 describe("registry", () => {
   test("exposes every built-in app in a deterministic order", () => {
