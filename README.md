@@ -80,6 +80,11 @@ baton resume run_abc123 "Now apply the fix you proposed"
 
 Kimi Code and OpenCode can serve more than one model. Kimi serves whatever its `config.toml` defines. OpenCode serves whatever providers it is logged into, which can reach models no other app has: on a machine with OpenCode's GitHub Copilot provider, `baton run gemini-3.1-pro ...` works even though no Gemini CLI is installed. `baton detect` shows what each app actually serves right now.
 
+OpenCode profiles use separate XDG data roots. `XDG_DATA_HOME` moves the
+credential store as well as sessions and logs. Profile configs belong in
+`~/.config/opencode`, selected with `OPENCODE_CONFIG`, not in a checkout — for
+example an `opencode-finnair.json` that enables only `github-copilot`.
+
 Safety rails that apply to every run:
 
 - Delegation depth is capped (two hops by default), so agents cannot recurse into each other forever.
