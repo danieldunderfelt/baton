@@ -6,6 +6,7 @@ import {
   DEFAULT_INSTANCE,
   type AdapterSpec,
   type Autonomy,
+  type RouteSpec,
 } from "../adapters/types.ts";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
 import { activeDiscoveredSpecs, listDiscovered } from "../discovery/discovery.ts";
@@ -20,10 +21,12 @@ import { SETTING_MAX_AUTONOMY_PREFIX } from "../supervisor/types.ts";
 import {
   blockFor,
   blockReason as routeBlockReason,
+  globRegex,
   listBlocks,
   routeKey,
   type RouteBlock,
 } from "./blocks.ts";
+import { catalogOf, type Catalog } from "./catalog.ts";
 
 /**
  * Registry: canonical model → routes → execution target (PLAN.md §Registry).
@@ -258,6 +261,20 @@ export function routableAdapters(db?: Database): AdapterSpec[] {
 }
 
 /**
+ * The routes an app serves in this scope right now: the adapter's pinned ones
+ * plus whatever its CLI reports (PLAN.md §Registry). The CLI is the authority
+ * on its own models, so a model released after the adapter was written routes
+ * without a Baton change. `listingError` says why that half is missing.
+ */
+export function catalogFor(spec: AdapterSpec): Catalog {
+  return catalogOf(spec, resolveBinary(spec.binary));
+}
+
+export function routesOf(spec: AdapterSpec): RouteSpec[] {
+  return catalogFor(spec).routes;
+}
+
+/**
  * The execution target a run already ran on — a LOOKUP, not a selection.
  * Session affinity (PLAN.md §Instance pools) must never consult the policy: a
  * resumed run belongs to the instance whose config dir holds its session, so
@@ -304,12 +321,32 @@ export function targetFor(
   };
 }
 
-/** Every route able to serve `model`, in deterministic order (app, then slug). */
+/**
+ * Every route able to serve `model`, in deterministic order (app, then slug).
+ * A model is named by its canonical id or by the app's own slug for it — the
+ * slug is what the CLI reports, so it must always be a valid name.
+ *
+ * Pinned routes are tried first, on their own: they are the canonical ids, and
+ * matching them needs no listing, so the common request never spawns an app.
+ * Only a name no adapter pins consults what the apps report, plus each app's
+ * `acceptsSlugs`: a matching name is passed through as the slug, and the app
+ * decides whether it exists.
+ */
 export function resolveTargets(model: string, db?: Database): Route[] {
+  const specs = routableAdapters(db);
+  const named = (routes: RouteSpec[]): RouteSpec[] =>
+    routes.filter((r) => r.model === model || r.slug === model);
   const routes: Route[] = [];
-  for (const spec of routableAdapters(db)) {
-    for (const route of spec.models) {
-      if (route.model === model) routes.push({ spec, slug: route.slug });
+  for (const spec of specs) {
+    for (const route of named(spec.models)) routes.push({ spec, slug: route.slug });
+  }
+  if (routes.length === 0) {
+    for (const spec of specs) {
+      const listed = named(routesOf(spec));
+      for (const route of listed) routes.push({ spec, slug: route.slug });
+      if (listed.length === 0 && spec.acceptsSlugs?.some((glob) => globRegex(glob).test(model))) {
+        routes.push({ spec, slug: model });
+      }
     }
   }
   if (routes.length === 0) throw unknownModel(model, db);
@@ -692,21 +729,34 @@ export function listModels(db: Database, at = nowIso()): ModelListing[] {
   );
   const rows: ModelListing[] = [];
   const blocks = listBlocks(db);
-  for (const spec of routableAdapters(db)) rows.push(...routeRows(db, spec, scores, at, blocks));
+  for (const spec of routableAdapters(db)) {
+    rows.push(...routeRows(db, spec, routesOf(spec), scores, at, blocks));
+  }
   // A quarantined adapter routes nowhere, but hiding it would hide the thing
   // the user is being asked to review — same for one waiting on a canary or
   // gone stale after a version bump. A rejected one is a decision, not a hint.
+  // Only its pinned routes are shown: asking its binary for a listing would
+  // execute something from a spec nobody has approved.
   for (const record of listDiscovered(db)) {
     if (record.status === "active" || record.status === "rejected") continue;
     if (!Array.isArray(record.spec?.models)) continue; // unvalidated row on disk
-    rows.push(...routeRows(db, record.spec, scores, at, blocks, quarantineHint(record)));
+    rows.push(
+      ...routeRows(db, record.spec, record.spec.models, scores, at, blocks, quarantineHint(record)),
+    );
   }
-  return rows.sort((a, b) => a.model.localeCompare(b.model) || a.app.localeCompare(b.app));
+  // Code-unit order, not localeCompare: reported slugs carry mixed case, and
+  // the order must not depend on the ICU data of whichever runtime lists them.
+  return rows.sort((a, b) => byCodeUnits(a.model, b.model) || byCodeUnits(a.app, b.app));
+}
+
+function byCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function routeRows(
   db: Database,
   spec: AdapterSpec,
+  routes: RouteSpec[],
   scores: Map<string, ModelScores>,
   at: string,
   blocks: RouteBlock[],
@@ -728,7 +778,7 @@ function routeRows(
       })
     : undefined;
   const instances = pool && pool.length > 0 ? pool.map((p) => p.instance) : [DEFAULT_INSTANCE];
-  return spec.models.map((route) => {
+  return routes.map((route) => {
     const score = scores.get(route.model);
     // A block only makes the route unusable when it covers every instance the
     // route could run on; a partial block just steers selection, and saying
@@ -766,12 +816,17 @@ function quarantineHint(record: DiscoveredAdapter): string {
 
 export function knownModels(db?: Database): string[] {
   const models = new Set<string>();
-  for (const spec of routableAdapters(db)) for (const r of spec.models) models.add(r.model);
+  for (const spec of routableAdapters(db)) for (const r of routesOf(spec)) models.add(r.model);
   return [...models].sort();
 }
 
+/** An app can report hundreds of models; the error names the pinned ones and counts the rest. */
 function unknownModel(model: string, db?: Database): Error {
-  return new Error(`Unknown model '${model}'. Known models: ${knownModels(db).join(", ")}.`);
+  const pinned = new Set<string>();
+  for (const spec of routableAdapters(db)) for (const r of spec.models) pinned.add(r.model);
+  const more = knownModels(db).length - pinned.size;
+  const rest = more > 0 ? `, and ${more} more reported by the installed apps (see list_models)` : "";
+  return new Error(`Unknown model '${model}'. Known models: ${[...pinned].sort().join(", ")}${rest}.`);
 }
 
 function isAutonomy(value: unknown): value is Autonomy {

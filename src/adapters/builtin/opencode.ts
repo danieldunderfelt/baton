@@ -27,15 +27,18 @@ export const opencodeAdapter: AdapterSpec = {
   binary: "opencode",
   identityEnv: "XDG_DATA_HOME",
   // OpenCode is a multi-provider host: what it can actually serve depends on
-  // which providers this machine has logged in ('opencode models' lists them,
-  // 'baton detect' shows what resolves). These routes are the ones that earn
-  // their place here: models no other installed app can reach. Claude/GPT
-  // models also appear via opencode's copilot provider but route better
-  // through their native apps, so they are deliberately not listed.
+  // which providers this machine has logged in. `opencode models` reports the
+  // whole set, one `provider/model` slug per line, and every one of them is a
+  // route under that name. The two pinned here are the canonical ids Baton's
+  // ratings already use. Claude/GPT models also appear via opencode's copilot
+  // provider; they route better through their native apps, and a user who
+  // wants them out of the way blocks them ('baton block add
+  // opencode/github-copilot/*').
   models: [
     { model: "ox-alpha", slug: "opencode/x-preview-f-free" },
     { model: "gemini-3.1-pro", slug: "github-copilot/gemini-3.1-pro-preview" },
   ],
+  listModels: { argv: ["models"], extract: { kind: "lines" } },
   invoke: {
     argv: ["run", "-m", "{slug}", "--format", "json", "{autonomyFlags}", "{prompt}"],
     promptVia: "argv",

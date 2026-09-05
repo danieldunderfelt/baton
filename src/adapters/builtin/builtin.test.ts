@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyFailure, executeAdapter, isAdmissionFailure } from "../executor.ts";
 import { AUTONOMY_ORDER, type AdapterSpec, type ExecResult, type ExtractSpec } from "../types.ts";
+import { catalogOf } from "../../registry/catalog.ts";
 import {
   builtinAdapters,
   claudeCodeAdapter,
@@ -83,6 +84,16 @@ describe.each(builtinAdapters.map((spec) => [spec.app, spec] as const))("%s spec
     }
     const canonical = spec.models.map((r) => r.model);
     expect(new Set(canonical).size).toBe(canonical.length);
+  });
+
+  test("the model listing, if any, is a plain argv with a declared extraction", () => {
+    if (!spec.listModels) return;
+    expect(spec.listModels.argv.length).toBeGreaterThan(0);
+    for (const element of spec.listModels.argv) {
+      expect(element).not.toMatch(SHELL_METACHARS);
+      expect(element).not.toInclude("{");
+    }
+    expect(["lines", "json"]).toContain(spec.listModels.extract.kind);
   });
 
   test("argv carries each placeholder exactly as the executor substitutes it", () => {
@@ -506,6 +517,21 @@ const CANARY_TIMEOUT_MS = 120_000;
 /** Cheapest route of an app whose first route is expensive: a canary proves the
  * plumbing, so it must not spend a precious window (PLAN.md §Quota-aware cost). */
 const CANARY_SLUG: Record<string, string> = { "claude-code": "sonnet" };
+
+describe.skipIf(!LIVE)("live listing", () => {
+  // The listing command and its extraction against the real CLI output: the
+  // one check that catches a CLI changing how it prints its models. Costs no
+  // quota, so it needs no cheapest-route dance.
+  test.each(builtinAdapters.filter((s) => s.listModels).map((s) => [s.app, s] as const))(
+    "%s reports its models through the declared command",
+    (_app, spec: AdapterSpec) => {
+      const catalog = catalogOf(spec, Bun.which(spec.binary));
+      expect(catalog.listingError).toBeUndefined();
+      expect(catalog.routes.length).toBeGreaterThan(spec.models.length);
+    },
+    30_000,
+  );
+});
 
 describe.skipIf(!LIVE)("live canary", () => {
   test.each(builtinAdapters.map((spec) => [spec.app, spec] as const))(

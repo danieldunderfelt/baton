@@ -49,13 +49,18 @@ const NO_PATH = "/nonexistent-baton-test";
 /**
  * A PATH holding exactly one fake binary — hermetic availability. The script
  * answers `--version` because the app version is part of the execution-target
- * fingerprint; nothing else about it is ever executed.
+ * fingerprint, and refuses everything else: in particular the adapter's model
+ * listing, so the fake serves exactly its pinned routes.
  */
 const FAKE_VERSION = "9.9.9";
 
 function fakeBinary(name: string, version = FAKE_VERSION): string {
   const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
-  writeFileSync(join(dir, name), `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
+  writeFileSync(
+    join(dir, name),
+    `#!/bin/sh\ncase "$1" in --version) echo ${version}; exit 0;; esac\nexit 1\n`,
+    { mode: 0o755 },
+  );
   return join(dir, name);
 }
 
@@ -130,6 +135,41 @@ describe("resolveTargets", () => {
   test("unknown model errors with the known models listed", () => {
     expect(() => resolveTargets("gpt-9")).toThrow(/Unknown model 'gpt-9'/);
     expect(() => resolveTargets("gpt-9")).toThrow(/kimi-k3/);
+  });
+
+  test("a model is also named by the app's own slug for it", () => {
+    const routes = withPath(NO_PATH, () => resolveTargets("kimi-code/k3"));
+    expect(routes.map((r) => `${r.spec.app}/${r.slug}`)).toEqual(["kimi/kimi-code/k3"]);
+  });
+
+  test("a name an app accepts sight unseen routes there with the name as its slug", () => {
+    // Claude Code cannot list its models but takes any full id: a model released
+    // tomorrow is reachable without an adapter change.
+    const routes = withPath(NO_PATH, () => resolveTargets("claude-fable-5-1"));
+    expect(routes.map((r) => `${r.spec.app}/${r.slug}`)).toEqual(["claude-code/claude-fable-5-1"]);
+    // The pinned alias still wins for the canonical id.
+    expect(withPath(NO_PATH, () => resolveTargets("fable-5"))[0]!.slug).toBe("fable");
+  });
+
+  test("a model the app reports routes under its own slug, and is listed", () => {
+    const db = scopeStore("reported");
+    const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
+    writeFileSync(
+      join(dir, "opencode"),
+      '#!/bin/sh\ncase "$1" in --version) echo 1.0.0; exit 0;; models) echo zeta/new-model; echo opencode/x-preview-f-free; exit 0;; esac\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const routes = withPath(dir, () => resolveTargets("zeta/new-model", db));
+    expect(routes.map((r) => `${r.spec.app}/${r.slug}`)).toEqual(["opencode/zeta/new-model"]);
+    const rows = withPath(dir, () => listModels(db));
+    expect(rows).toContainEqual(
+      expect.objectContaining({ model: "zeta/new-model", app: "opencode", available: true }),
+    );
+    // A reported slug that is pinned keeps its canonical id, once.
+    expect(rows.filter((r) => r.slug === "opencode/x-preview-f-free").map((r) => r.model)).toEqual([
+      "ox-alpha",
+    ]);
+    expect(withPath(dir, () => knownModels(db))).toContain("zeta/new-model");
   });
 
   test("ignores availability — routes exist even with an empty PATH", () => {
@@ -693,9 +733,11 @@ describe("ceilingFor / clampAutonomy", () => {
 });
 
 describe("listModels", () => {
-  test("lists every builtin route, sorted by model then app", () => {
+  test("lists every pinned builtin route, sorted by model then app", () => {
     const db = scopeStore("list");
-    const rows = listModels(db);
+    // No binary on PATH: nothing can be asked for its models, so the pinned
+    // routes are the whole roster (the reported ones are covered below).
+    const rows = withPath(NO_PATH, () => listModels(db));
     const routeCount = builtinAdapters.reduce((n, a) => n + a.models.length, 0);
     expect(rows.length).toBe(routeCount);
     expect(rows.map((r) => `${r.model}|${r.app}`)).toEqual(

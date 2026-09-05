@@ -58,6 +58,35 @@ export interface InvokeSpec {
   extract: ExtractSpec;
 }
 
+/**
+ * How the app-native model slugs are lifted out of a listing command's stdout.
+ * Declarative like ExtractSpec: dot-paths and plain separators, no code.
+ */
+export type ModelsExtractSpec =
+  /**
+   * One slug per non-blank line. With `separator`, only lines containing it
+   * count and the slug is the part before it (cursor prints "slug - Name").
+   */
+  | { kind: "lines"; separator?: string }
+  /**
+   * stdout is one JSON document; `path` points at the catalog. An array yields
+   * one slug per element, read at `slug` (or the element itself when it is a
+   * string); an object yields its keys. `where` keeps only entries whose
+   * dot-path equals the value (codex marks internal models `visibility: hide`).
+   */
+  | { kind: "json"; path: string; slug?: string; where?: { path: string; equals: string } };
+
+/**
+ * The command that asks the app which models it can serve right now. Baton
+ * routes on what it reports, so a model the app gained since the adapter was
+ * written is reachable without anyone touching Baton.
+ */
+export interface ListModelsSpec {
+  /** argv AFTER the binary. No placeholders. */
+  argv: string[];
+  extract: ModelsExtractSpec;
+}
+
 export interface AdapterSpec {
   /** App id: "codex", "kimi", "claude-code", "opencode", "cursor-agent". */
   app: string;
@@ -66,7 +95,22 @@ export interface AdapterSpec {
   binary: string;
   /** Env var that relocates this app's identity/config, if any. */
   identityEnv?: string;
+  /**
+   * Pinned routes: the canonical ids Baton has always used for this app's
+   * models (ratings and seeds attach to them), and the fallback roster when
+   * the listing below fails. Every slug the app reports beyond these becomes
+   * a route under its own name.
+   */
   models: RouteSpec[];
+  /** How to ask the app for its current models. Absent = pinned routes only. */
+  listModels?: ListModelsSpec;
+  /**
+   * Globs (`*` wildcard) for model names this app accepts sight unseen: a
+   * request naming one is routed here with the name as the slug. For apps
+   * that cannot enumerate their models but accept full model ids, so a newly
+   * released model needs no adapter change. The app itself rejects a bad one.
+   */
+  acceptsSlugs?: string[];
   invoke: InvokeSpec;
   /**
    * argv fragments per autonomy level. Missing level = level unsupported, and

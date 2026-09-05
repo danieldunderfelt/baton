@@ -36,7 +36,7 @@ Baton hands a self-contained task to a model running in another agent CLI on thi
 - `grok-4.6`, via cursor-agent. Quick, and a different family when two opinions have deadlocked.
 - `ox-alpha`, via opencode. A capable all-rounder from outside the other families.
 
-These are the user's starting priors. `list_models` reports what the evidence says instead, so believe it when the two disagree.
+These are the user's starting priors. `list_models` reports what the evidence says instead, so believe it when the two disagree. It also lists every model each app reports it can serve, under the app's own slug (`gpt-6-astra`, `github-copilot/claude-opus-5`, `cursor-grok-4.6-xhigh`), and Claude Code takes any full `claude-*` id. A newly released model needs no Baton change: name it as its app does.
 
 ### Afterwards
 

@@ -107,7 +107,8 @@ export function canarySlug(
 
 const regexCache = new Map<string, RegExp>();
 
-function globRegex(pattern: string): RegExp {
+/** `*` matches any run of characters; everything else is literal. */
+export function globRegex(pattern: string): RegExp {
   const cached = regexCache.get(pattern);
   if (cached) return cached;
   const source = pattern

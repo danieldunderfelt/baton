@@ -15,6 +15,10 @@ import type { AdapterSpec } from "../types.ts";
  *   "agent_message"` skips it; `take: "last"` guards against future
  *   intermediate agent messages.
  * - The working root is the spawned process cwd (codex `-C` defaults to it).
+ * - `codex debug models` prints the model catalog as one JSON document
+ *   (`{"models":[{"slug":...,"visibility":"list"|"hide",...}]}`) from the
+ *   local cache, in well under a second. Hidden entries are internal models
+ *   (`gpt-reserve`, `codex-auto-review`) and are skipped.
  */
 export const codexAdapter: AdapterSpec = {
   app: "codex",
@@ -25,6 +29,15 @@ export const codexAdapter: AdapterSpec = {
     { model: "gpt-5.6-sol", slug: "gpt-5.6-sol" },
     { model: "gpt-5.6-luna", slug: "gpt-5.6-luna" },
   ],
+  listModels: {
+    argv: ["debug", "models"],
+    extract: {
+      kind: "json",
+      path: "models",
+      slug: "slug",
+      where: { path: "visibility", equals: "list" },
+    },
+  },
   invoke: {
     argv: ["exec", "--json", "--skip-git-repo-check", "-m", "{slug}", "{autonomyFlags}"],
     promptVia: "stdin",

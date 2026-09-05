@@ -529,9 +529,24 @@ describe("pool", () => {
   });
 });
 
+/**
+ * Every built-in on PATH as a fake that answers the version probe and refuses
+ * everything else, including its model listing: the roster is exactly the
+ * pinned routes, whatever the real CLIs on this machine would report.
+ */
+function pinnedOnlyBin(): string {
+  const bin = tmp("pinned-bin");
+  for (const app of ["codex", "kimi", "claude", "opencode", "cursor-agent"]) {
+    writeFileSync(join(bin, app), `#!/bin/sh\n${VERSION_SHIM}\nexit 1\n`, { mode: 0o755 });
+  }
+  return bin;
+}
+
 describe("block", () => {
   test("add, list and remove round-trip, and the add names what it blocks", async () => {
     const scope = tmp("block");
+    const bin = pinnedOnlyBin();
+    const baton = (s: string, ...args: string[]) => batonOnPath(s, bin, ...args);
     expect((await baton(scope, "block", "list")).stdout).toContain("No blocked routes");
 
     const add = await baton(
@@ -566,6 +581,8 @@ describe("block", () => {
 
   test("rejecting a built-in takes the whole app out of service", async () => {
     const scope = tmp("reject-builtin");
+    const bin = pinnedOnlyBin();
+    const baton = (s: string, ...args: string[]) => batonOnPath(s, bin, ...args);
     const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
     expect(reject.code).toBe(0);
     expect(reject.stdout).toContain("Rejected opencode (client machine)");
@@ -953,7 +970,13 @@ sleep 30
 }
 
 /** Answer the pre-run version probe the way an installed CLI would. */
-const VERSION_SHIM = 'case "$1" in --version) echo "fake 1.0.0"; exit 0;; esac';
+/**
+ * Answers the version probe, and refuses the adapter's model listing
+ * (`provider list`, `debug models`, `models`) so a fake never mistakes it for
+ * a run: the shim's own body is the run.
+ */
+const VERSION_SHIM =
+  'case "$1" in --version) echo "fake 1.0.0"; exit 0;; provider|debug|models) exit 1;; esac';
 
 /** Reads a live stdout stream until it says what we are waiting for. */
 async function readUntil(
@@ -1552,11 +1575,31 @@ describe("serve --http", () => {
 
 describe("detect and unknown commands", () => {
   test("detect lists every builtin adapter and the models it serves", async () => {
-    const res = await baton(tmp("detect"), "detect");
+    const res = await batonOnPath(tmp("detect"), pinnedOnlyBin(), "detect");
     expect(res.code).toBe(0);
     expect(res.stdout).toContain("codex");
     expect(res.stdout).toContain("kimi");
     expect(res.stdout).toContain("gpt-5.6-luna");
+    // A listing that fails is said out loud, and the pinned routes stay.
+    expect(res.stdout).toContain("codex: 'debug models' exit 1");
+    expect(res.stdout).toContain("only its pinned models route until the listing works");
+  });
+
+  test("models an app reports are routes under their own name", async () => {
+    const bin = pinnedOnlyBin();
+    writeFileSync(
+      join(bin, "opencode"),
+      '#!/bin/sh\ncase "$1" in --version) echo "fake 1.0.0"; exit 0;; models) echo zeta/new-model; exit 0;; esac\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const scope = tmp("detect-reported");
+    const detect = await batonOnPath(scope, bin, "detect");
+    expect(detect.stdout).toMatch(/opencode.*ox-alpha, gemini-3.1-pro \+1 reported by the app/);
+    const models = await batonOnPath(scope, bin, "models");
+    expect(models.stdout).toMatch(/zeta\/new-model\s+opencode\/zeta\/new-model\s+yes/);
+    // And a block pattern sees it like any other route.
+    const add = await batonOnPath(scope, bin, "block", "add", "opencode/zeta/*");
+    expect(add.stdout).toContain("opencode:default/zeta/new-model");
   });
 
   test("an unknown subcommand prints usage to stderr and exits 2", async () => {

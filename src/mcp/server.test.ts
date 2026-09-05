@@ -93,9 +93,10 @@ function fakeKimi(): { bin: string; pidfile: string } {
   writeFileSync(
     join(bin, "kimi"),
     `#!/bin/sh
-# Answer the registry's version probe like a real CLI: a probe that fell into
-# the branch below would leave a pid nobody delegated behind.
-case "$1" in --version) echo "kimi 9.9.9"; exit 0;; esac
+# Answer the registry's version probe like a real CLI, and refuse its model
+# listing: either falling into the branch below would leave a pid nobody
+# delegated behind.
+case "$1" in --version) echo "kimi 9.9.9"; exit 0;; provider) exit 1;; esac
 echo $$ >> "${pidfile}"
 ${process.execPath} -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
 echo $! >> "${pidfile}"
@@ -713,7 +714,8 @@ function fakeSleeper(name: string): string {
   const bin = mkdtempSync(join(tmpdir(), "baton-mcp-bin-"));
   writeFileSync(
     join(bin, name),
-    `#!/bin/sh\ncase "$1" in --version) echo "${name} 9.9.9"; exit 0;; esac\nsleep 30\n`,
+    // Refuses the model listing too: only a run may stall.
+    `#!/bin/sh\ncase "$1" in --version) echo "${name} 9.9.9"; exit 0;; provider|debug|models) exit 1;; esac\nsleep 30\n`,
     { mode: 0o755 },
   );
   return bin;

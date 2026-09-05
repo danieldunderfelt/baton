@@ -28,7 +28,12 @@ function scopeStore(name: string): Database {
 /** A PATH holding one fake binary, so availability is hermetic. */
 function fakeBinary(name: string): string {
   const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
-  writeFileSync(join(dir, name), "#!/bin/sh\necho 9.9.9\n", { mode: 0o755 });
+  // Answers the version probe and refuses the model listing: pinned routes only.
+  writeFileSync(
+    join(dir, name),
+    '#!/bin/sh\ncase "$1" in --version) echo 9.9.9; exit 0;; esac\nexit 1\n',
+    { mode: 0o755 },
+  );
   return join(dir, name);
 }
 

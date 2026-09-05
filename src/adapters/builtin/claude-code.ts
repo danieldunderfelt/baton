@@ -15,6 +15,10 @@ import type { AdapterSpec } from "../types.ts";
  * - Session persistence is deliberately left on: `session_id` is what phase-2
  *   session affinity resumes with (`--resume`), so `--no-session-persistence`
  *   would trade resumability for nothing.
+ * - There is no command that lists models. `--model` takes an alias for the
+ *   latest model of a family (`fable`, `opus`, `sonnet`, `haiku`) or a full
+ *   model id (`claude-fable-5`), so the aliases are pinned and any `claude-*`
+ *   id is accepted as-is; the CLI is what rejects an id it does not know.
  * - haiku is a supported slug but is intentionally not routed here.
  * - Failures still print valid JSON on stdout while exiting 1: auth rejection
  *   has `api_error_status: null`, an unknown model slug has 404. The executor
@@ -27,9 +31,11 @@ export const claudeCodeAdapter: AdapterSpec = {
   binary: "claude",
   identityEnv: "CLAUDE_CONFIG_DIR",
   models: [
+    { model: "fable-5", slug: "fable" },
     { model: "opus-5", slug: "opus" },
     { model: "sonnet-5", slug: "sonnet" },
   ],
+  acceptsSlugs: ["claude-*"],
   invoke: {
     argv: ["-p", "--output-format", "json", "--model", "{slug}", "{autonomyFlags}"],
     promptVia: "stdin",

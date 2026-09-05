@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AdapterSpec } from "../adapters/types.ts";
+import type { AdapterSpec, ListModelsSpec } from "../adapters/types.ts";
 import { openStore } from "../store/store.ts";
 import {
   activeDiscoveredSpecs,
@@ -229,6 +229,20 @@ describe("validateSpec", () => {
     if (!dupes.ok) expect(dupes.errors.join("\n")).toContain("duplicate canonical model");
 
     expect(validateSpec(spec("/bin/fake", { models: [] })).ok).toBe(false);
+  });
+
+  test("a listing command and accepted slugs are part of the reviewed spec", () => {
+    const listModels: ListModelsSpec = {
+      argv: ["models", "--json"],
+      extract: { kind: "json", path: "models" },
+    };
+    expect(validateSpec(spec("/bin/fake", { listModels, acceptsSlugs: ["fake-*"] })).ok).toBe(true);
+
+    const shelly = validateSpec(
+      spec("/bin/fake", { listModels: { argv: ["models", "| tee"], extract: { kind: "lines" } } }),
+    );
+    expect(shelly.ok).toBe(false);
+    if (!shelly.ok) expect(shelly.errors.join("\n")).toContain("listModels.argv");
   });
 
   test("rejects a built-in app id but allows a built-in model through a new app", () => {

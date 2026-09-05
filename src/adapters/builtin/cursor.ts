@@ -27,11 +27,12 @@ export const cursorAdapter: AdapterSpec = {
   app: "cursor-agent",
   adapterVersion: 1,
   binary: "cursor-agent",
-  // Only the high-reasoning route is exposed: `cursor-grok-4.6-{low,medium,
-  // xhigh}` and the `-fast` variants exist (confirmed against the CLI's own
-  // model list), but they are the same canonical model at another effort, and a
-  // canonical id maps to exactly one slug per app.
+  // The pinned id is the high-reasoning route. `cursor-agent models` prints
+  // "slug - Display name" per line under an "Available models" header, and
+  // every slug there — the other effort levels, the `-fast` variants, the
+  // other families — is routable under its own name.
   models: [{ model: "grok-4.6", slug: "cursor-grok-4.6-high" }],
+  listModels: { argv: ["models"], extract: { kind: "lines", separator: " - " } },
   invoke: {
     argv: ["-p", "--model", "{slug}", "--output-format", "stream-json", "{autonomyFlags}"],
     promptVia: "stdin",

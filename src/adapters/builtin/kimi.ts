@@ -15,6 +15,10 @@ import type { AdapterSpec } from "../types.ts";
  *   cannot actually constrain.
  * - Only KIMI_CODE_HOME relocates identity; KIMI_HOME is not read by this CLI
  *   (verified: a run under an overridden KIMI_HOME used the default config).
+ * - `kimi provider list --json` dumps the provider/model config as JSON; the
+ *   keys of `models` are exactly the aliases `--model` accepts. It is the
+ *   config.toml of the inherited environment that is read, so a named
+ *   instance with a different config.toml is listed as the default one is.
  */
 export const kimiAdapter: AdapterSpec = {
   app: "kimi",
@@ -22,6 +26,10 @@ export const kimiAdapter: AdapterSpec = {
   binary: "kimi",
   identityEnv: "KIMI_CODE_HOME",
   models: [{ model: "kimi-k3", slug: "kimi-code/k3" }],
+  listModels: {
+    argv: ["provider", "list", "--json"],
+    extract: { kind: "json", path: "models" },
+  },
   invoke: {
     argv: [
       "--model",

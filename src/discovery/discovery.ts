@@ -77,6 +77,27 @@ const extractSchema = z
 const argvElement = z.string().min(1);
 const autonomyFragment = z.array(argvElement);
 
+const modelsExtractSchema = z
+  .discriminatedUnion("kind", [
+    z
+      .strictObject({
+        kind: z.literal("lines"),
+        separator: z.string().min(1).optional(),
+      })
+      .describe(
+        "One slug per non-blank line; with separator, the slug is the text before it and other lines are skipped.",
+      ),
+    z
+      .strictObject({
+        kind: z.literal("json"),
+        path: dotPath,
+        slug: dotPath.optional().describe("Dot-path to the slug inside each array element."),
+        where: match.optional().describe("Keep only entries matching this."),
+      })
+      .describe("stdout is one JSON document; an array at path yields elements, an object yields its keys."),
+  ])
+  .describe("How model slugs are lifted out of the listing command's stdout.");
+
 export const adapterSpecSchema = z.strictObject({
   app: z
     .string()
@@ -92,7 +113,24 @@ export const adapterSpecSchema = z.strictObject({
   models: z
     .array(z.strictObject({ model: z.string().min(1), slug: z.string().min(1) }))
     .min(1)
-    .describe("Canonical model id ↔ app-native slug. Canonical ids must be distinct."),
+    .describe(
+      "Pinned routes: canonical model id ↔ app-native slug, distinct ids. The canary spends the first one.",
+    ),
+  listModels: z
+    .strictObject({
+      argv: z.array(argvElement).describe("argv AFTER the binary that prints the models. No placeholders."),
+      extract: modelsExtractSchema,
+    })
+    .optional()
+    .describe(
+      "How the app lists the models it can serve right now. Every slug it reports becomes a route under its own name; declare it whenever the CLI has such a command.",
+    ),
+  acceptsSlugs: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "Globs ('*' wildcard) of model names routed to this app as-is when it has no listing command but accepts full model ids (e.g. 'claude-*').",
+    ),
   invoke: z.strictObject({
     argv: z
       .array(argvElement)
@@ -299,6 +337,13 @@ function structuralErrors(spec: AdapterSpec, builtin = false): string[] {
     if (seen.has(route.model)) push(`models: duplicate canonical model id ${q(route.model)}`);
     seen.add(route.model);
   }
+  // The listing is a second argv this spec spawns, reviewed like the first;
+  // nothing is substituted into it, so a placeholder there is a mistake.
+  for (const element of spec.listModels?.argv ?? []) {
+    if (FORBIDDEN_ARGV_CHARS.test(element)) {
+      push(`listModels.argv: element ${q(element)} contains shell metacharacters or placeholders`);
+    }
+  }
 
   if (!builtin && getAdapter(spec.app)) {
     push(`app: ${q(spec.app)} collides with a built-in adapter — built-ins are pinned, pick another id`);
@@ -429,6 +474,9 @@ export interface DiscoveredReview {
   sessionRef?: string;
   /** The second argv this spec can spawn — reviewed as closely as the first. */
   resumeArgv?: string[];
+  /** The argv that lists the app's models, if declared — spawned too, so reviewed too. */
+  listArgv?: string[];
+  acceptsSlugs?: string[];
   models: { model: string; slug: string }[];
   promptVia: "stdin" | "argv";
   admissionFailurePatterns: string[];
@@ -452,6 +500,8 @@ export function reviewDiscovered(db: Database, app: string): DiscoveredReview | 
     extract: describeExtract(spec.invoke.extract),
     ...(spec.sessionRef ? { sessionRef: describeExtract(spec.sessionRef) } : {}),
     ...(spec.resume ? { resumeArgv: spec.resume.argv } : {}),
+    ...(spec.listModels ? { listArgv: spec.listModels.argv } : {}),
+    ...(spec.acceptsSlugs ? { acceptsSlugs: spec.acceptsSlugs } : {}),
     models: spec.models,
     promptVia: spec.invoke.promptVia,
     admissionFailurePatterns: spec.admissionFailurePatterns,
@@ -496,7 +546,9 @@ export function formatReview(review: DiscoveredReview): string {
   });
   lines.push(
     `env:        ${review.envNames.join(", ") || "none (inherited environment only)"}`,
-    `models:     ${review.models.map((m) => `${m.model} → ${m.slug}`).join(", ")}`,
+    `models:     ${review.models.map((m) => `${m.model} → ${m.slug}`).join(", ") || "(none pinned)"}`,
+    ...(review.listArgv ? [`list argv:  ${JSON.stringify(review.listArgv)}`] : []),
+    ...(review.acceptsSlugs ? [`accepts:    ${review.acceptsSlugs.join(", ")}`] : []),
     `admission:  ${JSON.stringify(review.admissionFailurePatterns)}`,
     `work-start: ${JSON.stringify(review.workStartedPatterns)}`,
     `timeout:    ${spec.defaultTimeoutMs} ms`,
@@ -781,7 +833,11 @@ copy text you did not verify into the spec.
 4. Structured output — a JSON or JSON-lines mode. Run it once and read the real shape:
    which record carries the final answer, and which one signals a failed turn.
 5. Model slugs — how models are named and selected (\`--model <slug>\`, \`-m\`), and the
-   canonical Baton id each slug corresponds to.
+   command that LISTS them (\`<app> models\`, \`--list-models\`, a config dump). Declare it as
+   \`listModels\` so every model the app serves routes under its own slug, including ones
+   released after you wrote the spec; \`models\` pins the route the canary spends and any
+   canonical Baton id that differs from its slug. If the app cannot list but accepts full
+   model ids, declare the accepted shape as \`acceptsSlugs\` globs instead.
 6. Resume — whether a session/thread id is printed and which flag replays it.
 7. Auth state — how the CLI behaves logged out vs logged in (do NOT log anyone in).
 8. Identity env var — the var that relocates its config/credentials

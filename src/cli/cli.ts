@@ -80,7 +80,13 @@ import {
   routeKey,
   type RouteBlock,
 } from "../registry/blocks.ts";
-import { detectApps, listModels, routableAdapters } from "../registry/registry.ts";
+import {
+  catalogFor,
+  detectApps,
+  listModels,
+  routableAdapters,
+  routesOf,
+} from "../registry/registry.ts";
 import { nowIso, openStore, withBusyRetry } from "../store/store.ts";
 import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
 import {
@@ -190,19 +196,28 @@ function detect(): number {
   // where an active discovered adapter drops out of the registry until it is
   // re-canaried (PLAN.md §Agentic discovery, step 5).
   const changes = detectDiscovered(db);
-  const modelsByApp = new Map(
-    routableAdapters(db).map((spec) => [spec.app, spec.models.map((m) => m.model).join(", ")]),
-  );
+  const specs = new Map(routableAdapters(db).map((spec) => [spec.app, spec]));
   const rows: string[][] = [["APP", "BINARY", "VERSION", "MODELS"]];
+  const listingErrors: string[] = [];
   for (const app of detectApps({ db })) {
+    const spec = specs.get(app.app)!;
+    const catalog = catalogFor(spec);
+    if (catalog.listingError) listingErrors.push(`${app.app}: ${catalog.listingError}`);
+    // The pinned ids by name; the rest as a count, since an app can report
+    // hundreds and 'baton models' is the place for the full list.
+    const reported = catalog.routes.length - spec.models.length;
+    const pinned = spec.models.map((m) => m.model).join(", ");
     rows.push([
       app.app,
       app.binaryPath ?? "(not found)",
       app.version ?? "-",
-      modelsByApp.get(app.app) ?? "-",
+      reported > 0 ? `${pinned} +${reported} reported by the app` : pinned,
     ]);
   }
   console.log(table(rows));
+  for (const error of listingErrors) {
+    console.log(`\n${error} — only its pinned models route until the listing works.`);
+  }
   for (const change of changes) {
     console.log(`\n${change.app}: ${change.from} → ${change.to} — ${change.note}`);
   }
@@ -783,7 +798,7 @@ function rejectBuiltin(db: Database, spec: AdapterSpec, reason?: string): number
   const saved = addBlock(db, `${spec.app}:*/*`, reason);
   const routes = spec.models.map((m) => m.model).join(", ");
   console.log(
-    `Rejected ${spec.app}${saved.reason ? ` (${saved.reason})` : ""}. Nothing routes to it in this scope: ${routes}.`,
+    `Rejected ${spec.app}${saved.reason ? ` (${saved.reason})` : ""}. Nothing routes to it in this scope: ${routes}, nor anything the app reports.`,
   );
   console.log(
     `A built-in stays pinned in the binary — the block '${saved.pattern}' is what refuses it, including on resume and in the canary. Undo with: baton block remove '${saved.pattern}'`,
@@ -800,7 +815,7 @@ function appBlock(db: Database, spec: AdapterSpec, blocks: RouteBlock[]): RouteB
   const instances = [DEFAULT_INSTANCE, ...(spec.identityEnv ? instanceNames(db, spec.app) : [])];
   let first: RouteBlock | undefined;
   for (const instance of instances) {
-    for (const route of spec.models) {
+    for (const route of routesOf(spec)) {
       const block = blockFor(blocks, spec.app, instance, route.slug);
       if (!block) return undefined;
       first ??= block;
@@ -944,7 +959,9 @@ async function liveCanary(
   if (!target.binaryPath) return { failed: false, detail: "skipped (not on PATH)" };
   // The canary is a real call on a real subscription, so it obeys the deny
   // list: it canaries the first route the user has not blocked, and refuses
-  // rather than spending one they have.
+  // rather than spending one they have. Pinned routes only: the canary proves
+  // the declared spec, and asking the app for its models is itself a spawn
+  // that --structural promises not to make.
   const route = canarySlug(listBlocks(db), target.app, target.spec.models, DEFAULT_INSTANCE);
   if (route && "blocked" in route) {
     return { failed: false, detail: `skipped (${routeBlockReason(route.blocked)})` };
@@ -1267,7 +1284,7 @@ function matchingRoutes(db: Database, pattern: string): string[] {
       DEFAULT_INSTANCE,
       ...(spec.identityEnv ? instanceNames(db, spec.app) : []),
     ];
-    for (const route of spec.models) {
+    for (const route of routesOf(spec)) {
       for (const instance of instances) {
         if (blockFor(one, spec.app, instance, route.slug)) {
           keys.push(routeKey(spec.app, instance, route.slug));

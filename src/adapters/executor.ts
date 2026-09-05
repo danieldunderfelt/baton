@@ -306,7 +306,7 @@ function parseJsonl(stdout: string): unknown[] {
 }
 
 /** Dot-path over nested objects; numeric segments index arrays. */
-function dotPath(root: unknown, path: string): unknown {
+export function dotPath(root: unknown, path: string): unknown {
   let cursor = root;
   for (const segment of path.split(".")) {
     if (cursor === null || cursor === undefined) return undefined;
