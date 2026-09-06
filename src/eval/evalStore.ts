@@ -209,6 +209,13 @@ export interface ImportDiff {
   added: PriorRef[];
   changed: PriorChange[];
   unchanged: PriorRef[];
+  /** Priors the profile held that the document does not (replace mode only). */
+  removed: PriorRef[];
+}
+
+export interface ImportOptions {
+  /** Make the profile equal to the document: priors it does not name are deleted. */
+  replace?: boolean;
 }
 
 /**
@@ -221,9 +228,11 @@ export function importPriors(
   entries: PriorEntry[],
   source: string,
   at = nowIso(),
+  opts: ImportOptions = {},
 ): ImportDiff {
   const { stored: _stored, ...result } = writePriors(db, profile, entries, `imported:${source}`, at, {
     activateIfUnset: false,
+    replace: opts.replace ?? false,
   });
   return { profile, source, ...result };
 }
@@ -232,6 +241,7 @@ export interface PriorDiff {
   added: PriorRef[];
   changed: PriorChange[];
   unchanged: PriorRef[];
+  removed: PriorRef[];
 }
 
 export interface DiffOptions {
@@ -240,6 +250,8 @@ export interface DiffOptions {
   /** Time entries without their own as_of would be stamped with; omitted leaves
    * those entries' as_of out of the compare. */
   at?: string;
+  /** Report priors the entries do not name as removed (what a replacing write deletes). */
+  replace?: boolean;
 }
 
 /**
@@ -295,7 +307,15 @@ function diffNormalized(
       .all(profile)
       .map((r) => [priorKey(r.model, r.category), r] as const),
   );
-  const diff: PriorDiff = { added: [], changed: [], unchanged: [] };
+  const diff: PriorDiff = { added: [], changed: [], unchanged: [], removed: [] };
+  const named = new Set(entries.map((e) => priorKey(e.model, e.category)));
+  if (opts.replace) {
+    for (const [key, row] of existing) {
+      if (!named.has(key)) {
+        diff.removed.push({ model: row.model, category: row.category, mean: row.mean, weight: row.weight });
+      }
+    }
+  }
   for (const { asOf, ...ref } of entries) {
     const before = existing.get(priorKey(ref.model, ref.category));
     const next = asOf ?? opts.at;
@@ -337,11 +357,18 @@ function writePriors(
   entries: PriorEntry[],
   source: string,
   at: string,
-  opts: { activateIfUnset: boolean },
+  opts: { activateIfUnset: boolean; replace?: boolean },
 ): WriteResult {
   const normalized = entries.map(normalizeEntry);
   return inTransaction(db, () => {
-    const diff = diffNormalized(db, profile, normalized, { source, at });
+    const diff = diffNormalized(db, profile, normalized, { source, at, replace: opts.replace });
+    for (const gone of diff.removed) {
+      db.query("DELETE FROM priors WHERE profile = ? AND model = ? AND category = ?").run(
+        profile,
+        gone.model,
+        gone.category,
+      );
+    }
     const stored: PriorRef[] = [];
     for (const { asOf, ...entry } of normalized) {
       stored.push(entry);

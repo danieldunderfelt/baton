@@ -153,29 +153,49 @@ export type DeviceRedeem =
   | { status: "invalid" }
   | { status: "ok"; token: string; login: string };
 
-/** The CLI's poll: once approved, mint the token and burn the device code. */
+/**
+ * The CLI's poll: once approved, mint the token and burn the device code.
+ * Claiming is the DELETE itself, so two concurrent polls cannot both mint.
+ */
 export async function redeemDevice(db: D1Database, rawDeviceCode: string): Promise<DeviceRedeem> {
   const hash = await sha256Hex(rawDeviceCode);
-  const row = await db
-    .prepare("SELECT user_code, label, user_id, expires_at FROM device_codes WHERE device_code_hash = ?")
-    .bind(hash)
-    .first<PendingDevice>();
-  if (!row) return { status: "invalid" };
-  if (row.expires_at <= nowIso()) {
-    await db.prepare("DELETE FROM device_codes WHERE device_code_hash = ?").bind(hash).run();
-    return { status: "expired" };
+  const now = nowIso();
+  const claimed = await db
+    .prepare(
+      `DELETE FROM device_codes WHERE device_code_hash = ? AND user_id IS NOT NULL AND expires_at > ?
+       RETURNING user_id, label`,
+    )
+    .bind(hash, now)
+    .first<{ user_id: string; label: string }>();
+  if (!claimed) {
+    const row = await db
+      .prepare("SELECT expires_at FROM device_codes WHERE device_code_hash = ?")
+      .bind(hash)
+      .first<{ expires_at: string }>();
+    if (!row) return { status: "invalid" };
+    if (row.expires_at <= now) {
+      await db.prepare("DELETE FROM device_codes WHERE device_code_hash = ?").bind(hash).run();
+      return { status: "expired" };
+    }
+    return { status: "pending" };
   }
-  if (!row.user_id) return { status: "pending" };
-  const user = await db.prepare("SELECT * FROM users WHERE id = ?").bind(row.user_id).first<User>();
+  const user = await db.prepare("SELECT * FROM users WHERE id = ?").bind(claimed.user_id).first<User>();
   if (!user) return { status: "invalid" };
   const token = `bt_${randomSecret()}`;
-  await db.batch([
-    db
-      .prepare("INSERT INTO tokens (token_hash, user_id, label, created_at) VALUES (?, ?, ?, ?)")
-      .bind(await sha256Hex(token), user.id, row.label, nowIso()),
-    db.prepare("DELETE FROM device_codes WHERE device_code_hash = ?").bind(hash),
-  ]);
+  await db
+    .prepare("INSERT INTO tokens (token_hash, user_id, label, created_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256Hex(token), user.id, claimed.label, now)
+    .run();
   return { status: "ok", token, login: user.login };
+}
+
+/** Outstanding (unexpired) device requests: the cheap abuse ceiling. */
+export async function pendingDeviceCount(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM device_codes WHERE expires_at > ?")
+    .bind(nowIso())
+    .first<{ n: number }>();
+  return row?.n ?? 0;
 }
 
 /** Housekeeping on a path that is rare anyway (each `baton login`). */

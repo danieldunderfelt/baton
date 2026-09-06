@@ -89,7 +89,7 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
                     <td class="muted">{day(s.updated_at)}</td>
                     <td class="actions">
                       <a class="btn btn-sm" href={`${origin}/p/${s.code}`}>Open</a>
-                      <form method="post" action="/account" onsubmit={`return confirm('Revoke ${s.name}? Anyone holding the link loses access.')`}>
+                      <form method="post" action="/account" data-confirm={`Revoke ${s.name}? Anyone holding the link loses access.`}>
                         <input type="hidden" name="action" value="unshare" />
                         <input type="hidden" name="code" value={s.code} />
                         <button class="btn btn-sm btn-danger" type="submit">Revoke</button>
@@ -107,7 +107,7 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
     <section class="stack">
       <div class="section-head">
         <h2>Signed-in CLIs</h2>
-        <p class="muted">Each <code>baton login</code> mints one token, named after the machine. Revoke any you no longer recognise.</p>
+        <p class="muted">Each <code>baton login</code> mints one token. Revoke any you do not recognise; that CLI is signed out at once.</p>
       </div>
       {
         tokens.length === 0 ? (
@@ -119,7 +119,7 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
             <table class="table">
               <thead>
                 <tr>
-                  <th>Machine</th>
+                  <th>Device</th>
                   <th>Signed in</th>
                   <th>Last used</th>
                   <th />
@@ -148,6 +148,15 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
     </section>
   </div>
 </Base>
+
+<script>
+  // Confirmation text is a data attribute, never interpolated into script.
+  document.querySelectorAll<HTMLFormElement>("form[data-confirm]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (!confirm(form.dataset.confirm ?? "")) event.preventDefault();
+    });
+  });
+</script>
 
 <style>
   .account {

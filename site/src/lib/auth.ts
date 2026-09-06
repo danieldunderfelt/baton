@@ -65,7 +65,9 @@ export const crossSite = () => new Response("Cross-site request refused.", { sta
 
 /** Only same-site paths may be a post-login destination. */
 export function safeNext(next: string | null | undefined): string {
-  return next && /^\/(?!\/)/.test(next) ? next : "/account";
+  // One leading slash, then not another slash or backslash: `//host` and
+  // `/\host` are both scheme-relative to a browser.
+  return next && /^\/(?![/\\])/.test(next) ? next : "/account";
 }
 
 export function beginGithubLogin(

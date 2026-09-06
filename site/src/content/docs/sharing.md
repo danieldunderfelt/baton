@@ -45,6 +45,6 @@ Opening the link in a browser shows the profile: who shared it, when, the table 
 
 ## Privacy
 
-The only data uploaded is the profile document itself (name, timestamp, and per-model entries) plus your GitHub login and avatar for attribution. No prompts, runs, grades, account names, or machine details ever leave the machine. Shares are public to anyone holding the code.
+The only data uploaded is the profile document itself (name, timestamp, and per-model entries) plus your GitHub login and avatar for attribution. Signing in records a generic device label (the operating system, not the hostname) so you can tell tokens apart on the account page. No prompts, runs, grades, account names, or machine details ever leave the machine. Shares are public to anyone holding the code.
 
 The site URL can be overridden with the `BATON_SITE_URL` environment variable, for self-hosting or local testing of the site.

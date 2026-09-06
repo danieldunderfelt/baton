@@ -17,6 +17,7 @@ import {
 import {
   diffProfileDocument,
   exportProfile,
+  importProfileDocument,
   importProfileFile,
   parseProfileDocument,
   renderProfile,
@@ -420,5 +421,42 @@ describe("validation", () => {
       weight: DEFAULT_PRIOR_WEIGHT,
       as_of: NOW,
     });
+  });
+});
+
+describe("replace", () => {
+  test("a refreshed document removes priors it no longer names, and the preview says so", () => {
+    const target = scope("prof-replace");
+    seedPriors(
+      target.db,
+      "alice/picks",
+      [
+        { model: "opus-5", mean: 4, weight: 5 },
+        { model: "kimi-k3", category: "implementation", mean: 4.5, weight: 3 },
+      ],
+      NOW,
+    );
+    const refreshed: ProfileDocument = {
+      name: "picks",
+      exported_at: NOW,
+      entries: [{ model: "opus-5", category: "", mean: 4, weight: 5, as_of: NOW }],
+    };
+
+    const preview = diffProfileDocument(target.db, refreshed, "alice/picks", NOW, "alice/picks", true);
+    expect(preview.removed).toEqual([{ model: "kimi-k3", category: "implementation", mean: 4.5, weight: 3 }]);
+    // Without replace, the stale prior is invisible — the old behaviour, kept for seeds.
+    expect(diffProfileDocument(target.db, refreshed, "alice/picks", NOW, "alice/picks").removed).toEqual([]);
+
+    const committed = importProfileDocument(target.db, refreshed, {
+      name: "alice/picks",
+      source: "alice/picks",
+      replace: true,
+    });
+    expect(committed.removed).toEqual(preview.removed);
+    const left = target.db
+      .query<{ model: string }, [string]>("SELECT model FROM priors WHERE profile = ? ORDER BY model")
+      .all("alice/picks")
+      .map((r) => r.model);
+    expect(left).toEqual(["opus-5"]);
   });
 });

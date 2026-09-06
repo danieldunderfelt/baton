@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
@@ -1491,14 +1491,16 @@ async function profileImport(args: string[]): Promise<number> {
   if (loaded.from) console.log(loaded.from);
 
   if (flags.yes !== true) {
-    printDiff(source, target, diffProfileDocument(db, doc, target, undefined, source));
+    printDiff(source, target, diffProfileDocument(db, doc, target, undefined, source, true));
     console.log(
       `\nNothing was written. Re-run with --yes to commit${activate ? " and activate" : ""}.`,
     );
     return 0;
   }
 
-  const diff = importProfileDocument(db, doc, { name: target, activate, source });
+  // The document *is* the profile: priors it no longer names go, so a
+  // refreshed share does not leave the recipient routing on retracted opinions.
+  const diff = importProfileDocument(db, doc, { name: target, activate, source, replace: true });
   printDiff(diff.source, target, diff);
   publishRatings(db, paths.configDir);
   console.log(`\nImported into profile '${target}' at revision ${diff.revision}.`);
@@ -1569,7 +1571,7 @@ async function profileShare(args: string[]): Promise<number> {
   const auth = readAuth(paths.configDir, site) ?? (await signIn(paths.configDir, site));
   const share = await withAuth(paths.configDir, () => shareProfile(site, auth.token, doc));
   console.log(
-    `${share.created ? "Shared" : "Updated"} profile '${name}' (${doc.entries.length} priors) as @${auth.login}.`,
+    `${share.created ? "Shared" : "Updated"} profile '${name}' (${doc.entries.length} prior${doc.entries.length === 1 ? "" : "s"}) as @${auth.login}.`,
   );
   console.log(`  Link:   ${share.url}`);
   console.log(`  Import: baton profile import ${share.code}`);
@@ -1634,8 +1636,14 @@ async function logout(args: string[]): Promise<number> {
   try {
     await revokeToken(site, auth.token);
   } catch (err) {
-    // The token is gone locally either way; the site may already have dropped it.
-    if (!isUnauthorized(err)) console.error(`Could not revoke the token on ${site}: ${message(err)}`);
+    // A 401 means the site already dropped it. Anything else, and forgetting
+    // the token locally would leave a live credential nobody can revoke.
+    if (!isUnauthorized(err)) {
+      console.error(
+        `Could not revoke the token on ${site}: ${message(err)}\nKept it locally so the next 'baton logout' can retry; the site's account page can revoke it too.`,
+      );
+      return 1;
+    }
   }
   clearAuth(paths.configDir);
   console.log(`Signed out of ${site} (was @${auth.login}).`);
@@ -1645,10 +1653,15 @@ async function logout(args: string[]): Promise<number> {
 /** The device flow, then the token to disk. Only the token's owner can read it. */
 async function signIn(configDir: string, site: string): Promise<AuthFile> {
   console.log(`Signing in to ${site} with GitHub.`);
-  const auth = await deviceLogin(site, { label: hostname() });
+  // A generic label: the site keeps no machine details, so not the hostname.
+  const auth = await deviceLogin(site, { label: `Baton CLI on ${platformName()}` });
   const path = writeAuth(configDir, auth);
   console.log(`Signed in as @${auth.login}. Token stored in ${path}.`);
   return auth;
+}
+
+function platformName(): string {
+  return process.platform === "darwin" ? "macOS" : process.platform === "linux" ? "Linux" : process.platform;
 }
 
 function requireAuth(configDir: string, site: string): AuthFile {
@@ -1684,8 +1697,9 @@ function printDiff(source: string, target: string, diff: PriorDiff): void {
     );
   }
   for (const e of diff.unchanged) console.log(`  = ${priorLabel(e)}`);
+  for (const e of diff.removed) console.log(`  - ${priorLabel(e)} (not in the document)`);
   console.log(
-    `${diff.added.length} added, ${diff.changed.length} changed, ${diff.unchanged.length} unchanged`,
+    `${diff.added.length} added, ${diff.changed.length} changed, ${diff.unchanged.length} unchanged, ${diff.removed.length} removed`,
   );
 }
 

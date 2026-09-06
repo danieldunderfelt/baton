@@ -61,6 +61,8 @@ export interface ImportOptions {
   activate?: boolean;
   /** Provenance to stamp instead of the document's name, e.g. `login/name` for a share. */
   source?: string;
+  /** Make the local profile equal to the document: priors it no longer names are removed. */
+  replace?: boolean;
 }
 
 /**
@@ -87,7 +89,9 @@ export function importProfileDocument(
   const profile = opts.name ?? doc.name;
   // Provenance is the document's own name (or where it was shared from):
   // renaming locally must not hide where the numbers came from.
-  const diff = importPriors(db, profile, priorEntriesOf(doc), opts.source ?? doc.name, at);
+  const diff = importPriors(db, profile, priorEntriesOf(doc), opts.source ?? doc.name, at, {
+    replace: opts.replace,
+  });
   return opts.activate ? { ...diff, revision: setActiveProfile(db, profile) } : diff;
 }
 
@@ -118,8 +122,9 @@ export function diffProfileDocument(
   profile = doc.name,
   at = nowIso(),
   source = doc.name,
+  replace = false,
 ): PriorDiff {
-  return diffPriors(db, profile, priorEntriesOf(doc), { source: `imported:${source}`, at });
+  return diffPriors(db, profile, priorEntriesOf(doc), { source: `imported:${source}`, at, replace });
 }
 
 function read(filePath: string): string {

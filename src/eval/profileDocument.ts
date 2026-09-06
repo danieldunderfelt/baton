@@ -157,7 +157,7 @@ function scalar(text: string, fail: (why: string) => Error): unknown {
 }
 
 const DOC_KEYS = new Set(["name", "exported_at", "entries"]);
-const CONTROL_CHARS = /[\u0000-\u001f]/;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 const WHITESPACE = /\s/;
 const NUL = "\u0000";
 const ENTRY_KEYS = new Set(["model", "category", "mean", "weight", "as_of"]);
@@ -180,10 +180,7 @@ export function validateProfileDocument(
   if (name.length > 100 || CONTROL_CHARS.test(name)) {
     throw new Error(`${source}: profile "name" must be a short single-line string.`);
   }
-  const exportedAt = raw.exported_at ?? now;
-  if (typeof exportedAt !== "string" || Number.isNaN(Date.parse(exportedAt))) {
-    throw new Error(`${source}: "exported_at" must be an ISO timestamp.`);
-  }
+  const exportedAt = timestamp(raw.exported_at ?? now, now, `${source}: "exported_at"`);
   if (!Array.isArray(raw.entries)) {
     throw new Error(`${source}: profile needs an "entries" list.`);
   }
@@ -205,14 +202,16 @@ export function validateProfileDocument(
         `${where}: "${model}" is not a canonical model id — profiles carry models only, never targets, routes, or instances.`,
       );
     }
-    if (model.length > 100 || WHITESPACE.test(model)) {
+    if (model.length > 100 || WHITESPACE.test(model) || CONTROL_CHARS.test(model)) {
       throw new Error(`${where}: "model" must be a short identifier without whitespace.`);
     }
     const category = value.category ?? "";
     // NUL separates model from category in the rollup key; letting one
     // through would let a category collide with another model's rows.
-    if (typeof category !== "string" || category.includes(NUL) || category.length > 100) {
-      throw new Error(`${where}: "category" must be a plain string.`);
+    // Categories are printed to terminals before anything is written, so a
+    // control character here is an escape sequence in someone else's shell.
+    if (typeof category !== "string" || CONTROL_CHARS.test(category) || category.length > 100) {
+      throw new Error(`${where}: "category" must be a plain single-line string.`);
     }
     const mean = bounded(value.mean, 1, 5, `${where}: "mean"`);
     // A file that omits weight gets the same weight a fresh seed would; 0 is a
@@ -223,10 +222,7 @@ export function validateProfileDocument(
       PRIOR_WEIGHT_CAP,
       `${where}: "weight"`,
     );
-    const asOf = value.as_of ?? exportedAt;
-    if (typeof asOf !== "string" || Number.isNaN(Date.parse(asOf))) {
-      throw new Error(`${where}: "as_of" must be an ISO timestamp.`);
-    }
+    const asOf = timestamp(value.as_of ?? exportedAt, now, `${where}: "as_of"`);
     const key = `${model}${NUL}${category}`;
     if (seen.has(key)) {
       throw new Error(`${where}: duplicate entry for ${model}${category ? ` (${category})` : ""}.`);
@@ -236,6 +232,21 @@ export function validateProfileDocument(
   });
 
   return { name, exported_at: exportedAt, entries };
+}
+
+/** Beyond a day of clock skew, a future date is a prior that would never decay. */
+const CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A valid ISO timestamp, clamped to `now`: an as_of in the future would hold
+ * a shared opinion at full weight until that date arrives, which is exactly
+ * the "wrong seed steers routing for months" the weight cap exists to stop.
+ */
+function timestamp(value: unknown, now: string, what: string): string {
+  if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+    throw new Error(`${what} must be an ISO timestamp.`);
+  }
+  return Date.parse(value) > Date.parse(now) + CLOCK_SKEW_MS ? now : value;
 }
 
 function bounded(value: unknown, min: number, max: number, what: string): number {
