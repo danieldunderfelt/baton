@@ -15,6 +15,7 @@ import {
 } from "./decay.ts";
 import {
   DEFAULT_HALF_LIFE_DAYS,
+  DEFAULT_PRIOR_WEIGHT,
   PRIOR_WEIGHT_CAP,
   SETTING_ACTIVE_PROFILE,
   SETTING_HALF_LIFE_DAYS,
@@ -163,7 +164,7 @@ export interface PriorEntry {
 }
 
 /** "~5–10 observations" (PLAN.md §Seeded priors) — the low end is the default. */
-export const DEFAULT_PRIOR_WEIGHT = 5;
+export { DEFAULT_PRIOR_WEIGHT };
 
 export interface SeedResult {
   revision: number;

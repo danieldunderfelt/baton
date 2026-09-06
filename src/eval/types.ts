@@ -47,6 +47,9 @@ export interface Prior {
 /** A wrong seed must not steer routing for months (PLAN.md §Seeded priors). */
 export const PRIOR_WEIGHT_CAP = 10;
 
+/** Pseudo-observations a seed or import gets when it does not say. */
+export const DEFAULT_PRIOR_WEIGHT = 5;
+
 export const DEFAULT_HALF_LIFE_DAYS = 90;
 
 /** Effective rating shown per model: prior and observed kept separate. */
