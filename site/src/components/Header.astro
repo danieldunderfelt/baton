@@ -1,0 +1,75 @@
+---
+import Logo from "./Logo.astro";
+
+interface Props {
+  login?: string | null;
+}
+const { login = null } = Astro.props;
+const path = Astro.url.pathname;
+const isDocs = path.startsWith("/docs");
+---
+
+<header class="site-header">
+  <div class="container row">
+    <a href="/" class="brand" aria-label="Baton home">
+      <Logo />
+      <span>Baton</span>
+    </a>
+    <nav class="row nav" aria-label="Primary">
+      <a href="/docs" aria-current={isDocs ? "page" : undefined}>Docs</a>
+      <a href="https://github.com/danieldunderfelt/baton" rel="noopener">GitHub</a>
+      {
+        login ? (
+          <a href="/account" class="who" aria-current={path === "/account" ? "page" : undefined}>
+            @{login}
+          </a>
+        ) : (
+          <a href="/api/auth/github?next=/account" class="btn btn-sm">
+            Sign in
+          </a>
+        )
+      }
+    </nav>
+  </div>
+</header>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .site-header .container {
+    height: 3.5rem;
+    justify-content: space-between;
+    flex-wrap: nowrap;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    font-size: 1.0625rem;
+  }
+  .brand:hover {
+    color: inherit;
+  }
+  .nav {
+    --gap: 1.25rem;
+    font-size: 0.9375rem;
+    font-weight: 500;
+    color: var(--fg-muted);
+  }
+  .nav a[aria-current="page"] {
+    color: var(--fg);
+  }
+  .who {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+  }
+</style>

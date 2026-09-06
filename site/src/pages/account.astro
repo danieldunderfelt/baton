@@ -1,0 +1,213 @@
+---
+import Base from "../layouts/Base.astro";
+import { crossSite, currentUser, isSameOrigin } from "../lib/auth.ts";
+import { normalizeShareCode } from "../lib/codes.ts";
+import { deleteProfile, deleteTokenForUser, listProfiles, listTokens } from "../lib/db.ts";
+import { appEnv, siteOrigin } from "../lib/env.ts";
+
+export const prerender = false;
+
+const env = appEnv();
+const user = await currentUser(env, Astro.cookies);
+if (!user) return Astro.redirect("/api/auth/github?next=/account", 302);
+
+let notice: string | null = null;
+if (Astro.request.method === "POST") {
+  if (!isSameOrigin(Astro.request)) return crossSite();
+  const form = await Astro.request.formData();
+  const action = form.get("action");
+  if (action === "unshare") {
+    const code = normalizeShareCode(String(form.get("code") ?? ""));
+    if (code && (await deleteProfile(env.DB, user.id, code))) notice = `Revoked ${code}. Its link no longer resolves.`;
+  } else if (action === "revoke-token") {
+    const hash = String(form.get("token") ?? "");
+    if (await deleteTokenForUser(env.DB, user.id, hash)) notice = "Signed that CLI out.";
+  }
+}
+
+const origin = siteOrigin(Astro.request);
+const shares = await listProfiles(env.DB, user.id);
+const tokens = await listTokens(env.DB, user.id);
+const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
+---
+
+<Base title="Your shares" login={user.login} noindex>
+  <div class="container account">
+    <header class="head row">
+      <div class="row who">
+        {user.avatar_url && <img src={user.avatar_url} alt="" width="36" height="36" />}
+        <div>
+          <h1>@{user.login}</h1>
+          <p class="muted small">Signed in with GitHub</p>
+        </div>
+      </div>
+      <form method="post" action="/api/auth/logout">
+        <button class="btn btn-sm" type="submit">Sign out</button>
+      </form>
+    </header>
+
+    {notice && <p class="notice">{notice}</p>}
+
+    <section class="stack">
+      <div class="section-head">
+        <h2>Shared profiles</h2>
+        <p class="muted">
+          Each is reachable only by its code. Sharing a profile again from the CLI updates it under the same
+          code; revoking one here stops its link immediately.
+        </p>
+      </div>
+      {
+        shares.length === 0 ? (
+          <div class="card empty">
+            <p>Nothing shared yet.</p>
+            <p class="muted">
+              Run <code>baton profile share</code> in a terminal that is signed in as you. <a href="/docs/sharing">How sharing works</a>
+            </p>
+          </div>
+        ) : (
+          <div class="card flush">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Profile</th>
+                  <th>Code</th>
+                  <th class="num">Priors</th>
+                  <th>Updated</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {shares.map((s) => (
+                  <tr>
+                    <td>
+                      <a href={`/p/${s.code}`} class="name">{s.name}</a>
+                    </td>
+                    <td>
+                      <code>{s.code}</code>
+                    </td>
+                    <td class="num">{s.entry_count}</td>
+                    <td class="muted">{day(s.updated_at)}</td>
+                    <td class="actions">
+                      <a class="btn btn-sm" href={`${origin}/p/${s.code}`}>Open</a>
+                      <form method="post" action="/account" onsubmit={`return confirm('Revoke ${s.name}? Anyone holding the link loses access.')`}>
+                        <input type="hidden" name="action" value="unshare" />
+                        <input type="hidden" name="code" value={s.code} />
+                        <button class="btn btn-sm btn-danger" type="submit">Revoke</button>
+                      </form>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      }
+    </section>
+
+    <section class="stack">
+      <div class="section-head">
+        <h2>Signed-in CLIs</h2>
+        <p class="muted">Each <code>baton login</code> mints one token, named after the machine. Revoke any you no longer recognise.</p>
+      </div>
+      {
+        tokens.length === 0 ? (
+          <div class="card empty">
+            <p class="muted">No CLI is signed in. <code>baton login</code> starts the flow.</p>
+          </div>
+        ) : (
+          <div class="card flush">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Machine</th>
+                  <th>Signed in</th>
+                  <th>Last used</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {tokens.map((t) => (
+                  <tr>
+                    <td>{t.label}</td>
+                    <td class="muted">{day(t.created_at)}</td>
+                    <td class="muted">{day(t.last_used_at)}</td>
+                    <td class="actions">
+                      <form method="post" action="/account">
+                        <input type="hidden" name="action" value="revoke-token" />
+                        <input type="hidden" name="token" value={t.token_hash} />
+                        <button class="btn btn-sm btn-danger" type="submit">Sign out</button>
+                      </form>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      }
+    </section>
+  </div>
+</Base>
+
+<style>
+  .account {
+    padding: 3rem 0 5rem;
+    max-width: 56rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2.5rem;
+  }
+  .head {
+    justify-content: space-between;
+  }
+  .who img {
+    border-radius: 50%;
+  }
+  .who h1 {
+    font-size: 1.375rem;
+    font-family: var(--font-mono);
+  }
+  .small {
+    font-size: 0.8125rem;
+  }
+  .notice {
+    padding: 0.7rem 1rem;
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    font-size: 0.9375rem;
+  }
+  .section-head h2 {
+    font-size: 1.25rem;
+  }
+  .section-head p {
+    margin-top: 0.35rem;
+    font-size: 0.9375rem;
+    max-width: 60ch;
+  }
+  .section-head a,
+  .empty a {
+    color: var(--accent-ink);
+    text-decoration: underline;
+  }
+  .flush {
+    padding: 0;
+    overflow: hidden;
+  }
+  .empty {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .name {
+    font-weight: 500;
+  }
+  .actions {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .actions form {
+    display: inline;
+    margin-left: 0.4rem;
+  }
+</style>

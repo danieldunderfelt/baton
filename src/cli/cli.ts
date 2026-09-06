@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
@@ -46,10 +46,11 @@ import {
   type PriorDiff,
   type PriorRef,
 } from "../eval/evalStore.ts";
+import type { ProfileDocument } from "../eval/profileDocument.ts";
 import {
   diffProfileDocument,
   exportProfile,
-  importProfileFile,
+  importProfileDocument,
   parseProfileDocument,
   renderProfile,
 } from "../eval/profileFile.ts";
@@ -105,6 +106,21 @@ import {
   type InstallHost,
   type InstallScope,
 } from "./install.ts";
+import {
+  clearAuth,
+  deviceLogin,
+  fetchShare,
+  isUnauthorized,
+  listShares,
+  parseShareRef,
+  readAuth,
+  revokeShare,
+  revokeToken,
+  shareProfile,
+  siteUrl,
+  writeAuth,
+  type AuthFile,
+} from "./share.ts";
 import { CURRENT_VERSION, selfUpdate } from "./update.ts";
 
 /**
@@ -158,7 +174,11 @@ export async function runCli(command: string, args: string[]): Promise<number> {
       case "ratings":
         return ratings(args);
       case "profile":
-        return profile(args);
+        return await profile(args);
+      case "login":
+        return await login(args);
+      case "logout":
+        return await logout(args);
       case "grade":
         return grade(args);
       case "set":
@@ -1396,12 +1416,23 @@ function ratingsPublish(): number {
   return 0;
 }
 
-function profile(args: string[]): number {
-  if (args[0] === "import") return profileImport(args.slice(1));
-  if (args[0] === "export") return profileExport(args.slice(1));
-  return usage(
-    "profile takes: import <file> [--name <n>] [--activate] [--yes] | export [--profile <n>] [--out <file>]",
-  );
+async function profile(args: string[]): Promise<number> {
+  switch (args[0]) {
+    case "import":
+      return await profileImport(args.slice(1));
+    case "export":
+      return profileExport(args.slice(1));
+    case "share":
+      return await profileShare(args.slice(1));
+    case "shares":
+      return await profileShares(args.slice(1));
+    case "unshare":
+      return await profileUnshare(args.slice(1));
+    default:
+      return usage(
+        "profile takes: import <file|code|url> [--name <n>] [--activate] [--yes] | export [--profile <n>] [--out <file>] | share [--profile <n>] | shares | unshare <code>",
+      );
+  }
 }
 
 /**
@@ -1430,13 +1461,17 @@ function profileExport(args: string[]): number {
   const path = resolve(String(flags.out));
   writeFileSync(path, text);
   console.log(`Exported profile '${name}' (${doc.entries.length} priors) to ${path}`);
+  warnCategories(doc);
+  return 0;
+}
+
+function warnCategories(doc: ProfileDocument): void {
   const categories = [...new Set(doc.entries.map((e) => e.category).filter(Boolean))];
   if (categories.length > 0) {
     console.log(
       `Note: category names are free text and export verbatim (${categories.join(", ")}) — check none name a client or project before sharing.`,
     );
   }
-  return 0;
 }
 
 /**
@@ -1444,25 +1479,26 @@ function profileExport(args: string[]): number {
  * There is no interactive prompt — the caller is usually an agent — so the diff
  * is the dry run and `--yes` is the commit.
  */
-function profileImport(args: string[]): number {
+async function profileImport(args: string[]): Promise<number> {
   const { flags, rest } = parseFlags(args, { value: ["name"], boolean: ["activate", "yes"] });
-  const file = rest[0];
-  if (!file) return usage("profile import needs: <file> [--name <n>] [--activate] [--yes]");
-  const path = resolve(file);
-  const doc = parseProfileDocument(read(path), path);
-  const target = flags.name === undefined ? doc.name : String(flags.name);
+  const ref = rest[0];
+  if (!ref) return usage("profile import needs: <file|code|url> [--name <n>] [--activate] [--yes]");
+  const loaded = await loadProfile(ref);
+  const { doc, source } = loaded;
+  const target = flags.name === undefined ? loaded.defaultName : String(flags.name);
   const activate = flags.activate === true;
   const { db, paths } = openScope();
+  if (loaded.from) console.log(loaded.from);
 
   if (flags.yes !== true) {
-    printDiff(doc.name, target, diffProfileDocument(db, doc, target));
+    printDiff(source, target, diffProfileDocument(db, doc, target, undefined, source));
     console.log(
       `\nNothing was written. Re-run with --yes to commit${activate ? " and activate" : ""}.`,
     );
     return 0;
   }
 
-  const diff = importProfileFile(db, path, { name: target, activate });
+  const diff = importProfileDocument(db, doc, { name: target, activate, source });
   printDiff(diff.source, target, diff);
   publishRatings(db, paths.configDir);
   console.log(`\nImported into profile '${target}' at revision ${diff.revision}.`);
@@ -1472,6 +1508,168 @@ function profileImport(args: string[]): number {
       : `Not activated: 'baton set ${SETTING_ACTIVE_PROFILE} ${target}' switches to it.`,
   );
   return 0;
+}
+
+interface LoadedProfile {
+  doc: ProfileDocument;
+  /** Provenance stamped on the priors: the file's name, or `login/name` for a share. */
+  source: string;
+  /** Local profile name when --name is not given. */
+  defaultName: string;
+  /** Where it came from, for the terminal; empty for a local file. */
+  from: string;
+}
+
+/**
+ * A file path, a share code, or a share link. A share lands under
+ * `<login>/<name>` by default so it cannot collide with a profile of the same
+ * name the recipient already nurtures.
+ */
+async function loadProfile(ref: string): Promise<LoadedProfile> {
+  const path = resolve(ref);
+  if (existsSync(path)) {
+    const doc = parseProfileDocument(read(path), path);
+    return { doc, source: doc.name, defaultName: doc.name, from: "" };
+  }
+  const share = parseShareRef(ref);
+  if (!share) {
+    throw new Error(`'${ref}' is neither a profile file nor a share code or link.`);
+  }
+  const site = share.site ?? siteUrl();
+  const shared = await fetchShare(site, share.code);
+  const source = `${shared.owner.login}/${shared.profile.name}`;
+  return {
+    doc: shared.profile,
+    source,
+    defaultName: source,
+    from: `Fetched ${shared.url}: '${shared.profile.name}' shared by @${shared.owner.login}, updated ${day(shared.updated_at)}.`,
+  };
+}
+
+/**
+ * Publishing goes through the same export as a file, so the portability
+ * guarantee holds: canonical priors, nothing local. Re-sharing a profile name
+ * refreshes the existing share, so a link already handed out stays current.
+ */
+async function profileShare(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { value: ["profile"] });
+  if (rest.length > 0) {
+    return usage(`profile share takes no positional arguments, got '${rest[0]}'.`);
+  }
+  const { db, paths } = openScope();
+  const name = flags.profile === undefined ? activeProfile(db) : String(flags.profile);
+  if (!name) {
+    return usage(
+      "profile share needs a profile: this scope has no active one. Name it with --profile <n>, or 'baton set active_profile <n>'.",
+    );
+  }
+  const doc = exportProfile(db, name);
+  warnCategories(doc);
+  const site = siteUrl();
+  const auth = readAuth(paths.configDir, site) ?? (await signIn(paths.configDir, site));
+  const share = await withAuth(paths.configDir, () => shareProfile(site, auth.token, doc));
+  console.log(
+    `${share.created ? "Shared" : "Updated"} profile '${name}' (${doc.entries.length} priors) as @${auth.login}.`,
+  );
+  console.log(`  Link:   ${share.url}`);
+  console.log(`  Import: baton profile import ${share.code}`);
+  if (!share.created) console.log("The existing link now serves this version.");
+  return 0;
+}
+
+async function profileShares(args: string[]): Promise<number> {
+  if (args.length > 0) return usage(`profile shares takes no arguments, got '${args[0]}'.`);
+  const { paths } = openScope();
+  const site = siteUrl();
+  const auth = requireAuth(paths.configDir, site);
+  const shares = await withAuth(paths.configDir, () => listShares(site, auth.token));
+  if (shares.length === 0) {
+    console.log(`No shared profiles as @${auth.login}. 'baton profile share' publishes the active one.`);
+    return 0;
+  }
+  console.log(
+    table([
+      ["CODE", "PROFILE", "PRIORS", "UPDATED", "LINK"],
+      ...shares.map((s) => [s.code, s.name, String(s.entry_count), day(s.updated_at), s.url]),
+    ]),
+  );
+  return 0;
+}
+
+async function profileUnshare(args: string[]): Promise<number> {
+  const ref = args[0];
+  if (!ref || args.length > 1) return usage("profile unshare needs: <code>");
+  const share = parseShareRef(ref);
+  if (!share) return usage(`'${ref}' is not a share code or link.`);
+  const { paths } = openScope();
+  const site = share.site ?? siteUrl();
+  const auth = requireAuth(paths.configDir, site);
+  await withAuth(paths.configDir, () => revokeShare(site, auth.token, share.code));
+  console.log(`Revoked share ${share.code}. Its link no longer resolves.`);
+  return 0;
+}
+
+async function login(args: string[]): Promise<number> {
+  if (args.length > 0) return usage(`login takes no arguments, got '${args[0]}'.`);
+  const { paths } = openScope();
+  const site = siteUrl();
+  const existing = readAuth(paths.configDir, site);
+  if (existing) {
+    console.log(`Already signed in to ${site} as @${existing.login}. 'baton logout' signs out.`);
+    return 0;
+  }
+  await signIn(paths.configDir, site);
+  return 0;
+}
+
+async function logout(args: string[]): Promise<number> {
+  if (args.length > 0) return usage(`logout takes no arguments, got '${args[0]}'.`);
+  const { paths } = openScope();
+  const site = siteUrl();
+  const auth = readAuth(paths.configDir, site);
+  if (!auth) {
+    console.log(`Not signed in to ${site}.`);
+    return 0;
+  }
+  try {
+    await revokeToken(site, auth.token);
+  } catch (err) {
+    // The token is gone locally either way; the site may already have dropped it.
+    if (!isUnauthorized(err)) console.error(`Could not revoke the token on ${site}: ${message(err)}`);
+  }
+  clearAuth(paths.configDir);
+  console.log(`Signed out of ${site} (was @${auth.login}).`);
+  return 0;
+}
+
+/** The device flow, then the token to disk. Only the token's owner can read it. */
+async function signIn(configDir: string, site: string): Promise<AuthFile> {
+  console.log(`Signing in to ${site} with GitHub.`);
+  const auth = await deviceLogin(site, { label: hostname() });
+  const path = writeAuth(configDir, auth);
+  console.log(`Signed in as @${auth.login}. Token stored in ${path}.`);
+  return auth;
+}
+
+function requireAuth(configDir: string, site: string): AuthFile {
+  const auth = readAuth(configDir, site);
+  if (!auth) throw new Error(`Not signed in to ${site}. Run 'baton login' first.`);
+  return auth;
+}
+
+/** A 401 means the token is dead on the site: drop it so the next call signs in fresh. */
+async function withAuth<T>(configDir: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (isUnauthorized(err)) {
+      clearAuth(configDir);
+      throw new Error(
+        "The sharing site no longer accepts this token, so it was discarded. Run 'baton login' to sign in again.",
+      );
+    }
+    throw err;
+  }
 }
 
 function printDiff(source: string, target: string, diff: PriorDiff): void {
@@ -1765,8 +1963,11 @@ Usage:
   baton block list | block remove <pattern>
   baton ratings [publish]                 Show ratings, or refresh ratings.yaml
   baton grade <run-id> <1-5> [notes...]   Grade a run after using its result
-  baton profile import <file> [--name <n>] [--activate] [--yes]
+  baton profile import <file|code|url> [--name <n>] [--activate] [--yes]
   baton profile export [--profile <n>] [--out <file>]
+  baton profile share [--profile <n>]     Publish to the sharing site; prints code and link
+  baton profile shares | profile unshare <code>
+  baton login | logout                    Sign in to the sharing site with GitHub
   baton set <key> <value>                 ${validKeys()}
   baton install [host...] [--user] [--dir <dir>] [--no-eval]
                                           No host: every host CLI on PATH. --user: global configs

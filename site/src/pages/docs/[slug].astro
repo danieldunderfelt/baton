@@ -1,0 +1,166 @@
+---
+import { getCollection, render } from "astro:content";
+
+import Base from "../../layouts/Base.astro";
+
+export async function getStaticPaths() {
+  const docs = await getCollection("docs");
+  return docs.map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const all = (await getCollection("docs")).sort((a, b) => a.data.order - b.data.order);
+const index = all.findIndex((d) => d.id === entry.id);
+const prev = index > 0 ? all[index - 1] : null;
+const next = index < all.length - 1 ? all[index + 1] : null;
+---
+
+<Base title={entry.data.title} description={entry.data.description}>
+  <div class="container docs">
+    <aside class="sidebar">
+      <p class="eyebrow">Docs</p>
+      <nav aria-label="Documentation">
+        <ol>
+          {
+            all.map((d) => (
+              <li>
+                <a href={`/docs/${d.id}`} aria-current={d.id === entry.id ? "page" : undefined}>
+                  {d.data.title}
+                </a>
+              </li>
+            ))
+          }
+        </ol>
+      </nav>
+    </aside>
+    <article>
+      <header class="doc-head">
+        <h1>{entry.data.title}</h1>
+        <p class="muted">{entry.data.description}</p>
+      </header>
+      <div class="prose">
+        <Content />
+      </div>
+      <nav class="pager" aria-label="Previous and next">
+        {
+          prev ? (
+            <a href={`/docs/${prev.id}`} class="pager-link">
+              <span class="faint">Previous</span>
+              <span>{prev.data.title}</span>
+            </a>
+          ) : (
+            <span />
+          )
+        }
+        {
+          next && (
+            <a href={`/docs/${next.id}`} class="pager-link next">
+              <span class="faint">Next</span>
+              <span>{next.data.title}</span>
+            </a>
+          )
+        }
+      </nav>
+    </article>
+  </div>
+</Base>
+
+<style>
+  .docs {
+    display: grid;
+    grid-template-columns: 14rem minmax(0, 1fr);
+    gap: 4rem;
+    padding: 3rem 0 5rem;
+  }
+  .sidebar {
+    position: sticky;
+    top: 5rem;
+    align-self: start;
+  }
+  .sidebar ol {
+    list-style: none;
+    margin: 0.75rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    border-left: 1px solid var(--line);
+  }
+  .sidebar a {
+    display: block;
+    padding: 0.35rem 0.85rem;
+    margin-left: -1px;
+    border-left: 1px solid transparent;
+    font-size: 0.9375rem;
+    color: var(--fg-muted);
+  }
+  .sidebar a:hover {
+    color: var(--fg);
+  }
+  .sidebar a[aria-current="page"] {
+    color: var(--fg);
+    font-weight: 500;
+    border-left-color: var(--accent);
+  }
+  .doc-head {
+    margin-bottom: 2rem;
+  }
+  .doc-head h1 {
+    font-size: 2.125rem;
+    letter-spacing: -0.025em;
+  }
+  .doc-head p {
+    margin-top: 0.6rem;
+    font-size: 1.0625rem;
+    max-width: var(--measure);
+  }
+  .pager {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 3.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--line);
+    max-width: var(--measure);
+  }
+  .pager-link {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    font-size: 0.9375rem;
+    font-weight: 500;
+  }
+  .pager-link .faint {
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+  .next {
+    text-align: right;
+  }
+  @media (max-width: 52rem) {
+    .docs {
+      grid-template-columns: 1fr;
+      gap: 2rem;
+    }
+    .sidebar {
+      position: static;
+    }
+    .sidebar ol {
+      flex-direction: row;
+      flex-wrap: wrap;
+      border-left: none;
+      gap: 0.25rem;
+    }
+    .sidebar a {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0.3rem 0.7rem;
+      margin: 0;
+      font-size: 0.875rem;
+    }
+    .sidebar a[aria-current="page"] {
+      border-color: var(--accent);
+    }
+  }
+</style>

@@ -1,0 +1,136 @@
+---
+import Base from "../layouts/Base.astro";
+import { crossSite, currentUser, isSameOrigin } from "../lib/auth.ts";
+import { normalizeUserCode } from "../lib/codes.ts";
+import { approveDevice, pendingDevice } from "../lib/db.ts";
+import { appEnv } from "../lib/env.ts";
+
+export const prerender = false;
+
+const env = appEnv();
+const user = await currentUser(env, Astro.cookies);
+
+let typed = Astro.url.searchParams.get("code") ?? "";
+let error: string | null = null;
+let approved = false;
+
+if (Astro.request.method === "POST") {
+  if (!user) return Astro.redirect(`/api/auth/github?next=${encodeURIComponent("/device")}`, 302);
+  if (!isSameOrigin(Astro.request)) return crossSite();
+  const form = await Astro.request.formData();
+  typed = String(form.get("code") ?? "");
+  const code = normalizeUserCode(typed);
+  if (!code) {
+    error = "That does not look like a sign-in code. It has eight letters and digits, like ABCD-EFGH.";
+  } else if (await approveDevice(env.DB, code, user.id)) {
+    approved = true;
+  } else {
+    error = "That code is unknown, expired, or already used. Run 'baton login' again for a fresh one.";
+  }
+}
+
+const code = normalizeUserCode(typed);
+const pending = !approved && user && code ? await pendingDevice(env.DB, code) : null;
+const next = `/device${code ? `?code=${code}` : ""}`;
+---
+
+<Base title="Sign in the Baton CLI" login={user?.login} noindex>
+  <div class="container device">
+    <div class="card stack">
+      {
+        approved ? (
+          <>
+            <p class="eyebrow ok">Done</p>
+            <h1>The CLI is signed in as @{user!.login}.</h1>
+            <p class="muted">You can close this tab. The terminal that ran <code>baton login</code> picks it up on its next poll.</p>
+            <p class="small">
+              <a href="/account">Your shared profiles</a>
+            </p>
+          </>
+        ) : !user ? (
+          <>
+            <p class="eyebrow">Sign in the Baton CLI</p>
+            <h1>First, sign in here with GitHub.</h1>
+            <p class="muted">
+              Then confirm the code your terminal printed. GitHub is used for identity only: the site asks for no
+              scopes and sees your public login and avatar, nothing else.
+            </p>
+            <a class="btn btn-primary self" href={`/api/auth/github?next=${encodeURIComponent(next)}`}>
+              Continue with GitHub
+            </a>
+          </>
+        ) : (
+          <>
+            <p class="eyebrow">Sign in the Baton CLI</p>
+            <h1>Confirm the code from your terminal.</h1>
+            {pending ? (
+              <p class="muted">
+                A CLI on <strong>{pending.label}</strong> is waiting. Approving it lets that machine publish and
+                revoke shared profiles as <strong>@{user.login}</strong>, until you sign it out.
+              </p>
+            ) : (
+              <p class="muted">
+                Type the code <code>baton login</code> printed. Approving it lets that machine publish and revoke
+                shared profiles as <strong>@{user.login}</strong>.
+              </p>
+            )}
+            {error && <p class="error">{error}</p>}
+            <form method="post" class="row" action="/device">
+              <input
+                class="input code"
+                name="code"
+                value={code ?? typed}
+                placeholder="ABCD-EFGH"
+                autocomplete="off"
+                autocapitalize="characters"
+                spellcheck="false"
+                required
+                aria-label="Sign-in code"
+              />
+              <button class="btn btn-primary" type="submit">Authorize</button>
+            </form>
+            <p class="small muted">Not you, or not expecting this? Close the tab; the code expires on its own.</p>
+          </>
+        )
+      }
+    </div>
+  </div>
+</Base>
+
+<style>
+  .device {
+    padding: 4rem 0 6rem;
+    max-width: 34rem;
+  }
+  .device .card {
+    padding: 2rem;
+    --gap: 0.9rem;
+  }
+  h1 {
+    font-size: 1.5rem;
+  }
+  .ok {
+    color: var(--ok);
+  }
+  .self {
+    align-self: flex-start;
+  }
+  .code {
+    font-family: var(--font-mono);
+    font-size: 1.125rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    width: 11rem;
+  }
+  .error {
+    color: #c0392b;
+    font-size: 0.9375rem;
+  }
+  .small {
+    font-size: 0.8125rem;
+  }
+  .small a {
+    color: var(--accent-ink);
+    text-decoration: underline;
+  }
+</style>

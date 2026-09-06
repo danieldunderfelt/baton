@@ -89,6 +89,17 @@ Baton routes on evidence and keeps the kinds of evidence separate:
 
 `baton ratings` prints the current table. `ratings.yaml` in the config directory is the same thing as a file, regenerated on every change; it is display-only and Baton never reads it back. `baton profile export` emits a shareable file containing only model opinions, never your prompts, accounts, or machine details.
 
+To hand a profile to someone without passing files around, share it through the Baton site:
+
+```sh
+baton profile share                    # signs in with GitHub the first time
+# Shared profile 'mine' (12 priors) as @you.
+#   Link:   https://baton.sh/p/k7mq3-v2xrd
+#   Import: baton profile import k7mq3-v2xrd
+```
+
+`baton profile import <code-or-link>` on another machine shows the diff and writes nothing until `--yes`; the priors land in a local profile named `<login>/<name>` so they cannot collide with your own. Sharing the same profile again refreshes the same link. `baton profile shares` and `baton profile unshare <code>` manage them; `baton login` / `baton logout` manage the token, which lives in the scope's config dir. Nothing is browseable on the site: a share is reachable only by its code, and only the profile document itself (canonical model priors) is uploaded.
+
 ## Load balancing
 
 If you have two subscriptions for the same app, Baton can treat them as one bigger one. This works for any app whose account follows an environment variable: Claude Code (`CLAUDE_CONFIG_DIR`), Codex (`CODEX_HOME`), and Kimi Code (`KIMI_CODE_HOME`). Log the second account in once, tell Baton about it, and pool them:
@@ -164,3 +175,5 @@ bun run build
 ```
 
 PLAN.md is the design document, including the review log of every design decision and external code review. Server: `baton mcp` (stdio) or `baton serve --http --port 7317` (one daemon per environment).
+
+The website and the profile-sharing service live in `site/` (Astro on Cloudflare Workers with D1); see `site/README.md` for running it locally and deploying. `BATON_SITE_URL` points the CLI at a local or self-hosted instance.

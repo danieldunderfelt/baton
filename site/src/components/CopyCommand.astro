@@ -1,0 +1,39 @@
+---
+/** A shell command with a copy button. Works without JS; copies with it. */
+interface Props {
+  command: string;
+  label?: string;
+}
+const { command, label = "Copy" } = Astro.props;
+---
+
+<div class="cmd">
+  <pre><code>{command}</code></pre>
+  <button type="button" data-copy={command} aria-label={`Copy: ${command}`}>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="9" y="9" width="13" height="13" rx="2"></rect>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+    </svg>
+    <span>{label}</span>
+  </button>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>("button[data-copy]").forEach((button) => {
+    const label = button.querySelector("span");
+    const original = label?.textContent ?? "Copy";
+    button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy ?? "");
+        button.dataset.copied = "";
+        if (label) label.textContent = "Copied";
+        setTimeout(() => {
+          delete button.dataset.copied;
+          if (label) label.textContent = original;
+        }, 1600);
+      } catch {
+        // Clipboard blocked: the text is right there to select.
+      }
+    });
+  });
+</script>

@@ -1,0 +1,176 @@
+---
+import CopyCommand from "../../components/CopyCommand.astro";
+import Base from "../../layouts/Base.astro";
+import { currentUser } from "../../lib/auth.ts";
+import { normalizeShareCode } from "../../lib/codes.ts";
+import { profileByCode } from "../../lib/db.ts";
+import { appEnv } from "../../lib/env.ts";
+
+export const prerender = false;
+
+const env = appEnv();
+const code = normalizeShareCode(Astro.params.code ?? "");
+const share = code ? await profileByCode(env.DB, code) : null;
+if (!share) {
+  return new Response(null, { status: 404 });
+}
+const user = await currentUser(env, Astro.cookies);
+const entries = [...share.profile.entries].sort(
+  (a, b) => b.mean - a.mean || a.model.localeCompare(b.model) || a.category.localeCompare(b.category),
+);
+const day = (iso: string) => iso.slice(0, 10);
+const fixed = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""));
+const isOwner = user?.login === share.owner.login;
+---
+
+<Base
+  title={`${share.name} · shared by @${share.owner.login}`}
+  description={`A Baton profile with ${share.entry_count} model priors, shared by @${share.owner.login}.`}
+  login={user?.login}
+  noindex
+>
+  <div class="container share">
+    <header class="share-head">
+      <p class="eyebrow">Shared profile</p>
+      <h1>{share.name}</h1>
+      <p class="byline row">
+        {share.owner.avatar_url && <img src={share.owner.avatar_url} alt="" width="22" height="22" />}
+        <span>
+          shared by <a href={`https://github.com/${share.owner.login}`} rel="noopener">@{share.owner.login}</a>
+        </span>
+        <span class="faint">·</span>
+        <span class="muted">updated {day(share.updated_at)}</span>
+        <span class="faint">·</span>
+        <span class="muted">{share.entry_count} {share.entry_count === 1 ? "prior" : "priors"}</span>
+        {isOwner && <a href="/account" class="pill">yours</a>}
+      </p>
+    </header>
+
+    <div class="share-body">
+      <section class="try card">
+        <h2>Try it</h2>
+        <p class="muted">
+          Prints what would change in your ratings and writes nothing. Re-run with <code>--yes</code> to
+          import it as the local profile <code>{share.owner.login}/{share.name}</code>, and <code>--activate</code> to route on it.
+        </p>
+        <CopyCommand command={`baton profile import ${share.code}`} />
+        <p class="small muted">
+          Share code <code>{share.code}</code>. <a href={`/p/${share.code}.yaml`}>Download as YAML</a> for <code>baton profile import &lt;file&gt;</code>. No Baton yet? <a href="/">Install it</a>.
+        </p>
+      </section>
+
+      <section class="priors">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Category</th>
+              <th class="num">Mean</th>
+              <th class="num">Weight</th>
+              <th>As of</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              entries.map((e) => (
+                <tr>
+                  <td>
+                    <code>{e.model}</code>
+                  </td>
+                  <td class="muted">{e.category || <span class="faint">any</span>}</td>
+                  <td class="num">
+                    <span class="bar" style={`--v: ${((e.mean - 1) / 4) * 100}%`} aria-hidden="true" />
+                    {fixed(e.mean)}
+                  </td>
+                  <td class="num">{fixed(e.weight)}</td>
+                  <td class="muted">{day(e.as_of)}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+        <p class="small muted">
+          Mean is an opinion on the 1–5 grade scale; weight is how many observations it counts for, capped
+          so it can never outrank what you see yourself. <a href="/docs/ratings">How ratings work</a>
+        </p>
+      </section>
+    </div>
+  </div>
+</Base>
+
+<style>
+  .share {
+    padding: 3rem 0 5rem;
+    max-width: 56rem;
+  }
+  .share-head h1 {
+    font-size: 2.25rem;
+    letter-spacing: -0.025em;
+    margin-top: 0.5rem;
+    font-family: var(--font-mono);
+    font-weight: 600;
+  }
+  .byline {
+    margin-top: 0.75rem;
+    --gap: 0.5rem;
+    font-size: 0.9375rem;
+  }
+  .byline img {
+    border-radius: 50%;
+  }
+  .byline a {
+    font-weight: 500;
+  }
+  .share-body {
+    margin-top: 2rem;
+    display: grid;
+    gap: 1.5rem;
+  }
+  .try {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  .try h2 {
+    font-size: 1.125rem;
+  }
+  .try p {
+    font-size: 0.9375rem;
+  }
+  .small {
+    font-size: 0.8125rem;
+  }
+  .small a {
+    color: var(--accent-ink);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+  }
+  .priors .table {
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .priors .small {
+    margin-top: 0.75rem;
+  }
+  .bar {
+    display: inline-block;
+    width: 3.5rem;
+    height: 5px;
+    margin-right: 0.6rem;
+    border-radius: 3px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line);
+    position: relative;
+    vertical-align: middle;
+  }
+  .bar::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: var(--v);
+    background: var(--accent);
+    border-radius: 3px;
+  }
+</style>

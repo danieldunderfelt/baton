@@ -1,0 +1,5 @@
+# Copy to .dev.vars for local development. Create a GitHub OAuth app at
+# https://github.com/settings/developers with the callback URL
+# http://localhost:4321/api/auth/github/callback
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=

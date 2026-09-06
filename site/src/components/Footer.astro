@@ -1,0 +1,37 @@
+---
+import Logo from "./Logo.astro";
+---
+
+<footer class="site-footer">
+  <div class="container row">
+    <span class="row brand faint">
+      <Logo size={16} />
+      Baton
+    </span>
+    <nav class="row links" aria-label="Footer">
+      <a href="/docs">Docs</a>
+      <a href="/docs/sharing">Sharing</a>
+      <a href="https://github.com/danieldunderfelt/baton" rel="noopener">GitHub</a>
+      <a href="https://github.com/danieldunderfelt/baton/releases" rel="noopener">Releases</a>
+    </nav>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px solid var(--line);
+    padding: 1.75rem 0;
+    font-size: 0.875rem;
+    color: var(--fg-muted);
+  }
+  .site-footer .container {
+    justify-content: space-between;
+  }
+  .brand {
+    --gap: 0.45rem;
+    font-weight: 600;
+  }
+  .links {
+    --gap: 1.25rem;
+  }
+</style>

@@ -1,0 +1,29 @@
+{
+  "name": "baton-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "wrangler dev",
+    "check": "astro check",
+    "test": "bun test",
+    "db:migrate:local": "wrangler d1 migrations apply baton --local",
+    "db:migrate:remote": "wrangler d1 migrations apply baton --remote",
+    "deploy": "astro build && wrangler deploy"
+  },
+  "dependencies": {
+    "@astrojs/cloudflare": "^14.3.0",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "astro": "^7.3.1"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@cloudflare/workers-types": "latest",
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.129.0"
+  }
+}

@@ -1,0 +1,43 @@
+---
+import "../styles/global.css";
+import Footer from "../components/Footer.astro";
+import Header from "../components/Header.astro";
+
+interface Props {
+  title: string;
+  description?: string;
+  /** GitHub login of the signed-in user, when the page looked it up. */
+  login?: string | null;
+  /** Search engines have no business indexing shares or account pages. */
+  noindex?: boolean;
+}
+const {
+  title,
+  description = "Baton lets the coding agent you are talking to hand work to a model running in a different agent app on the same machine, on that app's own subscription.",
+  login = null,
+  noindex = false,
+} = Astro.props;
+const fullTitle = title === "Baton" ? "Baton" : `${title} · Baton`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    {noindex && <meta name="robots" content="noindex" />}
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <Header login={login} />
+    <main>
+      <slot />
+    </main>
+    <Footer />
+  </body>
+</html>
