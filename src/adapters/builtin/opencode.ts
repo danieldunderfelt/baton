@@ -76,7 +76,6 @@ export const opencodeAdapter: AdapterSpec = {
   },
   autonomyFlags: { full: ["--auto"] },
   defaultAutonomy: "full",
-  defaultTimeoutMs: 300_000,
   // The zen free models need no local credentials, so no auth failure could be
   // reproduced. What was observed live is the APIError envelope of an upstream
   // 503 — a pre-work rejection, which is exactly what cooldown-and-failover is

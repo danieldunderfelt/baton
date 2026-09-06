@@ -83,7 +83,6 @@ export const cursorAdapter: AdapterSpec = {
     full: ["--force"],
   },
   defaultAutonomy: "full",
-  defaultTimeoutMs: 300_000,
   // Both reproduced live, both plain text on stderr, both structurally
   // startup-only — cursor-agent checks credentials before it opens the stream:
   //   CURSOR_API_KEY rejected  -> "Warning: The provided API key is invalid."

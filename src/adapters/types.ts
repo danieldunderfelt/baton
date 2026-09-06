@@ -132,7 +132,12 @@ export interface AdapterSpec {
    */
   resume?: { argv: string[] };
   defaultAutonomy: Autonomy;
-  defaultTimeoutMs: number;
+  /**
+   * Kill the callee after this long. Absent (every built-in) = no deadline:
+   * Baton never gets in the way of a long run. A caller who wants a bound
+   * sets options.timeoutMs on the run.
+   */
+  defaultTimeoutMs?: number;
   /**
    * Case-insensitive substrings identifying an ADMISSION failure
    * (rate limit / auth rejection before work starts) in stderr/stdout —
@@ -186,7 +191,8 @@ export interface ExecRequest {
   /** Full callee environment (inherited + overlay + BATON_HOPS), pre-composed. */
   env: Record<string, string | undefined>;
   autonomy: Autonomy;
-  timeoutMs: number;
+  /** Absent = no deadline; the callee runs until it exits or is cancelled. */
+  timeoutMs?: number;
   /** Max bytes of raw output retained (default supplied by executor). */
   maxOutputBytes?: number;
   /**

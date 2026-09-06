@@ -157,7 +157,11 @@ export const adapterSpecSchema = z.strictObject({
         "Omit unless you verified a non-interactive resume — Baton refuses to resume rather than guess.",
     ),
   defaultAutonomy: z.enum(AUTONOMY_ORDER),
-  defaultTimeoutMs: z.int().positive().max(3_600_000),
+  defaultTimeoutMs: z
+    .int()
+    .positive()
+    .optional()
+    .describe("Omit: Baton sets no deadline of its own, so a long run is never cut short."),
   admissionFailurePatterns: z
     .array(argvElement)
     .describe(
@@ -551,7 +555,7 @@ export function formatReview(review: DiscoveredReview): string {
     ...(review.acceptsSlugs ? [`accepts:    ${review.acceptsSlugs.join(", ")}`] : []),
     `admission:  ${JSON.stringify(review.admissionFailurePatterns)}`,
     `work-start: ${JSON.stringify(review.workStartedPatterns)}`,
-    `timeout:    ${spec.defaultTimeoutMs} ms`,
+    `timeout:    ${spec.defaultTimeoutMs === undefined ? "none" : `${spec.defaultTimeoutMs} ms`}`,
     `submitted:  ${record.submittedAt}`,
   );
   if (record.binaryVersion) lines.push(`version:    ${record.binaryVersion}`);

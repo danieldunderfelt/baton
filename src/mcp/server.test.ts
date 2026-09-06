@@ -107,6 +107,21 @@ sleep 30
   return { bin, pidfile };
 }
 
+/** A throwaway `kimi` that takes its time and then answers like the real one. */
+function slowKimi(delaySeconds: number): string {
+  const bin = mkdtempSync(join(tmpdir(), "baton-mcp-bin-"));
+  writeFileSync(
+    join(bin, "kimi"),
+    `#!/bin/sh
+case "$1" in --version) echo "kimi 9.9.9"; exit 0;; provider) exit 1;; esac
+sleep ${delaySeconds}
+echo '{"role":"assistant","content":"took a while"}'
+`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
 async function poll<T>(what: string, budgetMs: number, probe: () => T | undefined): Promise<T> {
   const deadline = Date.now() + budgetMs;
   for (;;) {
@@ -323,6 +338,27 @@ describe("get_run", () => {
     expect(isError).toBe(true);
     expect(text).toContain("run_id");
   });
+
+  test("wait:true keeps waiting on a run that has no deadline of its own", async () => {
+    const host = await connect("0", { PATH: `${slowKimi(2)}:${process.env.PATH ?? ""}` });
+    try {
+      const started = await callJson(host.client, "run_model", {
+        model: "kimi-k3",
+        prompt: "take your time",
+        wait: false,
+      });
+      expect(started.status).toBe("running");
+      // The payload itself says this is not a time limit, so a caller cannot
+      // read 'running' as one.
+      expect(String(started.note)).toContain("no time limit");
+
+      const view = await callJson(host.client, "get_run", { run_id: started.run_id, wait: true });
+      expect(view.status).toBe("succeeded");
+      expect(view.output).toBe("took a while");
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
 });
 
 describe("run_model", () => {

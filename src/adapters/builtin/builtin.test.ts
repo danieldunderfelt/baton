@@ -67,7 +67,7 @@ describe.each(builtinAdapters.map((spec) => [spec.app, spec] as const))("%s spec
     expect(spec.adapterVersion).toBe(1);
     if (NO_IDENTITY_ENV.has(spec.app)) expect(spec.identityEnv).toBeUndefined();
     else expect(spec.identityEnv).toMatch(/^[A-Z][A-Z0-9_]*$/);
-    expect(spec.defaultTimeoutMs).toBe(300_000);
+    expect(spec.defaultTimeoutMs).toBeUndefined();
   });
 
   test("binary is a bare executable name, resolved elsewhere", () => {

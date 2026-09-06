@@ -77,7 +77,7 @@ Safety rails that apply to every run:
 - Delegation depth is capped (two hops by default), so agents cannot recurse into each other forever.
 - A per-app autonomy ceiling (`baton set max_autonomy:codex readonly`) limits what delegated agents may do. Callers can request less autonomy than the ceiling, never more.
 - Retries are safe: `run_model` takes an `idempotency_key`, and the same key with the same request returns the existing run instead of paying for a second one.
-- Timeouts kill the callee's whole process tree, and Baton verifies the processes are actually dead before recording the result.
+- Runs have no time limit. Baton never cuts a long run short; a caller who wants a deadline sets `--timeout` or `options.timeoutMs`, and only then does a timeout kill the callee's whole process tree, with Baton verifying the processes are actually dead before recording the result.
 
 ## Ratings
 

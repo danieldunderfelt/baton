@@ -45,11 +45,15 @@ import type { RunOptions, RunRequest, RunView } from "../supervisor/types.ts";
 const NAME = "baton";
 const VERSION = "0.1.0";
 
-/** Ceiling on how long one `wait: true` call may block, whatever the adapter allows. */
+/**
+ * Ceiling on how long one blocking tool call may hold the host, whatever the
+ * run is doing. It bounds the *call*, never the run: a run has no deadline
+ * unless the caller set one, and a call that returns 'running' is re-waited
+ * with get_run wait:true.
+ */
 const MAX_WAIT_MS = 600_000;
-/** Slack so the wait outlives the callee's own timeout and reports the timeout status. */
+/** Slack so the wait outlives a caller-set timeout and reports the timeout status. */
 const WAIT_MARGIN_MS = 5_000;
-const FALLBACK_TIMEOUT_MS = 300_000;
 /**
  * Caller-side cache hint only — Baton caches nothing, every call re-reads PATH.
  * It says how long the answer is worth reusing, not how stale it may be served.
@@ -219,11 +223,12 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       title: "Delegate a task to another model",
       description:
         "Hand a prompt to a model running in another agent CLI on this machine, using that app's own subscription. Always returns a run_id handle. " +
-        "wait (default true) blocks until the run finishes and inlines output; if the budget runs out you get status 'running' and poll get_run with the run_id. " +
+        "A run has no time limit: the callee works until it finishes, however long that takes. " +
+        "wait (default true) blocks until the run finishes and inlines output. One call blocks for at most ten minutes; a status of 'running' means only that this call's wait is over, not that anything timed out — call get_run with wait:true to keep waiting. " +
         "wait:false returns as soon as the run is launched — that plus get_run is the polling path for long tasks, and the polite way to keep several delegations in flight without holding a call open. " +
         "idempotency_key is retry-safe and payload-bound: the same key with the same request returns the existing run (deduplicated:true) instead of launching a second one, so a transport retry cannot double-spend quota; the same key with a changed prompt, cwd or options is an error, so use a NEW key for anything you actually changed. " +
         "cwd defaults to this host's working directory; pointing the delegated agent at another checkout is allowed and deliberate — note that concurrent delegates mutating the same checkout can conflict. " +
-        "options.autonomy narrows what the callee may do (readonly | edits | full); it can only narrow the user's per-app ceiling, never raise it. options.timeoutMs bounds the callee. " +
+        "options.autonomy narrows what the callee may do (readonly | edits | full); it can only narrow the user's per-app ceiling, never raise it. options.timeoutMs is the only deadline a run can have, and only if you set it. " +
         "Errors (unknown model, no installed app for it, a route the user has blocked, delegation-depth refusal) come back as tool errors, not as a failed run; a block names itself in the message and is not something to route around — pick another model. " +
         "So does hitting this scope's concurrency cap ('max_concurrent'): that one means too many attempts are already running, so let one finish instead of retrying in a loop — launch with wait:false and poll get_run rather than holding calls open.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -249,7 +254,9 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         wait: z
           .boolean()
           .default(true)
-          .describe("Block until the run settles (bounded). false returns the run_id immediately."),
+          .describe(
+            "Block until the run settles, for at most ten minutes per call. false returns the run_id immediately.",
+          ),
         category: z
           .string()
           .optional()
@@ -264,7 +271,9 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
               .int()
               .positive()
               .optional()
-              .describe("Kill the callee after this long. Defaults to the adapter's own timeout."),
+              .describe(
+                "Kill the callee after this long. Off by default: leave it unset and the run has no deadline.",
+              ),
           })
           .optional(),
         idempotency_key: z
@@ -301,17 +310,25 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Full state of a run started by run_model: status (queued | running | succeeded | failed | timeout | cancelled | orphaned), the extracted output once it succeeded, the error otherwise, and the per-attempt detail. " +
         "attempts is the failover chain: an instance that refuses admission (rate limit or auth, before the callee started work) hands the run to the next instance in its pool under the same run_id, so several attempts can appear and the last one is the answer. " +
         "A side of an unjudged duel answers with blind:true and its duel_id instead: status, output and timing only, because model, app, instance and the attempt targets are exactly what report_duel is withholding. Report the duel and the full detail is there. " +
-        "This is the polling half of wait:false. Handles are scope-local: a run_id only resolves in the scope that minted it.",
+        "This is the polling half of wait:false, and the way to keep waiting on a long run: wait:true blocks for up to ten minutes more and returns as soon as the run settles. A run has no time limit, so a 'running' answer just means call again. " +
+        "Handles are scope-local: a run_id only resolves in the scope that minted it.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: z.object({ run_id: z.string().min(1).describe("Handle returned by run_model.") }),
+      inputSchema: z.object({
+        run_id: z.string().min(1).describe("Handle returned by run_model."),
+        wait: z
+          .boolean()
+          .default(false)
+          .describe("Block until the run settles, for at most ten minutes per call."),
+      }),
     },
-    ({ run_id }) => {
-      const view = supervisor.getRun(run_id);
-      if (!view) {
+    async ({ run_id, wait }) => {
+      const current = supervisor.getRun(run_id);
+      if (!current) {
         throw new Error(
           `No run '${run_id}' in this scope (${paths.configDir}). Check the run_id, or list recent runs with 'baton runs'.`,
         );
       }
+      const view = wait ? await supervisor.waitForRun(run_id, MAX_WAIT_MS) : current;
       const duelId = blindDuelOf(db, run_id);
       return json(duelId === undefined ? view : blindView(view, duelId));
     },
@@ -337,7 +354,9 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         wait: z
           .boolean()
           .default(true)
-          .describe("Block until the new run settles (bounded). false returns its run_id at once."),
+          .describe(
+            "Block until the new run settles, for at most ten minutes per call. false returns its run_id at once.",
+          ),
         options: z
           .object({
             autonomy: z
@@ -348,7 +367,9 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
               .int()
               .positive()
               .optional()
-              .describe("Kill the callee after this long. Defaults to the original run's."),
+              .describe(
+                "Kill the callee after this long. Never longer than the original run's bound; unbounded, like the original, when unset.",
+              ),
           })
           .optional(),
       }),
@@ -463,7 +484,11 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
               .enum(AUTONOMY)
               .optional()
               .describe("Requested authority for both sides. Clamped to each scope ceiling."),
-            timeoutMs: z.int().positive().optional().describe("Kill either callee after this long."),
+            timeoutMs: z
+              .int()
+              .positive()
+              .optional()
+              .describe("Kill either callee after this long. Off by default: no deadline."),
           })
           .optional()
           .describe("Applied identically to both sides — that is what makes the duel fair."),
@@ -726,14 +751,15 @@ function message(err: unknown): string {
 }
 
 /**
- * Never block longer than the callee can run, and never longer than the hard
+ * Never block longer than the callee can run, and never longer than the call
  * ceiling. The adapter is looked up through the registry, not the built-in
- * table: a discovered app's own timeout is as real as a pinned one's.
+ * table: a discovered app's own timeout is as real as a pinned one's. With no
+ * deadline anywhere (the default) the ceiling alone applies.
  */
 function waitBudget(db: Database, view: RunView, options: RunOptions | undefined): number {
   const spec = routableAdapters(db).find((s) => s.app === view.app);
-  const adapterDefault = spec?.defaultTimeoutMs ?? FALLBACK_TIMEOUT_MS;
-  return Math.min(options?.timeoutMs ?? adapterDefault, MAX_WAIT_MS) + WAIT_MARGIN_MS;
+  const deadline = options?.timeoutMs ?? spec?.defaultTimeoutMs ?? MAX_WAIT_MS;
+  return Math.min(deadline, MAX_WAIT_MS) + WAIT_MARGIN_MS;
 }
 
 /**
@@ -774,6 +800,13 @@ function summary(view: RunView): Record<string, unknown> {
     app: view.app,
     instance: view.instance,
     ...(view.deduplicated ? { deduplicated: true } : {}),
+    // Said in the payload, not just the tool description: a caller reading
+    // 'running' after a long wait must not report it as a time limit.
+    ...(IN_FLIGHT.has(view.status)
+      ? {
+          note: "Still running. The run has no time limit; only this call's wait ended. Call get_run with wait:true to keep waiting.",
+        }
+      : {}),
     ...(view.output === undefined ? {} : { output: view.output }),
     ...(view.error === undefined ? {} : { error: view.error }),
   };

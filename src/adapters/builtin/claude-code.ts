@@ -72,7 +72,6 @@ export const claudeCodeAdapter: AdapterSpec = {
     full: ["--permission-mode", "bypassPermissions"],
   },
   defaultAutonomy: "full",
-  defaultTimeoutMs: 300_000,
   // "Not logged in" is the verified admission failure (reproduced by pointing
   // CLAUDE_CONFIG_DIR at an empty dir), and the only one listed. Deliberately
   // excludes:

@@ -75,7 +75,6 @@ export const kimiAdapter: AdapterSpec = {
   },
   autonomyFlags: { full: [] },
   defaultAutonomy: "full",
-  defaultTimeoutMs: 300_000,
   // This CLI cannot distinguish "unknown model" from "no models configured for
   // this identity" — both produce the same string with the slug substituted in.
   // Treating it as an admission failure is the safe read: an instance whose

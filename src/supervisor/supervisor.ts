@@ -143,7 +143,8 @@ interface AttemptCtx {
   /** attempts.target: the execution-target fingerprint incl. resolved autonomy. */
   fingerprint: string;
   autonomy: Autonomy;
-  timeoutMs: number;
+  /** Absent = no deadline: Baton only kills a run it was asked to bound. */
+  timeoutMs?: number;
   /** `<app>:<instance>` keys this run has used; the cap on a failover chain. */
   tried: string[];
   /** Set on a resumed run: the handle the adapter's resume argv continues. */
@@ -655,7 +656,7 @@ export class Supervisor {
   private resolve(
     target: Target,
     options: RunOptions | undefined,
-  ): { autonomy: Autonomy; timeoutMs: number; fingerprint: string } {
+  ): { autonomy: Autonomy; timeoutMs?: number; fingerprint: string } {
     const autonomy = clampAutonomy(
       options?.autonomy,
       ceilingFor(this.db, target.spec.app),
@@ -1068,9 +1069,14 @@ function narrowed(
 ): RunOptions {
   const originAutonomy = origin.autonomy ?? spec.defaultAutonomy;
   const originTimeoutMs = origin.timeoutMs ?? spec.defaultTimeoutMs;
+  const requestedTimeoutMs = requested?.timeoutMs ?? originTimeoutMs;
   return {
     autonomy: narrower(requested?.autonomy ?? originAutonomy, originAutonomy),
-    timeoutMs: Math.min(requested?.timeoutMs ?? originTimeoutMs, originTimeoutMs),
+    // An unbounded origin may be bounded on resume; a bounded one is never widened.
+    timeoutMs:
+      originTimeoutMs === undefined || requestedTimeoutMs === undefined
+        ? requestedTimeoutMs
+        : Math.min(requestedTimeoutMs, originTimeoutMs),
   };
 }
 

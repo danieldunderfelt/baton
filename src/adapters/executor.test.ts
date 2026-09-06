@@ -34,6 +34,8 @@ interface Opts {
   workStarted?: string[];
   env?: Record<string, string>;
   timeoutMs?: number;
+  /** Send no deadline at all, the production default. */
+  unbounded?: boolean;
   maxOutputBytes?: number;
   binary?: string;
   binaryPath?: string;
@@ -65,7 +67,7 @@ function request(o: Opts): ExecRequest {
     cwd: import.meta.dir,
     env: { ...process.env, BATON_FAKE_MODE: o.mode, ...o.env },
     autonomy: o.autonomy ?? "full",
-    timeoutMs: o.timeoutMs ?? 10_000,
+    ...(o.unbounded ? {} : { timeoutMs: o.timeoutMs ?? 10_000 }),
     maxOutputBytes: o.maxOutputBytes,
     ...(o.onSpawn ? { onSpawn: o.onSpawn } : {}),
   };
@@ -287,6 +289,16 @@ describe("prompt delivery", () => {
 });
 
 describe("failure modes", () => {
+  test("no deadline means no timer: the callee runs until it exits", async () => {
+    // setTimeout(fn, undefined) would fire at once; the timer must not be armed.
+    const res = await executeAdapter(
+      request({ mode: "sleep", unbounded: true, env: { BATON_FAKE_SLEEP_MS: "1200" } }),
+    );
+    expect(res.timedOut).toBe(false);
+    expect(res.exitCode).toBe(0);
+    expect(res.durationMs).toBeGreaterThanOrEqual(1_000);
+  }, 10_000);
+
   test("timeout kills the whole process group", async () => {
     const res = await executeAdapter(
       request({ mode: "grandchild", timeoutMs: 600, env: { BATON_FAKE_SLEEP_MS: "30000" } }),

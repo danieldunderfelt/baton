@@ -88,7 +88,6 @@ export const codexAdapter: AdapterSpec = {
     full: ["--dangerously-bypass-approvals-and-sandbox"],
   },
   defaultAutonomy: "full",
-  defaultTimeoutMs: 300_000,
   // Auth rejection before the turn starts: 401 on both the wss:// and https://
   // transports, retried 5x each. Deliberately excludes "turn.failed" (emitted
   // for any failure, including a bad model slug) so pool cooldown stays

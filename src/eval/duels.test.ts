@@ -88,7 +88,7 @@ interface Harness {
   db: Database;
   supervisor: Supervisor;
   /** Every ExecRequest the supervisor issued, so identical-payload is checkable. */
-  calls: { slug: string; prompt: string; cwd: string; timeoutMs: number }[];
+  calls: { slug: string; prompt: string; cwd: string; timeoutMs: number | undefined }[];
 }
 
 function harness(

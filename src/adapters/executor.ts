@@ -75,22 +75,26 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
      * that ignores SIGTERM must be dead before we report the run finished). */
     let termination: Promise<KillOutcome> | undefined;
 
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      const pid = child.pid;
-      if (pid === undefined) return;
-      termination = killProcessGroup(pid, {
-        fallback: (signal) => {
-          try {
-            child.kill(signal);
-          } catch {
-            // Already gone.
-          }
-        },
-      });
-      // The group may outlive its stdio pipes; don't wait on "close" forever.
-      void termination.then(() => finish(null));
-    }, req.timeoutMs);
+    // No deadline unless one was asked for: a long run is the callee's business.
+    const timeoutTimer =
+      req.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            const pid = child.pid;
+            if (pid === undefined) return;
+            termination = killProcessGroup(pid, {
+              fallback: (signal) => {
+                try {
+                  child.kill(signal);
+                } catch {
+                  // Already gone.
+                }
+              },
+            });
+            // The group may outlive its stdio pipes; don't wait on "close" forever.
+            void termination.then(() => finish(null));
+          }, req.timeoutMs);
 
     const finish = (exitCode: number | null): void => {
       if (settled) return;
