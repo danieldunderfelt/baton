@@ -1,6 +1,6 @@
 /**
- * Quota-aware cost (PLAN.md §Quota-aware cost) and instance pools
- * (PLAN.md §Instance pools). Subscriptions are flat-rate: the constraint is
+ * Quota-aware cost and instance pools. Subscriptions are flat-rate: the
+ * constraint is
  * quota-window headroom, not invented per-route cost numbers.
  */
 

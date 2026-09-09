@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,6 +54,35 @@ describe("checkoutRoot", () => {
 });
 
 describe("selfUpdate from a release", () => {
+  test("does not downgrade a checkout build installed ahead of the latest release", async () => {
+    const releases = fakeReleases("v0.0.1", {});
+    const execPath = join(mkdtempSync(join(tmpdir(), "baton-update-older-")), "baton");
+    writeFileSync(execPath, "newer build");
+    try {
+      const result = await selfUpdate({ execPath, releasesUrl: releases.url, target: TARGET });
+      expect(result.changed).toBe(false);
+      expect(readFileSync(execPath, "utf8")).toBe("newer build");
+    } finally {
+      releases.stop();
+    }
+  });
+
+  test("updates the target of a symlink without replacing the link", async () => {
+    const binary = "#!/bin/sh\necho new\n";
+    const releases = fakeReleases("v99.0.0", { [TARGET]: binary, SHA256SUMS: `${sha256(binary)}  ${TARGET}\n` });
+    const dir = mkdtempSync(join(tmpdir(), "baton-update-link-"));
+    const target = join(dir, "real-baton");
+    const link = join(dir, "baton");
+    writeFileSync(target, "old");
+    symlinkSync(target, link);
+    try {
+      await selfUpdate({ execPath: link, releasesUrl: releases.url, target: TARGET });
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readFileSync(target, "utf8")).toBe(binary);
+    } finally {
+      releases.stop();
+    }
+  });
   test("replaces the binary with the verified artifact of a newer tag", async () => {
     const binary = "#!/bin/sh\necho new\n";
     const releases = fakeReleases("v99.0.0", {

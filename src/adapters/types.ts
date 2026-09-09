@@ -1,8 +1,8 @@
 /**
- * The declarative adapter format (PLAN.md §Agentic discovery — same format
- * for built-ins). Safe by construction: argv arrays never shell strings,
+ * The declarative adapter format is shared by built-in and discovered adapters.
+ * It is safe by construction: argv arrays never shell strings,
  * prompt via stdin where possible, bounded declarative output extraction.
- * Built-in adapters are TS constants; discovered adapters (phase 3) are the
+ * Built-in adapters are TS constants; discovered adapters use the
  * same shape stored quarantined in SQLite.
  */
 
@@ -95,6 +95,8 @@ export interface AdapterSpec {
   binary: string;
   /** Env var that relocates this app's identity/config, if any. */
   identityEnv?: string;
+  /** Independent providers use the first component of provider/model slugs. */
+  cooldownScope?: "provider";
   /**
    * Pinned routes: the canonical ids Baton has always used for this app's
    * models (ratings and seeds attach to them), and the fallback roster when
@@ -115,14 +117,14 @@ export interface AdapterSpec {
   /**
    * argv fragments per autonomy level. Missing level = level unsupported, and
    * the executor refuses to run rather than falling back to the app's default
-   * authority (PLAN.md §Execution: options may narrow the ceiling, never raise it).
+   * authority. Options may narrow the ceiling, never raise it.
    */
   autonomyFlags: Partial<Record<Autonomy, string[]>>;
-  /** Where the app's own session/thread id appears in stdout, for resume (phase 2). */
+  /** Where the app's own session/thread id appears in stdout, for resume. */
   sessionRef?: ExtractSpec;
   /**
-   * How to continue a session the app already holds (PLAN.md §Session
-   * affinity). argv AFTER the binary, same substitution rules as `invoke`
+   * How to continue a session the app already holds. argv AFTER the binary,
+   * with the same substitution rules as `invoke`
    * plus `{sessionRef}` — the handle `sessionRef` extracted from the run being
    * resumed, filled in by the supervisor because it is run state, not adapter
    * state. `promptVia` and `extract` are inherited from `invoke`: only the argv
@@ -141,7 +143,7 @@ export interface AdapterSpec {
   /**
    * Case-insensitive substrings identifying an ADMISSION failure
    * (rate limit / auth rejection before work starts) in stderr/stdout —
-   * used for pool cooldown (phase 2) and clearer phase-1 errors.
+   * used for pool cooldown and clearer errors.
    * Only ever consulted together with workStartedPatterns: see classifyFailure.
    */
   admissionFailurePatterns: string[];
@@ -149,7 +151,7 @@ export interface AdapterSpec {
    * Case-insensitive substrings whose presence in the raw output is positive
    * evidence the callee BEGAN WORKING (first stream event, tool call, message
    * part). Failover replays the prompt, so it is reserved for rejections before
-   * any work happened (PLAN.md §Failover on admission failure only); one of
+   * any work happened; one of
    * these markers vetoes the admission reading no matter what else matched.
    * Omitted/empty means "this app gives no such evidence" — which only makes
    * the classification stricter if its admission patterns cannot appear mid-run.
@@ -172,6 +174,8 @@ export interface ExecResult {
   timedOut: boolean;
   /** Bounded tail of raw combined output, for debugging/reliability records. */
   rawTail: string;
+  /** Work-start evidence from the whole stream, retained beyond the raw tail. */
+  workStarted?: boolean;
   error?: string;
   durationMs: number;
   /** App-side session/thread id when the adapter exposes one (resume support). */

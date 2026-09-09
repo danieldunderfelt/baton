@@ -64,14 +64,12 @@ export const codexAdapter: AdapterSpec = {
   // - the PROMPT positional is documented as "if `-` is used, read from stdin"
   //   and, unlike `exec`, does NOT say an absent positional means stdin. `-` is
   //   passed explicitly so the prompt on stdin is certain to be the prompt.
-  // - the subcommand accepts `--dangerously-bypass-approvals-and-sandbox` but
-  //   NOT `-s/--sandbox` or `--approve-for-me`, so only `full` is expressible
-  //   here. A scope whose ceiling is readonly/edits gets a clap error from the
-  //   CLI instead of a run at an authority Baton cannot constrain — loud and
-  //   safe, which is the direction to err in.
+  // - sandbox and approval flags belong to exec, BEFORE the resume subcommand.
+  //   Putting them after resume makes restricted sessions fail argument parsing.
   resume: {
     argv: [
       "exec",
+      "{autonomyFlags}",
       "resume",
       "{sessionRef}",
       "-",
@@ -79,12 +77,11 @@ export const codexAdapter: AdapterSpec = {
       "--skip-git-repo-check",
       "-m",
       "{slug}",
-      "{autonomyFlags}",
     ],
   },
   autonomyFlags: {
     readonly: ["-s", "read-only"],
-    edits: ["-s", "workspace-write", "--approve-for-me"],
+    edits: ["--approve-for-me"],
     full: ["--dangerously-bypass-approvals-and-sandbox"],
   },
   defaultAutonomy: "full",

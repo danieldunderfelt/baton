@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
- * The phase-1 compiled-binary smoke test (PLAN.md §Architecture): a
+ * The compiled-binary smoke test: a
  * `bun build --compile` executable has no source tree, no bun runtime and no
  * cwd it can rely on, so external SQLite, child-process spawning and packaged
  * templates all have to be checked against the real artifact.
@@ -96,7 +96,7 @@ describe.skipIf(!BUILT)("compiled binary", () => {
   });
 
   /**
-   * Phase 2's read surfaces from the real artifact: both open the scope's
+   * The read surfaces from the real artifact both open the scope's
    * database, project ratings into the config dir and read quota state, so they
    * exercise the eval and quota tables through a binary with no source tree.
    */
@@ -130,7 +130,7 @@ describe.skipIf(!BUILT)("compiled binary", () => {
   });
 
   /**
-   * Phase 3's two new read surfaces from the real artifact: both open the
+   * The adapter and duel read surfaces from the real artifact both open the
    * scope's v5 tables (discovered_adapters, duels) through a binary with no
    * source tree, and both must be honest about an empty scope rather than
    * failing on it.

@@ -74,6 +74,16 @@ const codexInstalled = Bun.which("codex") !== null;
 
 /** Fixed selection time, so quota windows and cooldowns are deterministic. */
 const NOW = "2026-08-24T12:00:00.000Z";
+test("OpenCode provider cooldowns do not block unrelated providers", () => {
+  const db = scopeStore("provider-cooldown");
+  const path = fakeBinary("opencode");
+  writeFileSync(path, '#!/bin/sh\ncase "$1" in --version) echo 1;; models) echo github-copilot/model; echo opencode/x-preview-f-free;; esac\n', { mode: 0o755 });
+  recordAdmissionFailure(db, "opencode", "default", NOW, "429", undefined, "github-copilot");
+  withPath(dirname(path), () => {
+    expect(() => selectTarget(db, "github-copilot/model", { nowIso: NOW })).toThrow(/cooling/i);
+    expect(selectTarget(db, "ox-alpha", { nowIso: NOW }).slug).toBe("opencode/x-preview-f-free");
+  });
+});
 const at = (offsetMs: number): string => new Date(Date.parse(NOW) + offsetMs).toISOString();
 
 /** A kimi pool over `members`, each a real instance in this scope. */
@@ -179,8 +189,8 @@ describe("resolveTargets", () => {
 
 /**
  * Discovered adapters are the same format as built-ins, but only an ACTIVE one
- * (reviewed, approved, canaried) is merged into the registry — PLAN.md
- * §Agentic discovery: approval precedes execution, and routing IS execution.
+ * (reviewed, approved, canaried) is merged into the registry. Approval
+ * precedes execution, and routing IS execution.
  */
 describe("discovered adapters in the registry", () => {
   const DISCOVERED_STATUSES = ["quarantined", "approved", "stale", "rejected"] as const;

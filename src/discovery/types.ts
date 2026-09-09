@@ -1,5 +1,5 @@
 /**
- * Agentic discovery (PLAN.md §Agentic discovery). One adapter format, two
+ * Agentic discovery. One adapter format, two
  * provenances, not equal trust: built-ins are pinned and tested; discovered
  * specs enter QUARANTINED and Baton executes nothing from them until a human
  * approves the exact executable, argv, and env names in the trusted CLI —

@@ -1,6 +1,6 @@
 /**
- * The shareable profile document (PLAN.md §Layering and sharing), as pure
- * data: parse, validate, render. No store, no filesystem, no Bun APIs, so the
+ * The shareable profile document is pure data: parse, validate, render. No
+ * store, no filesystem, no Bun APIs, so the
  * same validator runs in the CLI and in the sharing site's Worker — a file
  * that one accepts, the other accepts too.
  *

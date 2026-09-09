@@ -4,7 +4,7 @@ import type { RouteSpec } from "../adapters/types.ts";
 import { nowIso, withBusyRetry } from "../store/store.ts";
 
 /**
- * Route blocks: the user-owned deny list (PLAN.md §Registry: route blocks).
+ * Route blocks: the user-owned deny list.
  *
  * Baton still does not verify identity — the environment is what runs, as it
  * would under a shell. This is the other half of that stance: since Baton

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
+import { recordGrade } from "../eval/evalStore.ts";
 import { newId, nowIso, openStore, pruneRuns, RUN_CAP, withBusyRetry } from "./store.ts";
 
 /** A throwaway BATON_CONFIG_DIR scope. Never touches a real Baton dir. */
@@ -82,7 +83,7 @@ describe("openStore — connection pragmas", () => {
 });
 
 describe("openStore — schema and migrations", () => {
-  test("phase-1 tables exist", () => {
+  test("base tables exist", () => {
     const { db } = scopeStore("schema");
     const tables = db
       .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -276,6 +277,22 @@ describe("openStore — quota event retention", () => {
 });
 
 describe("pruneRuns — capped ring buffer", () => {
+  test("reopening prunes graded runs without losing aggregate evidence", () => {
+    const paths = scopePaths("prune-graded");
+    const db = openStore(paths.dbPath);
+    const at = nowIso();
+    const id = insertRun(db, { status: "succeeded", at });
+    recordGrade(db, { runId: id, grade: 4, model: "kimi-k3", target: "kimi:default/k3+full", runAt: at });
+    const evidence = db.query("SELECT * FROM accumulator").all();
+    insertRun(db, { status: "succeeded", at });
+    db.close();
+    const reopened = openStore(paths.dbPath, 1);
+    expect(countRuns(reopened)).toBe(1);
+    expect(reopened.query("SELECT * FROM grades WHERE run_id = ?").get(id)).toBeNull();
+    expect(reopened.query("SELECT * FROM accumulator").all()).toEqual(evidence);
+    expect(reopened.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    reopened.close();
+  });
   const stamp = (i: number) => new Date(1_700_000_000_000 + i * 1000).toISOString();
 
   function seedTerminal(db: Database, count: number, offset = 0): void {
@@ -534,7 +551,7 @@ describe("id and time helpers", () => {
 });
 
 /**
- * Phase-1 spike: "two scopes, two DBs, no bleed" (PLAN.md §Build phases).
+ * Scope separation: "two scopes, two DBs, no bleed".
  * This is the whole scope-separation mechanism — if it holds, cross-scope
  * leakage is structurally impossible without any runtime check.
  */

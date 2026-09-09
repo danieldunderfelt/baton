@@ -10,6 +10,10 @@ The `baton` binary has two faces: `baton mcp` runs the MCP server over stdio tha
 
 | Command | What it does |
 |---|---|
+| `baton --help` | Show top-level usage and commands |
+| `baton help [command]` | Show usage for a command |
+| `baton <command> --help` | Show usage for a command |
+| `baton --version` | Print the installed version |
 | `baton status` | Scope, identity env, adapter availability |
 | `baton detect` | Installed agent CLIs, versions, models |
 | `baton models` | Models reachable in this scope |

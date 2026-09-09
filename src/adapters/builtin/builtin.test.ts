@@ -178,8 +178,8 @@ describe.each(builtinAdapters.map((spec) => [spec.app, spec] as const))("%s spec
   test("no admission pattern that can fire mid-run is left unguarded", () => {
     // Quota and upstream messages read identically whether they arrive at the
     // door or after four minutes of edits, so an adapter may only list one if
-    // it can also prove work started (PLAN.md §Failover on admission failure
-    // only). Auth/config signatures are startup-only and need no guard.
+    // it can also prove work started. Auth/config signatures are startup-only
+    // and need no guard.
     const guarded = (spec.workStartedPatterns ?? []).length > 0;
     for (const pattern of spec.admissionFailurePatterns) {
       if (MID_RUN_PLAUSIBLE.test(pattern)) expect(guarded).toBe(true);
@@ -206,7 +206,7 @@ describe("resume roster", () => {
     // --resume`, `kimi -S`, `opencode run -s`). codex's is exercised live (see
     // the canary below) and cursor-agent's was verified live while writing the
     // adapter (a second turn recalled the first); the rest are verified against
-    // --help, which is what the phase-3 brief asks for.
+    // --help, which is what the adapter brief asks for.
     expect(builtinAdapters.filter((s) => s.resume).map((s) => s.app)).toEqual([
       "claude-code",
       "codex",
@@ -221,7 +221,8 @@ describe("resume roster", () => {
     // used), instructions are read from stdin"; `codex exec resume` documents
     // only the `-` form, so the positional is passed rather than assumed.
     const argv = codexAdapter.resume!.argv;
-    expect(argv.slice(0, 4)).toEqual(["exec", "resume", "{sessionRef}", "-"]);
+    expect(argv.slice(0, 5)).toEqual(["exec", "{autonomyFlags}", "resume", "{sessionRef}", "-"]);
+    expect(codexAdapter.autonomyFlags.edits).toEqual(["--approve-for-me"]);
     expect(codexAdapter.invoke.promptVia).toBe("stdin");
   });
 });
@@ -515,7 +516,7 @@ describe("cursor-agent recorded output", () => {
 const LIVE = Bun.env.BATON_LIVE_TESTS === "1";
 const CANARY_TIMEOUT_MS = 120_000;
 /** Cheapest route of an app whose first route is expensive: a canary proves the
- * plumbing, so it must not spend a precious window (PLAN.md §Quota-aware cost). */
+ * plumbing, so it must not spend a precious window. */
 const CANARY_SLUG: Record<string, string> = { "claude-code": "sonnet" };
 
 describe.skipIf(!LIVE)("live listing", () => {

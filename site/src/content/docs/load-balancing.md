@@ -19,7 +19,7 @@ An instance is a named environment overlay for an app — the extra variables Ba
 From then on every delegation to a model that app serves picks an account automatically:
 
 - Selection favours the account with the most quota headroom, so both usage windows stay warm instead of one draining while the other sits idle. Subscription quota comes in rolling windows; two accounts drained evenly get you more work per day than two drained in sequence.
-- An account that hits a rate limit before starting work goes into cooldown — until the provider's stated reset when one is given, with growing backoff otherwise — and the run retries on the next account under the same run id.
+- An admission failure puts the account into an exponential cooldown backoff, and the run retries on the next account under the same run id.
 - Failover only happens when the refusal provably came before any work started. If a failure happens after work may have begun, Baton fails the run instead of silently re-running it, because the first attempt may have edited files.
 - Resumed runs skip the pool and go back to the account that holds the session.
 

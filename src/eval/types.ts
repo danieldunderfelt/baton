@@ -1,5 +1,5 @@
 /**
- * Eval foundation (PLAN.md §Evaluation, ratings, profiles). Storage roles are
+ * Ratings and profiles. Storage roles are
  * strictly separated: grades (raw, private ring buffer alongside runs),
  * accumulator (observed evidence only), priors (explicit, provenance-tagged),
  * ratings.yaml (derived projection — display/share only, never read back).
@@ -10,7 +10,7 @@ export type Grade = number;
 
 /**
  * Decayed sufficient statistics for one (execution target, category).
- * Write-side decay-forward (PLAN.md §Decay): on each event, decay the
+ * Write-side decay-forward: on each event, decay the
  * aggregate from as_of to now by 2^(−Δt/half-life) (sum_w2 by the square),
  * add the event weighted by 2^(−(now − t_run)/half-life), set as_of = now.
  */
@@ -44,7 +44,7 @@ export interface Prior {
   asOf: string;
 }
 
-/** A wrong seed must not steer routing for months (PLAN.md §Seeded priors). */
+/** A wrong seed must not steer routing for months. */
 export const PRIOR_WEIGHT_CAP = 10;
 
 /** Pseudo-observations a seed or import gets when it does not say. */
@@ -74,7 +74,6 @@ export const SETTING_PROFILE_WEIGHT = "profile_weight";
 /**
  * Monotonic revision, incremented in the same transaction as every
  * grades/accumulator/priors commit. The ratings.yaml publisher embeds it as
- * source_revision and only renames over an older revision (PLAN.md
- * §Publication protocol).
+ * source_revision and only renames over an older revision.
  */
 export const SETTING_RATINGS_REVISION = "ratings_revision";

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 import pkg from "../../package.json" with { type: "json" };
@@ -109,8 +109,9 @@ async function updateFromRelease(
   }
   const tag = await latestTag(releasesUrl);
   const to = tag.replace(/^v/, "");
-  const path = execPath;
-  if (to === CURRENT_VERSION) {
+  if (!Bun.semver.satisfies(to, "*")) throw new Error(`Latest release has an invalid version: ${tag}`);
+  const path = realpathSync(execPath);
+  if (!Bun.semver.satisfies(to, ">" + CURRENT_VERSION)) {
     return { source: "release", from: CURRENT_VERSION, to, changed: false, path, notes: [] };
   }
   const base = `${releasesUrl}/download/${tag}`;
@@ -129,20 +130,16 @@ async function updateFromRelease(
   }
 
   // Same directory, so the final rename is atomic and cannot cross a filesystem.
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.update`);
+  const staging = mkdtempSync(join(dirname(path), `.${basename(path)}-update-`));
+  const tmp = join(staging, "baton");
   try {
-    writeFileSync(tmp, binary, { mode: 0o755 });
+    writeFileSync(tmp, binary, { mode: 0o755, flag: "wx" });
     chmodSync(tmp, 0o755);
     const notes = resign(tmp);
     renameSync(tmp, path);
     return { source: "release", from: CURRENT_VERSION, to, changed: true, path, notes };
-  } catch (err) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // Nothing was written.
-    }
-    throw err;
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
   }
 }
 

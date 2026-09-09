@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { nowIso, withBusyRetry } from "../store/store.ts";
+import { inTransaction, nowIso } from "../store/store.ts";
 import {
   activePriors,
   activeProfile,
@@ -15,8 +15,8 @@ import { yamlValue } from "./profileFile.ts";
 import type { EffectiveRating } from "./types.ts";
 
 /**
- * The ratings.yaml publication protocol (PLAN.md §Evaluation, §Publication
- * protocol). The file is a *derived projection*: display and sharing only.
+ * The ratings.yaml publication protocol. The file is a *derived projection*:
+ * display and sharing only.
  * Baton never reads it back for routing — routing reads SQLite — so the only
  * thing that has to be true of it is that it honestly reflects some committed
  * state, and never an older one than what is already on disk.
@@ -94,7 +94,7 @@ export function publishRatings(db: Database, configDir: string, now = nowIso()):
 }
 
 /**
- * Startup repair (PLAN.md: "Startup repairs a stale projection"). Republishes
+ * Startup repair republishes
  * whenever the file's revision differs from the store's — including the case
  * where the file is *ahead* (a restored database, a copied config dir), which
  * the normal older-only rule would otherwise refuse to correct.
@@ -128,23 +128,11 @@ function withPublicationLock<T>(
   now: string,
   fn: (snapshot: RatingsSnapshot) => T,
 ): T {
-  return withBusyRetry(() => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.query(
-        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-      ).run(SETTING_PUBLISH_LOCK, now);
-      const result = fn(snapshotRatings(db, now));
-      db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // SQLite already rolled back; the original error is what matters.
-      }
-      throw err;
-    }
+  return inTransaction(db, () => {
+    db.query(
+      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    ).run(SETTING_PUBLISH_LOCK, now);
+    return fn(snapshotRatings(db, now));
   });
 }
 

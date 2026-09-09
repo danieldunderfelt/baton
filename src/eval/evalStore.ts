@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { AUTONOMY_ORDER, type Autonomy } from "../adapters/types.ts";
-import { nowIso, withBusyRetry } from "../store/store.ts";
+import { inTransaction, nowIso } from "../store/store.ts";
 import {
   addGradeEvent,
   blend,
@@ -27,15 +27,15 @@ import {
 } from "./types.ts";
 
 /**
- * The eval store (PLAN.md §Evaluation, ratings, profiles). Storage roles stay
+ * The eval store handles ratings and profiles. Storage roles stay
  * separated: grades are the raw private record, the accumulator holds observed
  * evidence only, priors are explicit and provenance-tagged, and nothing here
  * mixes the two — `effectiveRatings` blends them at read time and reports both.
  *
  * Every mutation that the ratings projection is made of commits inside one
  * BEGIN IMMEDIATE together with the revision bump, so the ratings.yaml
- * publisher can never render a half-applied state (PLAN.md §Publication
- * protocol). Reliability is target-private and not part of that projection, so
+ * publisher can never render a half-applied state. Reliability is target-private
+ * and not part of that projection, so
  * it commits without bumping.
  */
 
@@ -119,7 +119,7 @@ export interface Reliability {
 
 /**
  * Adapter/parse failures are reliability against the *target*, never quality
- * against the model (PLAN.md §Layering and sharing). Same decay rule, including
+ * against the model. The same decay rule applies, including
  * the monotonic `as_of`: an out-of-order outcome lands at the row's own time
  * instead of rewinding it, which would re-decay everything already counted.
  */
@@ -157,13 +157,13 @@ export interface PriorEntry {
   /**
    * When this opinion was formed. Defaults to the write time; a shared profile
    * carries its own per-entry as_of, and re-stamping it on import would claim
-   * the numbers are fresher than they are (PLAN.md §Layering: import with
-   * decayed as_of).
+   * the numbers are fresher than they are. Imported entries keep their decayed
+   * `as_of`.
    */
   asOf?: string;
 }
 
-/** "~5–10 observations" (PLAN.md §Seeded priors) — the low end is the default. */
+/** "~5–10 observations". The low end is the default. */
 export { DEFAULT_PRIOR_WEIGHT };
 
 export interface SeedResult {
@@ -201,7 +201,7 @@ export interface PriorChange extends PriorRef {
   previous: { mean: number; weight: number; source: string; asOf: string };
 }
 
-/** Import shows a summary diff, never silently reweights (PLAN.md §Layering). */
+/** Import shows a summary diff and never silently reweights. */
 export interface ImportDiff {
   profile: string;
   source: string;
@@ -263,7 +263,7 @@ export interface DiffOptions {
  * and provenance included: a re-import that only refreshes as_of restores the
  * prior's decayed precision, and one that only changes source relabels where
  * the numbers came from. Reporting either as unchanged would be the silent
- * reweighting the import diff exists to prevent (PLAN.md §Layering and sharing).
+ * reweighting the import diff exists to prevent.
  */
 export function diffPriors(
   db: Database,
@@ -416,7 +416,7 @@ export interface RatingSettingOptions {
  * Writes a setting that changes what the ratings projection says (half-life,
  * profile weight) and bumps the revision in the same transaction. Without the
  * bump the publisher would discard the refreshed render as stale, because no
- * eval table changed (PLAN.md §Publication protocol).
+ * eval table changed.
  *
  * `half_life_days` is special: the accumulator stores decayed sums, not the
  * events behind them, so its numbers only mean anything under the half-life
@@ -501,8 +501,8 @@ export interface TargetRating {
 /**
  * Per-target observed evidence, decayed read-side without writing. The
  * canonical model's rating (effectiveRatings) is the rollup across these; this
- * is the level ratings actually attach to (PLAN.md §Registry: execution
- * target), and what lets selection prefer the harness or instance that has been
+ * is the level ratings actually attach to, and what lets selection prefer the
+ * harness or instance that has been
  * answering well rather than treating every route to a model as identical.
  * `route`/`autonomy` are the split fingerprint, so a lens can ask for evidence
  * at the authority level a candidate would actually run at.
@@ -537,8 +537,7 @@ export function targetRatings(db: Database, at = nowIso()): TargetRating[] {
  * Prior-only models appear with `observed: null` so "unrated but seeded" stays
  * visible as exactly that.
  *
- * The prior decays on the same curve as observed evidence (PLAN.md §Decay:
- * "priors, whose own precision decays from *their* as_of"). Without that, a
+ * The prior decays on the same curve as observed evidence. Without that, a
  * year-old imported opinion would keep its full pseudo-observations forever and
  * outrank fresh local evidence — which is precisely what PRIOR_WEIGHT_CAP is
  * meant to prevent. `priorWeight` reports the decayed weight, so what selection
@@ -726,26 +725,4 @@ function cappedWeight(weight: number | undefined): number {
     throw new Error(`Prior weight must be a non-negative number, got ${weight}.`);
   }
   return Math.min(w, PRIOR_WEIGHT_CAP);
-}
-
-/**
- * BEGIN IMMEDIATE ... COMMIT with busy retry. Local by design: store.ts owns
- * the schema, this module owns its own write discipline.
- */
-function inTransaction<T>(db: Database, fn: () => T): T {
-  return withBusyRetry(() => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = fn();
-      db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // SQLite already rolled back; the original error is what matters.
-      }
-      throw err;
-    }
-  });
 }

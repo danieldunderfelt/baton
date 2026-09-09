@@ -14,7 +14,7 @@ import type { DiscoveredAdapter } from "../discovery/types.ts";
 import { blend } from "../eval/decay.ts";
 import { effectiveRatings, targetRatings } from "../eval/evalStore.ts";
 import { candidatesFor, getPool } from "../quota/pools.ts";
-import { snapshot } from "../quota/quota.ts";
+import { cooldownScopeFor, snapshot } from "../quota/quota.ts";
 import type { Preciousness } from "../quota/types.ts";
 import { nowIso } from "../store/store.ts";
 import { SETTING_MAX_AUTONOMY_PREFIX } from "../supervisor/types.ts";
@@ -29,7 +29,7 @@ import {
 import { catalogOf, type Catalog } from "./catalog.ts";
 
 /**
- * Registry: canonical model → routes → execution target (PLAN.md §Registry).
+ * Registry: canonical model → routes → execution target.
  * Selection is a versioned, deterministic policy; the version is recorded per
  * run so a policy change is visible in the evidence.
  *
@@ -94,7 +94,7 @@ export interface Considered {
 }
 
 export interface SelectOptions {
-  /** Explicit instance argument: outranks pool balancing (PLAN.md §Precedence). */
+  /** Explicit instance argument: outranks pool balancing. */
   instance?: string;
   /** Selection time; injectable so quota windows are testable. */
   nowIso?: string;
@@ -196,7 +196,7 @@ function binaryStamp(binaryPath: string): string | null {
  * file's mtime and size, because Baton also runs as a long-lived daemon: an
  * upgrade replaces the binary under a live process, and a fingerprint carrying
  * the old version would file new evidence against a build that is gone
- * (PLAN.md §Registry: execution target). Where the stat fails the memo is time
+ * Where the stat fails the memo is time
  * bound instead (VERSION_TTL_MS) rather than kept forever.
  * Never throws: an app that will not answer is "unknown", not an error.
  */
@@ -236,8 +236,8 @@ function appVersion(binaryPath: string): string {
 
 /**
  * The full execution-target identity a rating attaches to, minus the autonomy
- * the supervisor appends once authority is resolved (PLAN.md §Registry:
- * execution target). The app version is in it because the same adapter against
+ * the supervisor appends once authority is resolved. The app version is in it
+ * because the same adapter against
  * a different build of the app is not interchangeable evidence.
  */
 export function targetFingerprint(
@@ -253,8 +253,8 @@ export function targetFingerprint(
 /**
  * Adapter specs routable in this scope: the pinned built-ins plus the
  * discovered adapters a human approved and a canary activated. Everything else
- * a discovery submitted is inert here — that is the whole quarantine gate
- * (PLAN.md §Agentic discovery). Without a db only built-ins are knowable.
+ * a discovery submitted is inert here — that is the whole quarantine gate.
+ * Without a db only built-ins are knowable.
  */
 export function routableAdapters(db?: Database): AdapterSpec[] {
   return db ? [...builtinAdapters, ...activeDiscoveredSpecs(db)] : [...builtinAdapters];
@@ -262,7 +262,7 @@ export function routableAdapters(db?: Database): AdapterSpec[] {
 
 /**
  * The routes an app serves in this scope right now: the adapter's pinned ones
- * plus whatever its CLI reports (PLAN.md §Registry). The CLI is the authority
+ * plus whatever its CLI reports. The CLI is the authority
  * on its own models, so a model released after the adapter was written routes
  * without a Baton change. `listingError` says why that half is missing.
  */
@@ -276,7 +276,7 @@ export function routesOf(spec: AdapterSpec): RouteSpec[] {
 
 /**
  * The execution target a run already ran on — a LOOKUP, not a selection.
- * Session affinity (PLAN.md §Instance pools) must never consult the policy: a
+ * Session affinity must never consult the policy: a
  * resumed run belongs to the instance whose config dir holds its session, so
  * quota, ratings and pool balancing have no say. Throws with the reason when
  * the route no longer exists in this scope, which is the honest answer.
@@ -364,7 +364,7 @@ interface Candidate extends Considered {
 }
 
 /**
- * The grid quota headroom is compared on. PLAN.md's ranking is *staged* —
+ * The grid quota headroom is compared on. The ranking policy is *staged* —
  * quota-headroom-weighted-by-preciousness first, rating second — but a raw
  * comparison of two floats makes the first stage decide everything, since two
  * instances are almost never bit-identical. Rounding to 0.01 (a hundredth of
@@ -374,7 +374,7 @@ interface Candidate extends Considered {
 export const RANKING_GRID = 0.01;
 
 /**
- * Policy v2 (PLAN.md §Registry). Filter: the app's binary is on PATH, the
+ * Policy v2. Filter: the app's binary is on PATH, the
  * scope's authority ceiling is expressible, the instance is actually defined in
  * this scope, it is not cooling down, and it is not reserved for emergencies.
  * Rank: quota headroom × preciousness on the RANKING_GRID first, then the
@@ -419,7 +419,8 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     // The authority this candidate would run at, resolved here so the rating
     // lens can ask for evidence produced at that same level.
     const autonomy = clampAutonomy(opts.autonomy, ceiling, route.spec.defaultAutonomy);
-    candidatesFor(db, app, poolInstance(route.spec, opts.instance), now).forEach((c, memberIndex) => {
+    candidatesFor(db, app, poolInstance(route.spec, opts.instance), now,
+      cooldownScopeFor(route.spec, route.slug)).forEach((c, memberIndex) => {
       // A deny-listed route is reported as its own exclusion rather than
       // folded into another: it is the user's standing decision, and it is the
       // one reason that survives every relaxation below.
@@ -483,8 +484,8 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
 
 /**
  * Pools only mean something for an app whose identity an env var can relocate:
- * without one every "instance" is the same account under another name (PLAN.md
- * §Instance mechanics). Built-in pools are already refused at write time; a
+ * without one every "instance" is the same account under another name. Built-in
+ * pools are already refused at write time; a
  * discovered adapter's spec is what says whether it has one, so the gate lives
  * here too. Pinning the instance bypasses the pool without losing the explicit
  * argument's precedence.
@@ -550,14 +551,14 @@ function publicView(c: Candidate): Considered {
 /**
  * Maps a blended rating on the grade scale to a routing multiplier in
  * [RATING_FLOOR, 1]. Unrated is 1.0 on purpose: a model with no evidence must
- * not be starved of the runs that would produce some (PLAN.md §Layering).
+ * not be starved of the runs that would produce some.
  */
 const RATING_FLOOR = 0.6;
 
 /**
  * How much the canonical model's rating is worth when judging one of its
  * execution targets, in pseudo-observations. The model rating is the
- * hierarchical prior (PLAN.md §Registry): a target with no evidence of its own
+ * hierarchical prior: a target with no evidence of its own
  * lands exactly on it, and needs comparable evidence before it moves off.
  */
 const MODEL_PRIOR_WEIGHT = 5;
@@ -767,19 +768,13 @@ function routeRows(
     resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling);
   // Only a pool makes per-instance headroom meaningful: without one there is
   // nothing to spread across, and 'default' is the whole story.
-  const pool = spec.identityEnv
-    ? getPool(db, spec.app)?.members.map((instance) => {
-        const observed = snapshot(db, spec.app, instance, at);
-        return {
-          instance,
-          headroom: observed.headroom,
-          ...(observed.coolingUntil ? { coolingUntil: observed.coolingUntil } : {}),
-        };
-      })
-    : undefined;
-  const instances = pool && pool.length > 0 ? pool.map((p) => p.instance) : [DEFAULT_INSTANCE];
+  const members = spec.identityEnv ? getPool(db, spec.app)?.members : undefined;
+  const instances = members && members.length > 0 ? members : [DEFAULT_INSTANCE];
   return routes.map((route) => {
     const score = scores.get(route.model);
+    const observed = instances.map((instance) => snapshot(db, spec.app, instance, at, cooldownScopeFor(spec, route.slug)));
+    const pool = members ? observed.map((o) => ({ instance: o.instance, headroom: o.headroom,
+      ...(o.coolingUntil ? { coolingUntil: o.coolingUntil } : {}) })) : undefined;
     // A block only makes the route unusable when it covers every instance the
     // route could run on; a partial block just steers selection, and saying
     // "unavailable" would be a lie the pool view right beside it contradicts.
@@ -793,7 +788,7 @@ function routeRows(
       slug: route.slug,
       available: degradedReason === "",
       ...(degradedReason === "" ? {} : { degradedReason }),
-      instance: DEFAULT_INSTANCE,
+      instance: instances[0] ?? DEFAULT_INSTANCE,
       rating: score?.blended === undefined || score.blended === null ? "unrated" : "rated",
       scores: score ?? { observed: null, nEff: 0, prior: null, blended: null },
       ...(pool ? { pool } : {}),

@@ -13,6 +13,7 @@ import { specDigest } from "../discovery/discovery.ts";
 import { recordReliability } from "../eval/evalStore.ts";
 import {
   clearCooldown,
+  cooldownScopeFor,
   dropRunEvent,
   recordAdmissionFailure,
   recordRun,
@@ -51,8 +52,8 @@ import {
  * truth) with the adapter executor as the only execution path. A run is the
  * caller's request; each execution is an attempt, and an admission failure —
  * a rate-limit or auth refusal *before* the callee started work — adds another
- * attempt on the next pool candidate under the same run (PLAN.md §Instance
- * pools). Any other failure ends the run: replaying work that may already have
+ * attempt on the next pool candidate under the same run. Any other failure ends
+ * the run: replaying work that may already have
  * had side effects is the caller's decision, not Baton's.
  */
 
@@ -93,7 +94,7 @@ export interface TargetResolver {
   /**
    * The exact target a resumed run must land on — a lookup, never a selection:
    * the session lives in one instance's config dir, so affinity outranks pool
-   * balancing entirely (PLAN.md §Session affinity). Optional so existing
+   * balancing entirely. Optional so existing
    * resolvers keep working; the registry's `targetFor` lookup is the default.
    */
   pinned?(ref: PinnedRef): Target;
@@ -193,7 +194,7 @@ export class Supervisor {
     }
     const cwd = req.cwd ?? this.hostCwd;
     // The key alone is not the identity of the request: dedup must only fire
-    // for the payload the key was minted for (PLAN.md §Execution: payload-bound).
+    // for the payload the key was minted for.
     const payloadHash = digestPayload(req, cwd);
     if (key !== undefined) {
       const existing = this.findByKey(key, payloadHash);
@@ -265,7 +266,7 @@ export class Supervisor {
   /**
    * Continues a run's session on the SAME app and instance it ran on: session
    * state lives in that instance's config dir, so affinity bypasses pool
-   * balancing entirely (PLAN.md §Session affinity). The original run is left
+   * balancing entirely. The original run is left
    * untouched; this is a new run that records which one it continues, so the
    * caller's decision to resume is visible in the evidence.
    */
@@ -525,7 +526,7 @@ export class Supervisor {
    * The callee is running, so its window slot is spent NOW — not when it
    * finishes. A long run recorded at completion lands in the wrong 5-hour
    * window, and every selection made while it runs sees headroom it no longer
-   * has and piles onto the same instance (PLAN.md §Proactive spreading).
+   * has and piles onto the same instance.
    * `settle` gives the slot back if the spawn turned out to be a refusal.
    */
   private noteAdmitted(ctx: AttemptCtx): void {
@@ -558,7 +559,7 @@ export class Supervisor {
           : "failed";
     // A timeout is deliberately not an admission failure however its output
     // reads: the callee had the whole budget to act, so re-running it could
-    // duplicate side effects (PLAN.md §Failover on admission failure only).
+    // duplicate side effects.
     // classifyFailure applies the same rule to the output itself: a rejection
     // printed *after* work-started evidence is a failure, never a replay.
     const refused =
@@ -590,7 +591,7 @@ export class Supervisor {
    * down instead. Only a success proves admission works again, so only a
    * success ends the strike chain. Extraction and spawn failures are
    * reliability against the target, never quality against the model
-   * (PLAN.md §Layering and sharing) — and an attempt whose callee never ran is
+   * — and an attempt whose callee never ran is
    * neither: it is a Baton-side fact.
    */
   private observe(
@@ -605,9 +606,10 @@ export class Supervisor {
         if (o.quotaEventId !== null) dropRunEvent(this.db, o.quotaEventId);
         // No adapter's live probe produced a parseable reset time, so the
         // backoff decides; pass one here the moment an adapter can extract it.
-        recordAdmissionFailure(this.db, app, ctx.target.instance, now, res.error);
+        recordAdmissionFailure(this.db, app, ctx.target.instance, now, res.error, undefined,
+          cooldownScopeFor(ctx.target.spec, ctx.target.slug));
       } else if (o.status === "succeeded") {
-        clearCooldown(this.db, app, ctx.target.instance);
+        clearCooldown(this.db, app, ctx.target.instance, cooldownScopeFor(ctx.target.spec, ctx.target.slug));
       }
       // A cancelled attempt says nothing about the target: the user stopped it.
       if (!o.cancelled && res.started) {
@@ -736,7 +738,7 @@ export class Supervisor {
 
   /**
    * Inherited environment + the instance's overlay + the incremented hop count.
-   * Nothing is scrubbed: Baton is not more special than a shell (PLAN.md §Identity).
+   * Nothing is scrubbed: Baton is not more special than a shell.
    */
   private calleeEnv(ctx: AttemptCtx): Record<string, string | undefined> {
     return {
@@ -1059,7 +1061,7 @@ function inheritedOptions(optionsJson: string): RunOptions {
  * options may only NARROW that resolution — never raise it. Clamping against
  * the scope ceiling alone is not enough: a run resolved to `readonly` under a
  * ceiling that has since been widened would come back as `full` on the same
- * session (PLAN.md §Precedence). The origin's *resolved* values are the second
+ * session. The origin's *resolved* values are the second
  * ceiling; where a legacy row recorded none, the adapter's default stands in.
  */
 function narrowed(

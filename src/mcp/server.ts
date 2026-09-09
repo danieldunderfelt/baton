@@ -23,17 +23,18 @@ import { createSupervisor, type AdapterExec, type Supervisor } from "../supervis
 import type { RunOptions, RunRequest, RunView } from "../supervisor/types.ts";
 
 /**
- * The MCP server (PLAN.md §MCP surface), served over stdio by `baton mcp` and
+ * The MCP server, served over stdio by `baton mcp` and
  * over Streamable HTTP by `baton serve --http` (src/mcp/http.ts) — the same
  * tools, the same broker state, one server instance per serving unit. State
  * never travels between calls implicitly: `run_model` mints a `run_id` handle
  * and `get_run` polls it, which is what keeps this server stateless at its own
  * layer even while the SDK's session transport is not.
  *
- * Phase 2 added the evaluation loop — `report_result` (consumer grades after
- * *using* the answer), `seed_ratings` and `get_ratings`. Phase 3 adds blind
- * duels (`run_duel`/`report_duel`), session continuation (`resume_run`) and
- * agentic discovery (`discover_app`/`register_app`). None of these tools own
+ * The evaluation loop includes `report_result` (consumer grades after *using*
+ * the answer), `seed_ratings` and `get_ratings`. Blind duels
+ * (`run_duel`/`report_duel`), session continuation (`resume_run`) and agentic
+ * discovery (`discover_app`/`register_app`) use the same domain layers. None of
+ * these tools own
  * domain logic: they resolve arguments to what the eval store, the supervisor
  * or the quarantine store needs, commit, and republish the ratings projection.
  *
@@ -43,7 +44,9 @@ import type { RunOptions, RunRequest, RunView } from "../supervisor/types.ts";
  */
 
 const NAME = "baton";
-const VERSION = "0.1.0";
+import pkg from "../../package.json" with { type: "json" };
+
+const VERSION = pkg.version;
 
 /**
  * Ceiling on how long one blocking tool call may hold the host, whatever the
@@ -92,7 +95,7 @@ export interface McpRuntime {
 export function createMcpRuntime(): McpRuntime {
   const paths = ensurePaths(resolvePaths(process.env));
   const db = openStore(paths.dbPath);
-  // "Startup repairs a stale projection" (PLAN.md §Publication protocol): a
+  // Startup repair handles a stale projection: a
   // publisher that died mid-flight, or a config dir restored from elsewhere,
   // leaves ratings.yaml disagreeing with SQLite. Never fatal — routing reads
   // SQLite, so a broken projection must not stop the server from serving.
@@ -585,7 +588,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         activeProfile: activeProfile(db),
         revision: seeded.revision,
         // The store's own answer, defaults and cap applied — this is the
-        // confirmation the user approves against (PLAN.md §Seeded priors), so it
+        // confirmation the user approves against, so it
         // must not be a second derivation of the same rules.
         entries: seeded.entries,
         ratingsFile: ratingsPath(paths.configDir),

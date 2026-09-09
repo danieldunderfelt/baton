@@ -164,7 +164,7 @@ afterAll(async () => {
 });
 
 describe("tools/list", () => {
-  test("exposes exactly the phase-3 tool set with usable schemas", async () => {
+  test("exposes the tool set with usable schemas", async () => {
     const { tools } = await session.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "discover_app",
@@ -292,12 +292,12 @@ describe("list_models", () => {
     expect(apps.map((a) => a.app)).toContain("codex");
   });
 
-  test("carries the phase-2 score fields without renaming the phase-1 ones", async () => {
+  test("carries score fields without renaming existing ones", async () => {
     const payload = await callJson(session.client, "list_models");
     const models = payload.models as Record<string, unknown>[];
     const entry = models.find((m) => m.model === "kimi-k3")!;
 
-    // Backwards compatible: everything phase 1 promised is still spelled the same.
+    // Keep the existing field names for backwards compatibility.
     expect(Object.keys(entry)).toEqual(
       expect.arrayContaining(["model", "app", "slug", "available", "instance", "rating"]),
     );
@@ -743,7 +743,7 @@ describe("seed_ratings / get_ratings", () => {
   });
 });
 
-// --- Phase 3: duels, resume, discovery -------------------------------------
+// --- Duels, resume, and discovery -------------------------------------------
 
 /** A CLI on PATH that answers the version probe, admits the run, then stalls. */
 function fakeSleeper(name: string): string {

@@ -451,7 +451,7 @@ describe("btRatings", () => {
     );
   });
 
-  /** A prior's precision decays from its own as_of (PLAN.md §Decay). */
+  /** A prior's precision decays from its own as_of. */
   test("a stale prior pulls less than a fresh one on identical evidence", async () => {
     const pull = async (asOf: string) => {
       const h = harness(async (slug) => ok(slug));

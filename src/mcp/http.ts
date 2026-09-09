@@ -10,7 +10,7 @@ import { createMcpRuntime } from "./server.ts";
 
 /**
  * `baton serve --http`: the same MCP server as `baton mcp`, over Streamable
- * HTTP (PLAN.md §Architecture). One daemon per environment scope, because a
+ * HTTP. One daemon per environment scope, because a
  * daemon inherits exactly one environment — its callees run with whatever
  * identity the shell that started it supplied, and its evidence lands in that
  * scope's BATON_CONFIG_DIR. Two scopes need two daemons on two ports.

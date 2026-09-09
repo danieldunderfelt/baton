@@ -1,6 +1,6 @@
 {
   "name": "baton",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -8,7 +8,9 @@
   },
   "scripts": {
     "dev": "bun run src/index.ts",
-    "test": "bun test",
+    "test": "bun test ./src ./test",
+    "check": "tsc --noEmit",
+    "check:release": "bun run scripts/check-release.ts",
     "build": "bun build --compile --outfile dist/baton src/index.ts",
     "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile dist/baton-darwin-arm64 src/index.ts && bun build --compile --target=bun-darwin-x64 --outfile dist/baton-darwin-x64 src/index.ts && bun build --compile --target=bun-linux-x64 --outfile dist/baton-linux-x64 src/index.ts && bun build --compile --target=bun-linux-arm64 --outfile dist/baton-linux-arm64 src/index.ts"
   },
@@ -16,6 +18,7 @@
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/core": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
+    "jsonc-parser": "^3.3.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

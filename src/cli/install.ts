@@ -2,12 +2,16 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { applyEdits, modify } from "jsonc-parser";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
 // the source tree, and install must work from any cwd.
@@ -120,7 +124,7 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
       }
       const config = env.CLAUDE_CONFIG_DIR || join(home(env), ".claude");
       return {
-        mcpPath: join(dirname(config), ".claude.json"),
+        mcpPath: join(env.CLAUDE_CONFIG_DIR || home(env), ".claude.json"),
         instructionsPath: join(config, "skills", SERVER_NAME, "SKILL.md"),
       };
     },
@@ -160,10 +164,10 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
   opencode: {
     locate: (scope, dir, env) => {
       if (scope === "project") {
-        return { mcpPath: join(dir, "opencode.json"), instructionsPath: join(dir, AGENTS_FILE) };
+        return { mcpPath: opencodeConfig(dir), instructionsPath: join(dir, AGENTS_FILE) };
       }
       const config = join(env.XDG_CONFIG_HOME || join(home(env), ".config"), "opencode");
-      return { mcpPath: join(config, "opencode.json"), instructionsPath: join(config, AGENTS_FILE) };
+      return { mcpPath: env.OPENCODE_CONFIG ? resolve(env.OPENCODE_CONFIG) : opencodeConfig(config), instructionsPath: join(config, AGENTS_FILE) };
     },
     merge: mergeOpencodeJson,
     instructions: "agents",
@@ -171,6 +175,11 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
     restart: "Start a new opencode session to pick both up.",
   },
 };
+
+function opencodeConfig(dir: string): string {
+  const jsonc = join(dir, "opencode.jsonc");
+  return existsSync(jsonc) ? jsonc : join(dir, "opencode.json");
+}
 
 /** The host CLIs on PATH: what a bare `baton install` registers with. */
 export function detectedHosts(env: Env = process.env): InstallHost[] {
@@ -194,16 +203,14 @@ export function installHost(host: InstallHost, opts: InstallOptions = {}): Insta
   const installer = HOSTS[host];
   const { command, args } = serverCommand();
   const location = installer.locate(scope, dir, env);
+  const body = instructionText(host, opts.withEval ?? true);
+  const instructions = installer.instructions === "skill"
+    ? body
+    : markedBlockContent(location.instructionsPath, body);
   mkdirSync(dirname(location.mcpPath), { recursive: true });
   const registration = installer.merge(location.mcpPath, command, args);
-  const body = instructionText(host, opts.withEval ?? true);
-  if (installer.instructions === "skill") {
-    mkdirSync(dirname(location.instructionsPath), { recursive: true });
-    atomicWrite(location.instructionsPath, body);
-  } else {
-    mkdirSync(dirname(location.instructionsPath), { recursive: true });
-    writeMarkedBlock(location.instructionsPath, body);
-  }
+  mkdirSync(dirname(location.instructionsPath), { recursive: true });
+  atomicWrite(location.instructionsPath, instructions);
 
   return {
     host,
@@ -246,15 +253,13 @@ function serverCommand(): { command: string; args: string[] } {
     return { command: process.execPath, args: ["mcp"] };
   }
   const root = resolve(import.meta.dir, "..", "..");
-  const compiled = join(root, "dist", SERVER_NAME);
-  if (existsSync(compiled)) return { command: compiled, args: ["mcp"] };
-  return { command: "bun", args: ["run", join(root, "src", "index.ts"), "mcp"] };
+  return { command: process.execPath, args: ["run", join(root, "src", "index.ts"), "mcp"] };
 }
 
 /** Claude Code and Kimi Code: `mcpServers.<name>` in an `.mcp.json`-shaped file. */
 function mergeMcpJson(path: string, command: string, args: string[]): Registration {
   const doc = readJsonObject(path);
-  const servers = isRecord(doc.mcpServers) ? { ...doc.mcpServers } : {};
+  const servers = serverEntries(doc, "mcpServers", path);
   const preserved = Object.keys(servers).filter((name) => name !== SERVER_NAME);
   servers[SERVER_NAME] = { command, args };
   doc.mcpServers = servers;
@@ -298,13 +303,19 @@ function locateKimiProject(dir: string): Location {
  * --command flag), so the JSON is merged directly.
  */
 function mergeOpencodeJson(path: string, command: string, args: string[]): Registration {
-  const doc = readJsonObject(path);
-  if (doc.$schema === undefined) doc.$schema = "https://opencode.ai/config.json";
-  const servers = isRecord(doc.mcp) ? { ...doc.mcp } : {};
+  const raw = existsSync(path) ? readFileSync(path, "utf8") : "{}";
+  const doc: unknown = Bun.JSONC.parse(raw.trim() || "{}");
+  if (!isRecord(doc)) throw new Error(`${path} must contain a JSON object.`);
+  const servers = serverEntries(doc, "mcp", path);
   const preserved = Object.keys(servers).filter((name) => name !== SERVER_NAME);
-  servers[SERVER_NAME] = { type: "local", command: [command, ...args], enabled: true };
-  doc.mcp = servers;
-  atomicWrite(path, `${JSON.stringify(doc, null, 2)}\n`);
+  const formattingOptions = { insertSpaces: true, tabSize: 2 };
+  let output = raw.trim() || "{}";
+  if (doc.$schema === undefined) {
+    output = applyEdits(output, modify(output, ["$schema"], "https://opencode.ai/config.json", { formattingOptions }));
+  }
+  output = applyEdits(output, modify(output, ["mcp", SERVER_NAME],
+    { type: "local", command: [command, ...args], enabled: true }, { formattingOptions }));
+  atomicWrite(path, `${output.trimEnd()}\n`);
   return { mcpPath: path, preserved };
 }
 
@@ -323,6 +334,7 @@ function mergeOpencodeJson(path: string, command: string, args: string[]): Regis
  */
 function mergeCodexToml(path: string, command: string, args: string[]): Registration {
   const raw = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const original = Bun.TOML.parse(raw);
 
   const kept: string[] = [];
   const preserved = new Set<string>();
@@ -356,11 +368,29 @@ function mergeCodexToml(path: string, command: string, args: string[]): Registra
     `args = [${args.map(tomlString).join(", ")}]`,
     "enabled = true",
   ].join("\n");
-  atomicWrite(path, before ? `${before}\n\n${block}\n` : `${block}\n`);
+  const output = before ? `${before}\n\n${block}\n` : `${block}\n`;
+  // Validate the real TOML before touching disk. The textual merge preserves
+  // comments, but must never reinterpret a multiline string as a table.
+  const updated = Bun.TOML.parse(output);
+  const withoutBaton = (doc: unknown): Record<string, unknown> => {
+    if (!isRecord(doc)) throw new Error(`${path} must contain a TOML table.`);
+    const result = { ...doc };
+    if (isRecord(result.mcp_servers)) {
+      const servers = { ...result.mcp_servers };
+      delete servers[SERVER_NAME];
+      if (Object.keys(servers).length === 0) delete result.mcp_servers;
+      else result.mcp_servers = servers;
+    }
+    return result;
+  };
+  if (!isDeepStrictEqual(withoutBaton(original), withoutBaton(updated))) {
+    throw new Error(`Cannot merge ${path} without changing unrelated TOML values; nothing was written.`);
+  }
+  atomicWrite(path, output);
   return { mcpPath: path, preserved: [...preserved].sort() };
 }
 
-const TABLE_HEADER = /^\[\s*([^[\]]+?)\s*\]$/;
+const TABLE_HEADER = /^\[\s*([^[\]]+?)\s*\]\s*(?:#.*)?$/;
 const SEGMENT = String.raw`(?:[A-Za-z0-9_-]+|"[^"]*"|'[^']*')`;
 const KEY_ASSIGNMENT = new RegExp(String.raw`^\s*(${SEGMENT}(?:\s*\.\s*${SEGMENT})*)\s*=`);
 
@@ -378,7 +408,7 @@ function keyPath(line: string): string[] | null {
 }
 
 function dottedPath(dotted: string): string[] {
-  return dotted.split(".").map((part) => {
+  return (dotted.match(new RegExp(SEGMENT, "g")) ?? []).map((part) => {
     const segment = part.trim();
     return segment.startsWith('"') || segment.startsWith("'") ? segment.slice(1, -1) : segment;
   });
@@ -427,14 +457,23 @@ export const BLOCK_END = `<!-- ${SERVER_NAME}:end -->`;
  * we refuse to guess at.
  */
 export function writeMarkedBlock(path: string, body: string): string {
+  atomicWrite(path, markedBlockContent(path, body));
+  return path;
+}
+
+function markedBlockContent(path: string, body: string): string {
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
   const block = `${BLOCK_BEGIN}\n${body.trim()}\n${BLOCK_END}\n`;
   const start = existing.indexOf(BLOCK_BEGIN);
   const end = existing.indexOf(BLOCK_END);
+  if ((start === -1 && end !== -1) ||
+      (start !== -1 && existing.indexOf(BLOCK_BEGIN, start + BLOCK_BEGIN.length) !== -1) ||
+      (end !== -1 && existing.indexOf(BLOCK_END, end + BLOCK_END.length) !== -1)) {
+    throw new Error(`${path} has unmatched or duplicate Baton markers; repair the block before installing.`);
+  }
   if (start === -1) {
     const before = existing.replace(/\s+$/, "");
-    atomicWrite(path, before ? `${before}\n\n${block}` : block);
-    return path;
+    return before ? `${before}\n\n${block}` : block;
   }
   if (end < start) {
     throw new Error(
@@ -442,8 +481,7 @@ export function writeMarkedBlock(path: string, body: string): string {
     );
   }
   const after = existing.slice(end + BLOCK_END.length).replace(/^\n/, "");
-  atomicWrite(path, `${existing.slice(0, start)}${block}${after}`);
-  return path;
+  return `${existing.slice(0, start)}${block}${after}`;
 }
 
 function readJsonObject(path: string): Record<string, unknown> {
@@ -463,9 +501,11 @@ function readJsonObject(path: string): Record<string, unknown> {
 }
 
 function atomicWrite(path: string, content: string): void {
+  if (existsSync(path)) path = realpathSync(path);
   const tmp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`;
   try {
-    writeFileSync(tmp, content, { mode: 0o644 });
+    const mode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
+    writeFileSync(tmp, content, { mode, flag: "wx" });
     renameSync(tmp, path);
   } catch (err) {
     try {
@@ -475,6 +515,13 @@ function atomicWrite(path: string, content: string): void {
     }
     throw err;
   }
+}
+
+function serverEntries(doc: Record<string, unknown>, key: string, path: string): Record<string, unknown> {
+  const value = doc[key];
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new Error(`${path}: ${key} must be an object; nothing was written.`);
+  return { ...value };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

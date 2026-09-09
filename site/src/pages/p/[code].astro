@@ -12,7 +12,7 @@ const env = appEnv();
 const code = normalizeShareCode(Astro.params.code ?? "");
 const share = code ? await profileByCode(env.DB, code) : null;
 if (!share) {
-  return new Response(null, { status: 404 });
+  return Astro.rewrite("/404");
 }
 const user = await currentUser(env, Astro.cookies);
 const entries = [...share.profile.entries].sort(

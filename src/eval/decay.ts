@@ -1,7 +1,7 @@
 import type { Accumulator } from "./types.ts";
 
 /**
- * The decay rule (PLAN.md §Decay), as pure math over the sufficient statistics.
+ * The decay rule, as pure math over the sufficient statistics.
  * No DB, no clock: every function takes the times it needs, so the write-side
  * (decay-forward on commit) and the read-side (residual decay to read time)
  * share one implementation and can be property-tested against brute force.
@@ -136,8 +136,8 @@ function nonNegative(value: number): number {
  * The later of two instants. An aggregate's `as_of` is its clock and must never
  * rewind, so an event that arrives out of order — a replayed grade, a backdated
  * report, a clock that stepped back — is folded in at the aggregate's own time
- * rather than at the older one it claims (PLAN.md §Decay: read-side decay is a
- * common factor, which only holds while `as_of` is monotonic).
+ * rather than at the older one it claims. Read-side decay is a common factor
+ * while `as_of` is monotonic.
  */
 export function laterOf(a: string, b: string): string {
   return Date.parse(b) > Date.parse(a) ? b : a;

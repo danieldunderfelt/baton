@@ -12,7 +12,7 @@ import type { AdapterSpec } from "../types.ts";
  * - `--output-format json` prints one JSON object with the answer in `result`;
  *   `stream-json` only adds parsing work for a one-shot delegation.
  * - `-p` with no positional prompt reads the prompt from stdin (verified).
- * - Session persistence is deliberately left on: `session_id` is what phase-2
+ * - Session persistence is deliberately left on: `session_id` is what session
  *   session affinity resumes with (`--resume`), so `--no-session-persistence`
  *   would trade resumability for nothing.
  * - There is no command that lists models. `--model` takes an alias for the

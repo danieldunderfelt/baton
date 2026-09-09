@@ -2,8 +2,7 @@ import { BT_SHRINKAGE_WEIGHT, TIE_WEIGHT } from "./duelTypes.ts";
 import type { BtEdge, BtPrior, BtRating } from "./duelTypes.ts";
 
 /**
- * Regularized Bradley-Terry over log-strengths (PLAN.md §Evaluation: "shrinkage
- * to the canonical prior, identifiability anchored"). Every model gets a
+ * Regularized Bradley-Terry over log-strengths. Every model gets a
  * shrinkage pseudo-edge against a fixed virtual anchor (theta 0), so sparse or
  * disconnected duel graphs stay numerically identified instead of diverging:
  * duel evidence moves a model away from its prior, never the reverse.

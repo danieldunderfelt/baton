@@ -16,7 +16,7 @@ import type { AdapterSpec } from "../types.ts";
  *   `HOME` does move the credential store, but `HOME` moves *everything* about a
  *   child process; it is not this app's identity var.) So cursor-agent has only
  *   the inherited-environment `default` instance and no pool is possible, same
- *   as opencode — PLAN.md §Instance mechanics excludes both.
+ *   as opencode — neither app supports instance pools.
  * - Failures do not respect `--output-format`. A bad slug, a bad API key and a
  *   logged-out config all exit 1 with a plain-text line on stderr and no JSON at
  *   all, so nothing here may assume a well-formed envelope on the failure path;

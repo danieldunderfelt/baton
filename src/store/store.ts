@@ -6,13 +6,13 @@ import { Database } from "bun:sqlite";
 import { pruneQuotaEvents } from "../quota/quota.ts";
 
 /**
- * SQLite is the source of truth for everything mutable (PLAN.md §Architecture).
+ * SQLite is the source of truth for everything mutable.
  * WAL + busy_timeout + retry-on-BUSY; serialized, versioned migrations.
  * One DB per scope — the path comes from resolvePaths(), never hardcoded.
  */
 
 const MIGRATIONS: string[] = [
-  // v1 — phase-1 schema: runs, attempts, settings, instances.
+  // v1 — base schema: runs, attempts, settings, instances.
   `
   CREATE TABLE runs (
     id              TEXT PRIMARY KEY,
@@ -68,8 +68,8 @@ const MIGRATIONS: string[] = [
   // v2 — payload-bound idempotency: the hash of the request an idempotency_key
   // was minted for, so a reused key with a different payload can be rejected.
   `ALTER TABLE runs ADD COLUMN payload_hash TEXT;`,
-  // v3 — phase 2: eval foundation (grades, decayed accumulator, priors),
-  // quota observation, cooldowns, pools. PLAN.md §Evaluation, §Quota-aware cost.
+  // v3 — ratings foundation (grades, decayed accumulator, priors),
+  // quota observation, cooldowns, and pools.
   `
   CREATE TABLE grades (
     run_id    TEXT PRIMARY KEY REFERENCES runs(id),
@@ -142,9 +142,9 @@ const MIGRATIONS: string[] = [
   // scope (a CLI run + a callee's own MCP server), so orphan recovery must know
   // which process owns an in-flight attempt before declaring it abandoned.
   `ALTER TABLE attempts ADD COLUMN owner_pid INTEGER;`,
-  // v5 — phase 3: blind duels + decayed Bradley-Terry edge map, and the
-  // quarantine store for agentically discovered adapters (PLAN.md §Agentic
-  // discovery: approval precedes execution).
+  // v5 — blind duels + decayed Bradley-Terry edge map, and the
+  // quarantine store for agentically discovered adapters. Approval precedes
+  // execution.
   `
   CREATE TABLE duels (
     id          TEXT PRIMARY KEY,
@@ -183,7 +183,7 @@ const MIGRATIONS: string[] = [
   );
   `,
   // v6 — the duel rows outlive the runs they point at. The ring buffer evicts
-  // runs by age (PLAN.md §Evaluation), and a foreign key to runs(id) turned
+  // runs by age, and a foreign key to runs(id) turned
   // that eviction into "FOREIGN KEY constraint failed" inside openStore, i.e.
   // every process in the scope failing to open the database. A duel whose runs
   // are gone is void, not judgeable — which is what duelView already reports —
@@ -206,13 +206,13 @@ const MIGRATIONS: string[] = [
   ALTER TABLE duels_v6 RENAME TO duels;
   `,
   // v7 — Σw² per duel edge, the same sufficient statistic the accumulator keeps
-  // (PLAN.md §Decay: "Σw² decays by the square"). Without it nEff on the BT side
+  // Σw² decays by the square of the factor. Without it nEff on the BT side
   // was the raw decayed mass, which calls ten half-faded duels one observation.
   // Existing edges start at 0 and therefore report nEff 0 until they are judged
   // again; they are days old and decay, so no backfill is attempted (a backfill
   // would have to invent the event weights that are exactly what was not kept).
   `ALTER TABLE bt_edges ADD COLUMN mass2 REAL NOT NULL DEFAULT 0;`,
-  // v8 — the user-owned route deny list (PLAN.md §Registry: route blocks).
+  // v8 — the user-owned route deny list.
   // Baton cannot tell whose subscription a route spends, so the user can name
   // the ones it must never spend; written only through the trusted CLI, like
   // the authority ceiling.
@@ -223,9 +223,26 @@ const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL
   );
   `,
+  // Separate independent providers served by the same CLI. Old OpenCode
+  // cooldowns have no provider attribution, so discard those transient rows.
+  `
+  CREATE TABLE cooldowns_v9 (
+    app TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    until TEXT NOT NULL,
+    strikes INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    PRIMARY KEY (app, instance, scope)
+  );
+  INSERT INTO cooldowns_v9 (app, instance, until, strikes, reason)
+    SELECT app, instance, until, strikes, reason FROM cooldowns WHERE app != 'opencode';
+  DROP TABLE cooldowns;
+  ALTER TABLE cooldowns_v9 RENAME TO cooldowns;
+  `,
 ];
 
-/** Ring-buffer cap on retained runs (PLAN.md §Evaluation: ~2,000 runs). */
+/** Ring-buffer cap on retained runs: about 2,000. */
 export const RUN_CAP = 2000;
 
 export function openStore(dbPath: string, cap = RUN_CAP): Database {
@@ -236,8 +253,8 @@ export function openStore(dbPath: string, cap = RUN_CAP): Database {
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
   // Every Baton process opens the store, so retention self-maintains without a
-  // background job: the run ring buffer (PLAN.md §Evaluation) and the quota
-  // observations no window can still see (PLAN.md §Quota-aware cost).
+  // background job: the run ring buffer and the quota observations no window
+  // can still see.
   pruneRuns(db, cap);
   withBusyRetry(() => pruneQuotaEvents(db, nowIso()));
   return db;
@@ -287,6 +304,7 @@ export function pruneRuns(db: Database, cap = RUN_CAP): number {
       const victims = `SELECT id FROM runs WHERE status NOT IN ('queued','running')
                        ORDER BY created_at, rowid LIMIT ?`;
       db.query(`DELETE FROM attempts WHERE run_id IN (${victims})`).run(excess);
+      db.query(`DELETE FROM grades WHERE run_id IN (${victims})`).run(excess);
       return db.query(`DELETE FROM runs WHERE id IN (${victims})`).run(excess).changes;
     }),
   );
@@ -294,6 +312,11 @@ export function pruneRuns(db: Database, cap = RUN_CAP): number {
 
 function countRuns(db: Database): number {
   return db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()?.n ?? 0;
+}
+
+/** One write transaction, with the same busy retry and rollback in every store. */
+export function inTransaction<T>(db: Database, fn: () => T): T {
+  return withBusyRetry(() => inImmediate(db, fn));
 }
 
 /** BEGIN IMMEDIATE ... COMMIT, rolling back on failure. Busy-on-BEGIN never rolls back. */

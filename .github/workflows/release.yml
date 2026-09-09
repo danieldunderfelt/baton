@@ -33,6 +33,15 @@ jobs:
       - name: Build release binaries
         run: bun run build:all
 
+      - name: Typecheck and test
+        run: |
+          bun run check
+          bun run build
+          bun run test
+
+      - name: Check the Linux release artifact
+        run: bun run check:release dist/baton-linux-x64
+
       - name: Create checksums
         run: cd dist && sha256sum baton-* > SHA256SUMS
 

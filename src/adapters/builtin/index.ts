@@ -5,7 +5,7 @@ import { cursorAdapter } from "./cursor.ts";
 import { kimiAdapter } from "./kimi.ts";
 import { opencodeAdapter } from "./opencode.ts";
 
-/** Pinned, CI-tested adapters (PLAN.md §Agentic discovery). Deterministic order: by app id. */
+/** Pinned, CI-tested adapters. Deterministic order: by app id. */
 export const builtinAdapters: AdapterSpec[] = [
   claudeCodeAdapter,
   codexAdapter,

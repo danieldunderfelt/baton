@@ -1,5 +1,4 @@
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
 import { join } from "node:path";
 
 import type { ProfileDocument } from "../eval/profileDocument.ts";
@@ -8,12 +7,15 @@ import { validateProfileDocument } from "../eval/profileDocument.ts";
 /**
  * Client for the sharing site: sign in with GitHub through a device flow, then
  * publish, fetch, list and revoke shared profiles. A share is a profile
- * document (PLAN.md §Layering and sharing — canonical priors, nothing local)
+ * document containing canonical priors and nothing local
  * reachable by a short code; the site keeps no directory of them.
  *
  * The token lives in the scope's config dir, so each BATON_CONFIG_DIR world
  * signs in on its own, like everything else Baton knows.
  */
+
+import { normalizeShareCode } from "../eval/shareCode.ts";
+export { normalizeShareCode } from "../eval/shareCode.ts";
 
 export const DEFAULT_SITE_URL = "https://baton.sh";
 export const AUTH_FILE = "auth.json";
@@ -94,7 +96,7 @@ export async function deviceLogin(site: string, opts: LoginOptions = {}): Promis
   const print = opts.print ?? ((line: string) => console.log(line));
   const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
   const start = await call<DeviceStart>(site, "POST", "/api/device/code", {
-    body: { label: opts.label ?? hostname() },
+    body: { label: opts.label ?? "cli" },
   });
   print(`Open ${start.verification_uri_complete}`);
   print(`and confirm the code ${start.user_code} to sign in with GitHub.`);
@@ -181,8 +183,6 @@ export function revokeToken(site: string, token: string): Promise<void> {
   return call<void>(site, "POST", "/api/auth/revoke", { token });
 }
 
-const SHARE_CODE = /^[a-z0-9]{5}-[a-z0-9]{5}$/;
-
 /**
  * A share reference as the user typed it: the bare code, the code without its
  * dash, or the share link. Null for anything else (a file path, say). Any host
@@ -200,18 +200,15 @@ export function parseShareRef(arg: string): { code: string; site: string | null 
     }
     const match = /^\/p\/([^/]+)\/?$/.exec(url.pathname);
     if (!match) return null;
-    const code = normalizeShareCode(decodeURIComponent(match[1]!));
-    return code ? { code, site: url.origin } : null;
+    try {
+      const code = normalizeShareCode(decodeURIComponent(match[1]!));
+      return code ? { code, site: url.origin } : null;
+    } catch {
+      return null;
+    }
   }
   const code = normalizeShareCode(trimmed);
   return code ? { code, site: null } : null;
-}
-
-export function normalizeShareCode(text: string): string | null {
-  const compact = text.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (compact.length !== 10) return null;
-  const code = `${compact.slice(0, 5)}-${compact.slice(5)}`;
-  return SHARE_CODE.test(code) ? code : null;
 }
 
 interface CallOptions {

@@ -1,6 +1,6 @@
 import type { APIRoute } from "astro";
 
-import { ApiError, handle, json, readJson } from "../../../lib/api.ts";
+import { ApiError, handle, json, readJsonObject } from "../../../lib/api.ts";
 import { createDeviceCode, pendingDeviceCount, purgeExpired } from "../../../lib/db.ts";
 import { appEnv, siteOrigin } from "../../../lib/env.ts";
 
@@ -12,7 +12,7 @@ const MAX_PENDING_DEVICES = 500;
 export const POST: APIRoute = ({ request }) =>
   handle(async () => {
     const env = appEnv();
-    const body = (await readJson(request)) as { label?: unknown };
+    const body = await readJsonObject(request);
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 80) : "cli";
     if ([...label].some((ch) => ch.charCodeAt(0) < 32)) {
       throw new ApiError(400, "bad_request", "label must be a single line.");

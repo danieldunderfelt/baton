@@ -1,15 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import type { AdapterSpec, ExecRequest, ExecResult, ExtractSpec } from "./types.ts";
 
 /**
  * The only place Baton spawns a callee CLI. Environment-transparent
- * (PLAN.md §Identity): req.env is passed verbatim — nothing added, nothing
+ * Environment-transparent: req.env is passed verbatim — nothing added, nothing
  * scrubbed. argv is an array built from the declarative spec, never a shell
  * string. The child is detached so it leads its own process group, which lets
  * a timeout kill the whole tree (`kill(-pid)`), not just the CLI wrapper.
  */
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
+/** JSON envelopes must be parsed whole, independently of the diagnostic tail. */
+const MAX_JSON_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** Time between SIGTERM and SIGKILL of the callee's process group. */
 const KILL_GRACE_MS = 5_000;
 /** Overall budget for a group to be verifiably dead, SIGTERM to last poll. */
@@ -27,6 +30,10 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
   const stdout = new Tail(cap);
   const stdoutHead = new Head(SESSION_HEAD_BYTES);
   const stderr = new Tail(cap);
+  const json = req.spec.invoke.extract.kind === "json" || req.spec.sessionRef?.kind === "json"
+    ? new Head(MAX_JSON_OUTPUT_BYTES) : undefined;
+  const stdoutWork = new MarkerDetector(req.spec.workStartedPatterns ?? []);
+  const stderrWork = new MarkerDetector(req.spec.workStartedPatterns ?? []);
 
   const flags = req.spec.autonomyFlags[req.autonomy];
   if (flags === undefined) {
@@ -107,6 +114,9 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
             stdout: stdout.text(),
             stdoutHead: stdoutHead.text(),
             stdoutTruncated: stdout.truncated,
+            json: json?.text(),
+            jsonTruncated: json?.truncated ?? false,
+            workStarted: stdoutWork.matched || stderrWork.matched,
             stderr: stderr.text(),
             exitCode,
             timedOut,
@@ -123,8 +133,13 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout.push(chunk);
       stdoutHead.push(chunk);
+      json?.push(chunk);
+      stdoutWork.push(chunk);
     });
-    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr.push(chunk);
+      stderrWork.push(chunk);
+    });
     child.on("error", (err) => {
       spawnError = `spawn failed: ${message(err)}`;
       finish(null);
@@ -149,7 +164,7 @@ export type FailureClass = "admission" | "failure";
  * output says the callee already started working. A rate-limit notice printed
  * after four minutes of edits reads exactly like one printed at the door —
  * only the surrounding stream tells them apart, and when in doubt the run
- * fails instead of failing over (PLAN.md §Failover on admission failure only).
+ * fails instead of failing over.
  */
 export function classifyFailure(spec: AdapterSpec, res: ExecResult): FailureClass {
   const haystack = `${res.rawTail}\n${res.error ?? ""}`.toLowerCase();
@@ -158,7 +173,7 @@ export function classifyFailure(spec: AdapterSpec, res: ExecResult): FailureClas
       (pattern) => pattern.length > 0 && haystack.includes(pattern.toLowerCase()),
     );
   if (!matches(spec.admissionFailurePatterns)) return "failure";
-  return matches(spec.workStartedPatterns) ? "failure" : "admission";
+  return res.workStarted || matches(spec.workStartedPatterns) ? "failure" : "admission";
 }
 
 /** Did this failure look like a rejection *before any work started*? */
@@ -193,6 +208,9 @@ interface Outcome {
   /** First SESSION_HEAD_BYTES of stdout, kept for sessionRef extraction. */
   stdoutHead: string;
   stdoutTruncated: boolean;
+  json?: string;
+  jsonTruncated: boolean;
+  workStarted: boolean;
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
@@ -208,7 +226,9 @@ function buildResult(o: Outcome): ExecResult {
   // runs that did not finish, which are exactly the ones we may want to resume.
   // Verbose runs push the session line (typically the first) out of the tail,
   // so search head+tail — the answer still comes from the tail alone.
-  const sessionSource = o.stdoutTruncated ? `${o.stdoutHead}\n${o.stdout}` : o.stdout;
+  const sessionSource = o.req.spec.sessionRef?.kind === "json"
+    ? (o.jsonTruncated ? "" : o.json ?? o.stdout)
+    : o.stdoutTruncated ? `${o.stdoutHead}\n${o.stdout}` : o.stdout;
   const session = o.req.spec.sessionRef && extract(o.req.spec.sessionRef, sessionSource);
   const base = {
     // A spawn error means the process never ran; anything else got that far.
@@ -217,6 +237,7 @@ function buildResult(o: Outcome): ExecResult {
     timedOut: o.timedOut,
     rawTail,
     durationMs: o.durationMs,
+    workStarted: o.workStarted,
     ...(session?.ok ? { sessionRef: session.value } : {}),
   };
 
@@ -235,7 +256,11 @@ function buildResult(o: Outcome): ExecResult {
       error: `exited with code ${o.exitCode}${tail ? `: ${tail}` : ""}`,
     };
   }
-  const extracted = extract(o.req.spec.invoke.extract, o.stdout);
+  if (o.req.spec.invoke.extract.kind === "json" && o.jsonTruncated) {
+    return { ...base, ok: false, error: `JSON output exceeded ${MAX_JSON_OUTPUT_BYTES} bytes; ask the callee to save large results to a file.` };
+  }
+  const extracted = extract(o.req.spec.invoke.extract,
+    o.req.spec.invoke.extract.kind === "json" ? o.json ?? o.stdout : o.stdout);
   if (!extracted.ok) {
     return { ...base, ok: false, error: `extraction failed: ${extracted.why}` };
   }
@@ -445,11 +470,13 @@ class Tail {
 class Head {
   private chunks: Buffer[] = [];
   private size = 0;
+  truncated = false;
 
   constructor(private readonly cap: number) {}
 
   push(chunk: Buffer): void {
     const room = this.cap - this.size;
+    if (chunk.length > room) this.truncated = true;
     if (room <= 0) return;
     this.chunks.push(chunk.length <= room ? chunk : chunk.subarray(0, room));
     this.size += Math.min(chunk.length, room);
@@ -457,5 +484,26 @@ class Head {
 
   text(): string {
     return Buffer.concat(this.chunks).toString("utf8");
+  }
+}
+
+/** Remember evidence of work even after its log line falls out of the tail. */
+class MarkerDetector {
+  matched = false;
+  private tail = "";
+  private readonly decoder = new StringDecoder("utf8");
+  private readonly patterns: string[];
+  private readonly overlap: number;
+
+  constructor(patterns: string[]) {
+    this.patterns = patterns.filter(Boolean).map((pattern) => pattern.toLowerCase());
+    this.overlap = Math.max(0, ...this.patterns.map((pattern) => pattern.length - 1));
+  }
+
+  push(chunk: Buffer): void {
+    if (this.matched || this.patterns.length === 0) return;
+    const text = this.tail + this.decoder.write(chunk).toLowerCase();
+    this.matched = this.patterns.some((pattern) => text.includes(pattern));
+    this.tail = this.matched || this.overlap === 0 ? "" : text.slice(-this.overlap);
   }
 }

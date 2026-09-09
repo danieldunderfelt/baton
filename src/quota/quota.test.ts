@@ -60,6 +60,14 @@ describe("recordRun", () => {
 });
 
 describe("recordAdmissionFailure — cooldowns", () => {
+  test("success clears only the provider that recovered", () => {
+    const db = scopeStore("provider-recovery");
+    recordAdmissionFailure(db, "opencode", "default", at(0), "429", undefined, "a");
+    recordAdmissionFailure(db, "opencode", "default", at(0), "429", undefined, "b");
+    clearCooldown(db, "opencode", "default", "a");
+    expect(coolingUntil(db, "opencode", "default", at(0), "a")).toBeUndefined();
+    expect(coolingUntil(db, "opencode", "default", at(0), "b")).toBeDefined();
+  });
   test("consecutive strikes back off exponentially and cap", () => {
     const db = scopeStore("quota-backoff");
     const untils: number[] = [];

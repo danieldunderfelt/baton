@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { newId, nowIso, withBusyRetry } from "../store/store.ts";
+import { inTransaction, newId, nowIso, withBusyRetry } from "../store/store.ts";
 import type { RunOptions, RunRequest, RunStatus, RunView } from "../supervisor/types.ts";
 import { fitBradleyTerry } from "./bradleyTerry.ts";
 import { decayFactor, laterOf, weightAt } from "./decay.ts";
@@ -15,7 +15,7 @@ import { activePriors, bumpRevision, halfLifeMsFor, profileWeight } from "./eval
 import { PRIOR_WEIGHT_CAP } from "./types.ts";
 
 /**
- * Blind duels (PLAN.md §Evaluation): both sides run through the ordinary
+ * Blind duels: both sides run through the ordinary
  * supervisor with an IDENTICAL prompt, options and cwd — the model name is
  * never written into the prompt, and nothing beyond the two runs is retained
  * (their prompts live in the run ring buffer like any other run's).
@@ -183,7 +183,7 @@ function viewOf(row: DuelRow, status: DuelView["status"]): DuelView {
  * before the new one is added, so a correction can never double-count.
  *
  * The revision bumps in the same transaction as the edge, so the ratings.yaml
- * publisher can never render a half-applied judgment (PLAN.md §Publication).
+ * publisher can never render a half-applied judgment.
  */
 export function reportDuel(
   db: Database,
@@ -385,7 +385,7 @@ function saveEdge(db: Database, edge: EdgeState): void {
 
 /**
  * The edge map decayed to read time. Edges are stored decayed-forward to their
- * own `as_of` (PLAN.md §Decay), so every reader owes the same residual factor
+ * own `as_of`, so every reader owes the same residual factor
  * before fitting — one implementation of that rule, not one per surface.
  */
 export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
@@ -405,7 +405,7 @@ export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
         winsA: row.wins_a * f,
         winsB: row.wins_b * f,
         ties: row.ties * f,
-        // Σw² decays by the square of the factor (PLAN.md §Decay).
+        // Σw² decays by the square of the factor.
         mass2: row.mass2 * f * f,
         asOf: at,
       };
@@ -415,7 +415,7 @@ export function currentEdges(db: Database, at = nowIso()): BtEdge[] {
 /**
  * The regularized Bradley-Terry fit over the current edges, shrunk toward the
  * active profile's canonical priors. Reported as a SEPARATE signal from the
- * grade EMAs — never merged into `blended` (PLAN.md §Layering and sharing).
+ * grade EMAs — never merged into `blended`.
  *
  * Fitted one category at a time, because a prior is per (model, category): a
  * model seeded 5 for implementation and 1 for review must not be shrunk toward
@@ -454,7 +454,7 @@ interface PriorIndex {
  * under the default profile weight gets the whole shrinkage budget, and a thin,
  * stale or down-weighted one gets proportionally less of it — the fit falls back
  * to the neutral anchor for the rest. Without this every prior, however faded,
- * pulled with identical force (PLAN.md §Decay: priors decay from *their* as_of).
+ * pulled with identical force.
  */
 function priorIndex(db: Database, at: string): PriorIndex {
   const hl = halfLifeMsFor(db);
@@ -488,23 +488,4 @@ function clamp(value: number): number {
 /** Unbiased enough for a coin flip, and unguessable by the caller. */
 function coinFlip(): boolean {
   return (crypto.getRandomValues(new Uint8Array(1))[0]! & 1) === 1;
-}
-
-/** BEGIN IMMEDIATE ... COMMIT with busy retry; the same discipline evalStore uses. */
-function inTransaction<T>(db: Database, fn: () => T): T {
-  return withBusyRetry(() => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = fn();
-      db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // SQLite already rolled back; the original error is what matters.
-      }
-      throw err;
-    }
-  });
 }

@@ -27,7 +27,7 @@ baton profile share            # then open the link it prints
 baton profile import <code>    # from any scope, e.g. BATON_CONFIG_DIR=/tmp/other
 ```
 
-Checks: `bun test` (pure helpers), `bun run check` (Astro + TypeScript), `bun run build`.
+Checks: `bun test` (helpers and local D1 integration tests), `bun run check` (Astro + TypeScript), `bun run build`.
 
 ## Deploy
 
@@ -49,7 +49,7 @@ bun run deploy                            # astro build && wrangler deploy
 
 Links the CLI prints use the origin of the request that created them. Set `"vars": { "SITE_URL": "https://..." }` in `wrangler.jsonc` only if the Worker is reachable under more than one host and one should be canonical.
 
-The CLI's default site is `DEFAULT_SITE_URL` in `../src/cli/share.ts`; change it when the domain is decided, and the `site` field in `astro.config.mjs` with it.
+The public site is `https://baton.sh`. For another deployment, set `BATON_SITE_URL` in the CLI environment and update `site` in `astro.config.mjs`.
 
 ## Layout
 

@@ -22,14 +22,47 @@ When a run comes in, Baton picks a route for the requested model, spawns that ap
 
 ## Install
 
-Two commands, once per machine:
+Install Baton once per machine:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/danieldunderfelt/baton/main/install.sh | sh
 baton install --user
 ```
 
-The first puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second registers Baton with every supported agent app found on PATH — Claude Code, Codex, Kimi Code, OpenCode — in each app's own global config, and writes the instructions that teach its agent when to delegate and how to grade what comes back. Start a new session in any app and the `baton` tools are there.
+The first command puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second command registers Baton with the four caller hosts it finds on PATH: Claude Code, Codex, Kimi Code, and OpenCode. It writes each host's global config and the instructions that teach its agent when to delegate and how to grade what comes back.
+
+Cursor Agent is a callee, not one of the caller hosts configured by `baton install --user`. Configure its MCP server manually if you want Cursor Agent to call Baton.
+
+Shells use the first matching executable in `PATH`. Check which binary your shell will run with `type -a baton`, and put the user install first when needed:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Start a new agent session after installing or updating so it loads the new MCP server. A session that is already running keeps its old server.
+
+For usage, run `baton <command> --help`. `baton --help` lists the top-level commands.
+
+### Recovering a v0.1.0 install
+
+The v0.1.0 release predates `install --user` and `update`. Those commands require v0.2.0 or later. Check the version and every matching executable before choosing a recovery path:
+
+```sh
+baton --version
+type -a baton
+```
+
+If the binary is v0.1.0, build the current source. If a different copy appears first in `PATH`, put `~/.local/bin` first. This path requires Bun:
+
+```sh
+git clone https://github.com/danieldunderfelt/baton.git
+cd baton
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+"$HOME/.local/bin/baton" install --user
+```
+
+After a release that includes these commands is published, rerunning the curl installer also updates the binary. Restart agent sessions after the update.
 
 To update:
 
@@ -113,7 +146,7 @@ baton pool set claude-code default personal-2
 From then on every delegation to an opus or sonnet model picks an account automatically:
 
 - Selection favours the account with the most quota headroom, so both usage windows stay warm instead of one draining while the other sits idle. Subscription quota comes in rolling windows; two accounts drained evenly get you more work per day than two drained in sequence.
-- An account that hits a rate limit before starting work goes into cooldown (until the provider's stated reset when one is given, with growing backoff otherwise) and the run retries on the next account under the same run id.
+- An admission failure puts the account into an exponential cooldown backoff, and the run retries on the next account under the same run id.
 - Failover only happens when the refusal provably came before any work started. If a failure happens after work may have begun, Baton fails the run instead of silently re-running it, because the first attempt may have edited files.
 - Resumed runs skip the pool and go back to the account that holds the session.
 - `baton pool list` shows the live picture: headroom per account and who is cooling down.
@@ -168,12 +201,12 @@ If the app's binary is later upgraded, the adapter is marked stale and re-verifi
 ## Development
 
 ```sh
-bun test               # full suite; no live CLI calls, no quota spent
+bun run test           # CLI suite; no live CLI calls, no quota spent
 BATON_LIVE_TESTS=1 bun test src/adapters/builtin   # live canaries, costs a few real prompts
 bunx tsc --noEmit
 bun run build
 ```
 
-PLAN.md is the design document, including the review log of every design decision and external code review. Server: `baton mcp` (stdio) or `baton serve --http --port 7317` (one daemon per environment).
+Server: `baton mcp` (stdio) or `baton serve --http --port 7317` (one daemon per environment).
 
 The website and the profile-sharing service live in `site/` (Astro on Cloudflare Workers with D1); see `site/README.md` for running it locally and deploying. `BATON_SITE_URL` points the CLI at a local or self-hosted instance.

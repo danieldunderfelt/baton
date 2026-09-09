@@ -24,30 +24,14 @@ export async function upsertUser(
   db: D1Database,
   github: { id: number; login: string; avatar_url: string | null },
 ): Promise<User> {
-  const existing = await db
-    .prepare("SELECT * FROM users WHERE github_id = ?")
-    .bind(github.id)
+  const user = await db
+    .prepare(`INSERT INTO users (id, github_id, login, avatar_url, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (github_id) DO UPDATE SET login = excluded.login, avatar_url = excluded.avatar_url
+      RETURNING *`)
+    .bind(`u_${randomSecret(96)}`, github.id, github.login, github.avatar_url, nowIso())
     .first<User>();
-  if (existing) {
-    if (existing.login !== github.login || existing.avatar_url !== github.avatar_url) {
-      await db
-        .prepare("UPDATE users SET login = ?, avatar_url = ? WHERE id = ?")
-        .bind(github.login, github.avatar_url, existing.id)
-        .run();
-    }
-    return { ...existing, login: github.login, avatar_url: github.avatar_url };
-  }
-  const user: User = {
-    id: `u_${randomSecret(96)}`,
-    github_id: github.id,
-    login: github.login,
-    avatar_url: github.avatar_url,
-    created_at: nowIso(),
-  };
-  await db
-    .prepare("INSERT INTO users (id, github_id, login, avatar_url, created_at) VALUES (?, ?, ?, ?, ?)")
-    .bind(user.id, user.github_id, user.login, user.avatar_url, user.created_at)
-    .run();
+  if (!user) throw new Error("User upsert returned no row.");
   return user;
 }
 
@@ -160,13 +144,19 @@ export type DeviceRedeem =
 export async function redeemDevice(db: D1Database, rawDeviceCode: string): Promise<DeviceRedeem> {
   const hash = await sha256Hex(rawDeviceCode);
   const now = nowIso();
-  const claimed = await db
-    .prepare(
-      `DELETE FROM device_codes WHERE device_code_hash = ? AND user_id IS NOT NULL AND expires_at > ?
-       RETURNING user_id, label`,
-    )
-    .bind(hash, now)
-    .first<{ user_id: string; label: string }>();
+  const token = `bt_${randomSecret()}`;
+  const tokenHash = await sha256Hex(token);
+  // Token creation and code consumption commit together. A failed insert
+  // keeps the code usable; concurrent polls cannot mint twice.
+  const [inserted] = await db.batch<{ user_id: string }>([
+    db.prepare(`INSERT INTO tokens (token_hash, user_id, label, created_at)
+      SELECT ?, user_id, label, ? FROM device_codes
+      WHERE device_code_hash = ? AND user_id IS NOT NULL AND expires_at > ?
+      RETURNING user_id`).bind(tokenHash, now, hash, now),
+    db.prepare(`DELETE FROM device_codes
+      WHERE device_code_hash = ? AND user_id IS NOT NULL AND expires_at > ?`).bind(hash, now),
+  ]);
+  const claimed = inserted?.results[0];
   if (!claimed) {
     const row = await db
       .prepare("SELECT expires_at FROM device_codes WHERE device_code_hash = ?")
@@ -181,11 +171,6 @@ export async function redeemDevice(db: D1Database, rawDeviceCode: string): Promi
   }
   const user = await db.prepare("SELECT * FROM users WHERE id = ?").bind(claimed.user_id).first<User>();
   if (!user) return { status: "invalid" };
-  const token = `bt_${randomSecret()}`;
-  await db
-    .prepare("INSERT INTO tokens (token_hash, user_id, label, created_at) VALUES (?, ?, ?, ?)")
-    .bind(await sha256Hex(token), user.id, claimed.label, now)
-    .run();
   return { status: "ok", token, login: user.login };
 }
 
@@ -238,33 +223,19 @@ export async function upsertProfile(
 ): Promise<ShareSummary & { created: boolean }> {
   const now = nowIso();
   const document = JSON.stringify(doc);
-  const existing = await db
-    .prepare("SELECT code, created_at FROM profiles WHERE user_id = ? AND name = ?")
-    .bind(userId, doc.name)
-    .first<{ code: string; created_at: string }>();
-  if (existing) {
-    await db
-      .prepare("UPDATE profiles SET document = ?, entry_count = ?, updated_at = ? WHERE code = ?")
-      .bind(document, doc.entries.length, now, existing.code)
-      .run();
-    return {
-      code: existing.code,
-      name: doc.name,
-      entry_count: doc.entries.length,
-      created_at: existing.created_at,
-      updated_at: now,
-      created: false,
-    };
-  }
   const code = newShareCode();
-  await db
+  const row = await db
     .prepare(
       `INSERT INTO profiles (code, user_id, name, document, entry_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (user_id, name) DO UPDATE SET
+         document = excluded.document, entry_count = excluded.entry_count, updated_at = excluded.updated_at
+       RETURNING code, name, entry_count, created_at, updated_at`,
     )
     .bind(code, userId, doc.name, document, doc.entries.length, now, now)
-    .run();
-  return { code, name: doc.name, entry_count: doc.entries.length, created_at: now, updated_at: now, created: true };
+    .first<ShareSummary>();
+  if (!row) throw new Error("Profile upsert returned no row.");
+  return { ...row, created: row.code === code };
 }
 
 export interface SharedProfile extends ShareSummary {

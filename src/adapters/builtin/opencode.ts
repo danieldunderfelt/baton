@@ -23,6 +23,7 @@ import type { AdapterSpec } from "../types.ts";
  */
 export const opencodeAdapter: AdapterSpec = {
   app: "opencode",
+  cooldownScope: "provider",
   adapterVersion: 1,
   binary: "opencode",
   identityEnv: "XDG_DATA_HOME",

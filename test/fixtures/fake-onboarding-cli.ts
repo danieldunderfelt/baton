@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * A "previously unknown agent app" for the phase-3 exit-criterion rehearsal
+ * A "previously unknown agent app" for the onboarding rehearsal
  * (test/onboarding.e2e.test.ts). It behaves like the non-interactive surface of
  * a real agent CLI — `--version`, a prompt on stdin, JSONL on stdout carrying a
  * session id and a result record — without a model, a network call or a

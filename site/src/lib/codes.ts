@@ -5,19 +5,11 @@ import { randomString } from "./crypto.ts";
  * (no 0/o, 1/l/i), shown as `xxxxx-xxxxx`. That is ~49 bits, and the code is
  * the only way to reach a share: enough that guessing one is not a strategy.
  */
-const SHARE_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
-const SHARE_LENGTH = 10;
+import { SHARE_ALPHABET, SHARE_LENGTH } from "../../../src/eval/shareCode.ts";
+export { normalizeShareCode } from "../../../src/eval/shareCode.ts";
 
 export function newShareCode(): string {
   return format(randomString(SHARE_ALPHABET, SHARE_LENGTH), 5);
-}
-
-/** The canonical form of whatever the user pasted, or null if it cannot be one. */
-export function normalizeShareCode(text: string): string | null {
-  const compact = text.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (compact.length !== SHARE_LENGTH) return null;
-  for (const ch of compact) if (!SHARE_ALPHABET.includes(ch)) return null;
-  return format(compact, 5);
 }
 
 /**

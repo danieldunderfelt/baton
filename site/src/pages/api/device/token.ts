@@ -1,6 +1,6 @@
 import type { APIRoute } from "astro";
 
-import { ApiError, handle, json, readJson } from "../../../lib/api.ts";
+import { ApiError, handle, json, readJsonObject } from "../../../lib/api.ts";
 import { redeemDevice } from "../../../lib/db.ts";
 import { appEnv } from "../../../lib/env.ts";
 
@@ -10,7 +10,7 @@ export const prerender = false;
 export const POST: APIRoute = ({ request }) =>
   handle(async () => {
     const env = appEnv();
-    const body = (await readJson(request)) as { device_code?: unknown };
+    const body = await readJsonObject(request);
     if (typeof body.device_code !== "string" || !body.device_code) {
       throw new ApiError(400, "bad_request", "device_code is required.");
     }

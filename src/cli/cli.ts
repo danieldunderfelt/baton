@@ -121,11 +121,12 @@ import {
   writeAuth,
   type AuthFile,
 } from "./share.ts";
+import { COMMANDS, HELP, wantsHelp } from "./help.ts";
 import { CURRENT_VERSION, selfUpdate } from "./update.ts";
 
 /**
  * The trusted face of Baton: the only place the authority ceiling and instance
- * definitions can be written (never through a tool call — PLAN.md §Execution).
+ * definitions can be written (never through a tool call).
  * Everything reads and writes the scope resolved from BATON_CONFIG_DIR.
  */
 
@@ -146,6 +147,14 @@ const PROMPT_PREVIEW_CHARS = 60;
 
 export async function runCli(command: string, args: string[]): Promise<number> {
   try {
+    if (!COMMANDS.includes(command)) return usage(`unknown command '${command}'`);
+    if (wantsHelp(args)) {
+      console.log(HELP);
+      return 0;
+    }
+    if (["status", "detect", "models", "update", "upgrade"].includes(command) && args.length > 0) {
+      return usage(`${command} takes no arguments, got '${args[0]}'.`);
+    }
     switch (command) {
       case "status":
         return status();
@@ -206,6 +215,8 @@ function status(): number {
   const paths = resolvePaths(env);
   const rows: string[][] = [
     ["scope", paths.scoped ? `${env.BATON_CONFIG_DIR} (BATON_CONFIG_DIR)` : "default (XDG)"],
+    ["version", CURRENT_VERSION],
+    ["executable", process.execPath],
     ["configDir", paths.configDir],
     ["dbPath", paths.dbPath],
     ["hops", `${hopDepth(env)} (${HOPS_ENV}=${env[HOPS_ENV] ?? "unset"})`],
@@ -225,7 +236,7 @@ function detect(): number {
   const { db } = openScope();
   // A version bump means the canary's evidence is stale, so detect is also
   // where an active discovered adapter drops out of the registry until it is
-  // re-canaried (PLAN.md §Agentic discovery, step 5).
+  // re-canaried.
   const changes = detectDiscovered(db);
   const specs = new Map(routableAdapters(db).map((spec) => [spec.app, spec]));
   const rows: string[][] = [["APP", "BINARY", "VERSION", "MODELS"]];
@@ -303,8 +314,8 @@ async function run(args: string[]): Promise<number> {
 }
 
 /**
- * A second turn on a finished run's own session, on the instance that holds it
- * (PLAN.md §Session affinity — the supervisor pins both). Everything else about
+ * A second turn on a finished run's own session, on the instance that holds it.
+ * The supervisor pins both. Everything else about
  * the original request is inherited; only the prompt is new.
  */
 async function resume(args: string[]): Promise<number> {
@@ -413,7 +424,7 @@ function runs(args: string[]): number {
   }
 
   // A side of an unjudged duel describes itself by label only: model, route and
-  // attempt targets are exactly what `duel report` reveals (PLAN.md §Evaluation).
+  // attempt targets are exactly what `duel report` reveals.
   const blindDuel = blindDuelOf(db, runId);
   console.log(
     table([
@@ -485,7 +496,7 @@ function blindLabel(duelId: string): string {
 }
 
 /**
- * Blind A/B (PLAN.md §Evaluation). Both sides run with identical prompt,
+ * Blind A/B. Both sides run with identical prompt,
  * options and cwd, and the two answers are printed under labels only: a judge
  * who knows which model wrote which text is rating the name, not the answer.
  * `duel report` is the single place the mapping is revealed.
@@ -629,8 +640,8 @@ function duelList(): number {
 
 /**
  * The adapter surface: built-ins are pinned, discovered specs are quarantined
- * until a human approves the exact binary and argv here (PLAN.md §Agentic
- * discovery — approval precedes execution, and only the trusted CLI can give it).
+ * until a human approves the exact binary and argv here. Approval precedes
+ * execution, and only the trusted CLI can give it.
  */
 async function adapters(args: string[]): Promise<number> {
   switch (args[0]) {
@@ -731,7 +742,7 @@ const realApprovalGate: ApprovalGate = { isInteractive: () => process.stdin.isTT
 
 /**
  * Approval is the one place where a human, not a program, grants execution
- * rights (PLAN.md §Agentic discovery). Two conditions: the approval quotes the
+ * rights. Two conditions: the approval quotes the
  * digest of the spec stored right now — so it is a statement about content and
  * not about an app name an agent chose — and it is typed at a terminal. The
  * terminal check is not a security boundary against an agent that already has
@@ -1024,8 +1035,8 @@ async function liveCanary(
 }
 
 /**
- * The stateless Streamable-HTTP face, one daemon per environment scope
- * (PLAN.md §Architecture) — a daemon inherits one environment, so it serves
+ * The stateless Streamable-HTTP face, one daemon per environment scope.
+ * A daemon inherits one environment, so it serves
  * exactly the scope it was started in.
  */
 async function serve(args: string[]): Promise<number> {
@@ -1076,8 +1087,8 @@ function instanceAdd(args: string[]): number {
     return usage("'default' is the inherited environment and cannot be redefined.");
   }
   // An app whose identity cannot be relocated by an env var has exactly one
-  // account, whatever we name it (PLAN.md §Instance mechanics: opencode's
-  // credentials follow neither a config-dir var nor HOME).
+  // account, whatever we name it. Opencode credentials follow neither a
+  // config-dir variable nor HOME.
   const identityEnv = spec.identityEnv;
   if (!identityEnv) {
     return usage(
@@ -1176,7 +1187,7 @@ function instanceRemove(args: string[]): number {
 
 /**
  * Pools are user-defined config, trusted like the rest of the environment
- * (PLAN.md §Instance pools) — which is exactly why they are set here and not
+ * Pools are trusted configuration, which is exactly why they are set here and not
  * through a tool call.
  */
 function pool(args: string[]): number {
@@ -1237,8 +1248,8 @@ function poolClear(args: string[]): number {
 }
 
 /**
- * Route blocks: the deny list for routes Baton can reach but must not spend
- * (PLAN.md §Registry: route blocks). Baton still does not verify identity —
+ * Route blocks: the deny list for routes Baton can reach but must not spend.
+ * Baton still does not verify identity —
  * this is the user saying which reachable routes are off limits, and Baton
  * obeying without pretending to know whose account is behind one.
  */
@@ -1347,7 +1358,7 @@ function instanceNames(db: Database, app: string): string[] {
 /**
  * The ratings view: observed, prior and blended stay three visibly separate
  * numbers, because the whole point of the provenance split is that the user can
- * see which one is carrying a routing decision (PLAN.md §Evaluation).
+ * see which one is carrying a routing decision.
  */
 function ratings(args: string[]): number {
   const sub = args[0];
@@ -1388,7 +1399,7 @@ function ratings(args: string[]): number {
 
 /**
  * Duel evidence, fitted and shown as its own signal: grade EMAs and BT are
- * reported separately and never merged (PLAN.md §Layering and sharing). Absent
+ * reported separately and never merged. Absent
  * entirely until a duel has been judged, so an unused feature adds no noise.
  */
 function btSection(db: Database, at = nowIso()): string | null {
@@ -1436,7 +1447,7 @@ async function profile(args: string[]): Promise<number> {
 }
 
 /**
- * Portable by construction (PLAN.md §Layering and sharing): the document is
+ * Portable by construction: the document is
  * canonical model priors and nothing else — no targets, instances, machine
  * details or prompts — which profileFile.ts guarantees at the format level.
  */
@@ -1475,7 +1486,7 @@ function warnCategories(doc: ProfileDocument): void {
 }
 
 /**
- * Import shows a summary diff and never silently reweights (PLAN.md §Layering).
+ * Import shows a summary diff and never silently reweights.
  * There is no interactive prompt — the caller is usually an agent — so the diff
  * is the dry run and `--yes` is the commit.
  */
@@ -1769,6 +1780,7 @@ function grade(args: string[]): number {
 
 function set(args: string[]): number {
   const [key, value] = args;
+  if (key !== SETTING_HALF_LIFE_DAYS && args.length > 2) return usage(`set takes a key and one value.`);
   if (!key || value === undefined) return usage(`set needs: <key> <value>. ${validKeys()}`);
 
   if (key === SETTING_MAX_HOPS) {
@@ -1854,7 +1866,7 @@ function activateProfile(name: string): number {
 /**
  * Settings that change what ratings.yaml would say are outcome commits too:
  * they bump the revision in the same transaction, otherwise the publisher
- * discards the refreshed render as stale (PLAN.md §Publication protocol).
+ * discards the refreshed render as stale.
  */
 function writeSetting(
   key: string,
@@ -1931,7 +1943,7 @@ function install(args: string[]): number {
 async function update(): Promise<number> {
   const res = await selfUpdate();
   if (!res.changed) {
-    console.log(`Baton ${res.from} is the latest release.`);
+    console.log(`Baton ${res.from} is up to date (latest release: ${res.to}).`);
     return 0;
   }
   console.log(
@@ -1945,49 +1957,7 @@ async function update(): Promise<number> {
 }
 
 function usage(problem: string): number {
-  console.error(`baton: ${problem}
-
-Usage:
-  baton status                            Scope, identity env, adapter availability
-  baton detect                            Installed agent CLIs, versions, models
-  baton models                            Models reachable in this scope
-  baton run <model> <prompt...>           Delegate once from the shell
-      --cwd <dir> --timeout <ms> --autonomy <readonly|edits|full>
-      --instance <name>                   ('-' as the prompt reads stdin)
-  baton resume <run-id> <prompt...>       Continue a finished run's own session
-  baton runs [<run-id>]                   Recent runs, or one run in detail
-  baton duel <a> <b> <prompt...>          Blind A/B; the outputs carry no names
-      --category <c> --cwd <dir> --timeout <ms>
-  baton duel report <duel-id> <A|B|tie>   Judge, then reveal which was which
-  baton duel list                         Recent duels and their status
-  baton adapters list                     Built-in and discovered adapters
-  baton adapters review <app>             The exact binary, argv and env names
-  baton adapters approve <app> --digest <d> [--no-canary]
-  baton adapters reject <app> [reason...]  Discovered: a verdict on its spec
-                                          Built-in: blocks every route it has
-  baton adapters canary <app|--all> [--structural]   Conformance suite
-  baton serve --http [--port <n>]         HTTP MCP daemon for this scope
-  baton instance add <app> <name> --env KEY=VAL
-  baton instance list
-  baton instance remove <app> <name>
-  baton pool set <app> <instance...>      Load-balance an app across instances
-  baton pool list | pool clear <app>
-  baton block add <pattern> [reason...]   Never route to <app>[:<instance>]/<slug>
-      e.g. 'opencode/github-copilot/*'    ('*' wildcards; bare app blocks it all)
-  baton block list | block remove <pattern>
-  baton ratings [publish]                 Show ratings, or refresh ratings.yaml
-  baton grade <run-id> <1-5> [notes...]   Grade a run after using its result
-  baton profile import <file|code|url> [--name <n>] [--activate] [--yes]
-  baton profile export [--profile <n>] [--out <file>]
-  baton profile share [--profile <n>]     Publish to the sharing site; prints code and link
-  baton profile shares | profile unshare <code>
-  baton login | logout                    Sign in to the sharing site with GitHub
-  baton set <key> <value>                 ${validKeys()}
-  baton install [host...] [--user] [--dir <dir>] [--no-eval]
-                                          No host: every host CLI on PATH. --user: global configs
-  baton update                            Replace this binary with the latest release
-      hosts: ${INSTALL_HOSTS.join(", ")}
-`);
+  console.error(`baton: ${problem}\n\n${HELP}`);
   return 2;
 }
 
@@ -2120,6 +2090,7 @@ function parseFlags(
     const inline = eq === -1 ? undefined : arg.slice(eq + 1);
 
     if (schema.boolean?.includes(name)) {
+      if (inline !== undefined) throw new UsageError(`--${name} does not take a value.`);
       flags[name] = true;
       continue;
     }
@@ -2128,7 +2099,9 @@ function parseFlags(
       throw new UsageError(`unknown flag '--${name}'.`);
     }
     const value = inline ?? args[++i];
-    if (value === undefined) throw new UsageError(`--${name} needs a value.`);
+    if (value === undefined || (inline === undefined && value.startsWith("--"))) {
+      throw new UsageError(`--${name} needs a value.`);
+    }
     if (repeats) flags[name] = [...asList(flags[name]), value];
     else flags[name] = value;
   }

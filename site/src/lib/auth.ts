@@ -65,15 +65,20 @@ export const crossSite = () => new Response("Cross-site request refused.", { sta
 
 /** Only same-site paths may be a post-login destination. */
 export function safeNext(next: string | null | undefined): string {
-  // One leading slash, then not another slash or backslash: `//host` and
-  // `/\host` are both scheme-relative to a browser.
-  return next && /^\/(?![/\\])/.test(next) ? next : "/account";
+  if (!next?.startsWith("/")) return "/account";
+  const origin = "https://baton.invalid";
+  try {
+    const url = new URL(next, origin);
+    return url.origin === origin ? url.pathname + url.search + url.hash : "/account";
+  } catch {
+    return "/account";
+  }
 }
 
 export function beginGithubLogin(
-  env: AppEnv,
+  env: Pick<AppEnv, "GITHUB_CLIENT_ID">,
   request: Request,
-  cookies: AstroCookies,
+  cookies: Pick<AstroCookies, "set">,
   origin: string,
   next: string,
 ): Response {
@@ -84,7 +89,8 @@ export function beginGithubLogin(
   url.searchParams.set("redirect_uri", `${origin}/api/auth/github/callback`);
   url.searchParams.set("state", state);
   // No scopes: the public profile (id, login, avatar) is all attribution needs.
-  return Response.redirect(url.toString(), 302);
+  // Astro appends the state cookie after this handler returns.
+  return new Response(null, { status: 302, headers: { location: url.toString() } });
 }
 
 export interface GithubIdentity {

@@ -313,6 +313,7 @@ describe("install --user", () => {
         CODEX_HOME: "",
         KIMI_CODE_HOME: "",
         XDG_CONFIG_HOME: "",
+        OPENCODE_CONFIG: "",
       },
       ["install", "--user"],
     );
@@ -394,7 +395,8 @@ theme = "dark"
     expect(toml).toContain("[mcp_servers.other]");
     expect(toml).toContain('theme = "dark"');
     expect(toml).toContain("[mcp_servers.baton]");
-    expect(toml).toMatch(/args = \["mcp"\]/);
+    expect(toml).toContain(`command = ${JSON.stringify(process.execPath)}`);
+    expect(toml).toMatch(/args = \["run", ".*\/src\/index.ts", "mcp"\]/);
 
     // The instruction block is appended, the user's own AGENTS.md content stays.
     const agents = readFileSync(join(target, "AGENTS.md"), "utf8");
@@ -472,6 +474,7 @@ describe("install into a damaged AGENTS.md", () => {
     expect(res.code).toBe(1);
     expect(res.stderr).toContain("refusing to guess");
     expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toBe(agents);
+    expect(existsSync(join(target, ".kimi-code/mcp.json"))).toBe(false);
   });
 });
 
@@ -701,7 +704,7 @@ describe("block", () => {
   });
 });
 
-describe("set (phase-2 keys)", () => {
+describe("set keys", () => {
   test("preciousness lands on the pool member it names", async () => {
     const scope = tmp("precious");
     await baton(scope, "instance", "add", "kimi", "work", "--env", "KIMI_CODE_HOME=/tmp/kimi-work");
@@ -768,7 +771,7 @@ describe("set (phase-2 keys)", () => {
     expect(res.stderr).toContain("no profiles yet");
   });
 
-  test("the phase-2 keys are advertised among the valid ones", async () => {
+  test("the rating keys are advertised among the valid ones", async () => {
     const res = await baton(tmp("keys2"), "set", "nonsense", "1");
     expect(res.stderr).toContain("half_life_days");
     expect(res.stderr).toContain("profile_weight");
@@ -1624,8 +1627,8 @@ describe("serve --http", () => {
     30_000,
   );
 
-  // Skipped only while src/mcp/http.ts is unimplemented; without it the CLI
-  // would "fail" for the wrong reason and the assertion would prove nothing.
+  // Keep this behind the module check so the assertion tests the CLI's error,
+  // not a missing implementation.
   test.skipIf(!existsSync(HTTP_MODULE))(
     "fails gracefully when the port is already taken",
     async () => {

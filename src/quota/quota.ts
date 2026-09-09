@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { AdapterSpec } from "../adapters/types.ts";
 
 import { withBusyRetry } from "../store/store.ts";
 import {
@@ -10,8 +11,8 @@ import {
 } from "./types.ts";
 
 /**
- * Quota observation and admission-failure cooldowns (PLAN.md §Quota-aware cost,
- * §Instance pools). Baton observes what happens rather than modelling provider
+ * Quota observation and admission-failure cooldowns. Baton observes what
+ * happens rather than modelling provider
  * quotas: run counts per instance in the active scope's own DB, plus cooldowns
  * minted when a CLI refuses admission.
  */
@@ -29,12 +30,16 @@ export const WEEK_WINDOW_SOFT_CAP = 80;
 /** Events outlive the weekly window by a day, then they are noise. */
 export const EVENT_RETENTION_MS = 8 * 24 * 60 * 60 * 1000;
 
+export function cooldownScopeFor(spec: AdapterSpec, slug: string): string {
+  return spec.cooldownScope === "provider" ? slug.split("/")[0] ?? slug : "";
+}
+
 /**
  * Records a run against an instance's windows, returning the event's id.
  * Written the moment the callee is admitted (not when it finishes), so a
  * selection made while this run is still in flight already sees the slot it
  * took — otherwise concurrent selections all read the same headroom and pile
- * onto one instance (PLAN.md §Proactive spreading). Tokens when the CLI
+ * onto one instance. Tokens when the CLI
  * reports them.
  */
 export function recordRun(
@@ -78,6 +83,7 @@ export function recordAdmissionFailure(
   atIso: string,
   detail?: string,
   resetAtIso?: string,
+  scope = "",
 ): string {
   const at = iso(atIso);
   const reset = parseIso(resetAtIso);
@@ -86,15 +92,15 @@ export function recordAdmissionFailure(
       db.query(
         "INSERT INTO quota_events (app, instance, at, kind, detail) VALUES (?, ?, ?, 'admission_failure', ?)",
       ).run(app, instance, at, detail ?? null);
-      const existing = cooldownRow(db, app, instance);
+      const existing = cooldownRow(db, app, instance, scope);
       const strikes = (existing?.strikes ?? 0) + 1;
       const proposed = reset ?? new Date(Date.parse(at) + backoffMs(strikes)).toISOString();
       const until = laterOf(existing?.until, proposed);
       db.query(
-        `INSERT INTO cooldowns (app, instance, until, strikes, reason) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (app, instance) DO UPDATE
+        `INSERT INTO cooldowns (app, instance, scope, until, strikes, reason) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (app, instance, scope) DO UPDATE
            SET until = excluded.until, strikes = excluded.strikes, reason = excluded.reason`,
-      ).run(app, instance, until, strikes, detail ?? null);
+      ).run(app, instance, scope, until, strikes, detail ?? null);
       return until;
     })(),
   );
@@ -116,9 +122,9 @@ export function backoffMs(strikes: number): number {
  * the ONLY thing that ends it. The supervisor calls this on success; strikes
  * compound until an instance actually admits work again.
  */
-export function clearCooldown(db: Database, app: string, instance: string): boolean {
+export function clearCooldown(db: Database, app: string, instance: string, scope = ""): boolean {
   return (
-    db.query("DELETE FROM cooldowns WHERE app = ? AND instance = ?").run(app, instance).changes > 0
+    db.query("DELETE FROM cooldowns WHERE app = ? AND instance = ? AND scope = ?").run(app, instance, scope).changes > 0
   );
 }
 
@@ -134,8 +140,9 @@ export function coolingUntil(
   app: string,
   instance: string,
   nowIso: string,
+  scope = "",
 ): string | undefined {
-  const row = cooldownRow(db, app, instance);
+  const row = cooldownRow(db, app, instance, scope);
   if (!row) return undefined;
   return Date.parse(row.until) > Date.parse(iso(nowIso)) ? row.until : undefined;
 }
@@ -146,11 +153,12 @@ export function snapshot(
   app: string,
   instance: string,
   nowIso: string,
+  scope = "",
 ): QuotaSnapshot {
   const now = Date.parse(iso(nowIso));
   const runsShort = countRuns(db, app, instance, now - WINDOW_SHORT_MS);
   const runsWeek = countRuns(db, app, instance, now - WINDOW_WEEK_MS);
-  const cooling = coolingUntil(db, app, instance, nowIso);
+  const cooling = coolingUntil(db, app, instance, nowIso, scope);
   return {
     app,
     instance,
@@ -194,13 +202,14 @@ function cooldownRow(
   db: Database,
   app: string,
   instance: string,
+  scope: string,
 ): { until: string; strikes: number } | undefined {
   return (
     db
-      .query<{ until: string; strikes: number }, [string, string]>(
-        "SELECT until, strikes FROM cooldowns WHERE app = ? AND instance = ?",
+      .query<{ until: string; strikes: number }, [string, string, string]>(
+        "SELECT until, strikes FROM cooldowns WHERE app = ? AND instance = ? AND scope = ?",
       )
-      .get(app, instance) ?? undefined
+      .get(app, instance, scope) ?? undefined
   );
 }
 

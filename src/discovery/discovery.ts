@@ -29,7 +29,7 @@ import {
 } from "./types.ts";
 
 /**
- * Agentic discovery (PLAN.md §Agentic discovery). The whole module exists to
+ * Agentic discovery. The whole module exists to
  * keep one invariant true: **Baton executes nothing from a discovered spec
  * before a human approved that exact spec in the trusted CLI.** Submission
  * quarantines, review prints, approval unlocks the canary, the canary
@@ -149,6 +149,7 @@ export const adapterSpecSchema = z.strictObject({
     })
     .describe("argv fragment per autonomy level. A missing level means unsupported — never faked."),
   sessionRef: extractSchema.optional().describe("Where the app prints its session/thread id."),
+  cooldownScope: z.literal("provider").optional(),
   resume: z
     .strictObject({ argv: z.array(argvElement) })
     .optional()

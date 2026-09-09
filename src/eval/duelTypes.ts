@@ -1,5 +1,5 @@
 /**
- * Blind A/B duels and the Bradley-Terry layer (PLAN.md §Evaluation).
+ * Blind A/B duels and the Bradley-Terry layer.
  * Duels run both sides with identical options and cwd; labels are randomized
  * and the mapping is revealed only after judgment. BT ratings are reported as
  * a SEPARATE signal from grade EMAs — never merged into `blended`.

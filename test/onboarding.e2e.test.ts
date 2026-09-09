@@ -9,7 +9,7 @@ import { adaptersApprove } from "../src/cli/cli.ts";
 import type { AdapterSpec } from "../src/adapters/types.ts";
 
 /**
- * THE PHASE-3 EXIT CRITERION, rehearsed end to end (PLAN.md §Build phases):
+ * End-to-end onboarding of
  * "a previously unknown agent app is onboarded end-to-end by an agent —
  * discovered, reviewed, approved, activated, seeded — without the user editing
  * a config file."
@@ -195,7 +195,7 @@ afterAll(async () => {
   await client?.close();
 });
 
-describe("phase-3 exit criterion: onboarding an unknown agent app", () => {
+describe("onboarding an unknown agent app", () => {
   /**
    * Ordered on purpose — this is one flow, and each step is only meaningful
    * after the one before it. Bun runs tests in a file sequentially.
@@ -336,7 +336,7 @@ describe("phase-3 exit criterion: onboarding an unknown agent app", () => {
     const ratings = await call("get_ratings");
     const row = ratings.ratings.find((r: { model: string }) => r.model === MODEL);
     expect(row.prior).toBe(4);
-    // Prior and observed stay provenance-separated (PLAN.md §Evaluation).
+    // Prior and observed stay provenance-separated.
     expect(row.priorSource).toBeDefined();
   });
 

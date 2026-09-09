@@ -1,15 +1,46 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
- * Flag-surface regressions found in the phase-1 review: instance `--env` values
+ * Flag-surface regressions found in review: instance `--env` values
  * were stored with a literal `~`, and `run --no-wait` promised a detachment the
  * CLI cannot deliver. Subprocess round-trips, throwaway scope, no callee runs.
  */
 
 const ENTRY = resolve(import.meta.dir, "..", "index.ts");
+
+describe("help and argument validation", () => {
+  for (const args of [[], ["--help"], ["help", "install"], ["install", "--user", "--help"],
+    ["update", "--help"], ["upgrade", "-h"], ["mcp", "--help"], ["profile", "share", "--help"]]) {
+    test(`baton ${args.join(" ")} prints help without side effects`, async () => {
+      const dir = tmp("help");
+      const config = join(dir, "state");
+      const res = await baton({ BATON_CONFIG_DIR: config }, ...args);
+      expect(res.code, res.stderr).toBe(0);
+      expect(res.stdout).toContain("baton install [host...] [--user]");
+      expect(res.stdout).toContain("baton update");
+      expect(res.stdout).toContain("baton block");
+      expect(existsSync(config)).toBe(false);
+    });
+  }
+  for (const args of [["update", "--typo"], ["upgrade", "oops"], ["mcp", "--typo"],
+    ["status", "--typo"], ["models", "oops"], ["detect", "oops"], ["nonsense", "--help"],
+    ["help", "nonsense"], ["install", "--user=false"], ["install", "--dir", "--user"],
+    ["set", "max_hops", "2", "oops"]]) {
+    test(`baton ${args.join(" ")} rejects invalid arguments`, async () => {
+      const res = await baton({ BATON_CONFIG_DIR: tmp("bad-args") }, ...args);
+      expect(res.code, res.stdout).toBe(2);
+    });
+  }
+  test("-- makes help text a literal prompt", async () => {
+    const res = await baton({ BATON_CONFIG_DIR: tmp("literal-help") }, "run", "unknown-model", "--", "--help");
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("Unknown model");
+    expect(res.stdout).not.toContain("Usage:");
+  });
+});
 
 function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), `baton-cli-${prefix}-`));

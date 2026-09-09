@@ -5,6 +5,7 @@ set -eu
 
 REPO="${BATON_REPO:-danieldunderfelt/baton}"
 VERSION="${BATON_VERSION:-latest}"
+REQUESTED_VERSION="$VERSION"
 DEST="${BATON_INSTALL_DIR:-$HOME/.local/bin}"
 ARTIFACT=""
 
@@ -20,7 +21,7 @@ case "$0" in
         exit 1
       fi
       cd "$SOURCE_DIR"
-      bun install --silent
+      bun install --frozen-lockfile --silent
       bun run build
       ARTIFACT="$SOURCE_DIR/dist/baton"
     fi
@@ -56,10 +57,13 @@ if [ -z "$ARTIFACT" ]; then
 
   TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/baton-install.XXXXXX")
   if [ "$VERSION" = "latest" ]; then
-    BASE_URL="https://github.com/$REPO/releases/latest/download"
-  else
-    BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+    RELEASE_URL=$(curl --fail --location --silent --show-error --output /dev/null --write-out '%{url_effective}' "https://github.com/$REPO/releases/latest")
+    case "$RELEASE_URL" in
+      "https://github.com/$REPO/releases/tag/"*) VERSION=${RELEASE_URL##*/} ;;
+      *) echo "Could not resolve the latest Baton release: $RELEASE_URL" >&2; exit 1 ;;
+    esac
   fi
+  BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
   ARTIFACT="$TEMP_DIR/baton-$TARGET"
   echo "Downloading Baton $VERSION for $OS/$ARCH..."
   curl --fail --location --silent --show-error "$BASE_URL/baton-$TARGET" -o "$ARTIFACT"
@@ -89,7 +93,7 @@ fi
 mkdir -p "$DEST"
 INSTALL_TMP=$(mktemp "$DEST/.baton.XXXXXX")
 cp "$ARTIFACT" "$INSTALL_TMP"
-chmod +x "$INSTALL_TMP"
+chmod 755 "$INSTALL_TMP"
 
 # macOS kills a Mach-O whose signature does not match the bytes at that path,
 # and copying over an existing install invalidates the ad-hoc signature Bun
@@ -99,16 +103,40 @@ if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
   codesign --force --sign - "$INSTALL_TMP" >/dev/null 2>&1 ||
     echo "Warning: could not re-sign $INSTALL_TMP; if it exits 137, run: codesign --force --sign - $DEST/baton" >&2
 fi
+INSTALLED_VERSION=$("$INSTALL_TMP" --version) || {
+  echo "The downloaded Baton binary does not run on this machine; the existing install was kept." >&2
+  exit 1
+}
+HELP_TEXT=$("$INSTALL_TMP" --help)
+if [ "$REQUESTED_VERSION" = "latest" ]; then
+  case "$HELP_TEXT" in
+    *'baton update'*'--user'*|*'--user'*'baton update'*) ;;
+    *)
+      echo "Release $INSTALLED_VERSION predates 'install --user' and 'update'. The existing install was kept." >&2
+      echo "Build current sources with Bun: git clone https://github.com/$REPO.git && cd baton && ./install.sh" >&2
+      exit 1
+      ;;
+  esac
+fi
 mv -f "$INSTALL_TMP" "$DEST/baton"
 INSTALL_TMP=""
 
-echo "Installed: $DEST/baton"
+echo "Installed Baton $INSTALLED_VERSION: $DEST/baton"
 case ":$PATH:" in
   *":$DEST:"*) ;;
   *) echo "Note: $DEST is not on your PATH. Add it, e.g.: export PATH=\"$DEST:\$PATH\"" ;;
 esac
+RESOLVED=$(command -v baton || true)
+if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$DEST/baton" ]; then
+  echo "Note: your PATH selects $RESOLVED. Put $DEST first, or run $DEST/baton directly."
+fi
 
 echo
-echo "Next, register Baton with every agent app on this machine, once:"
-echo "  baton install --user"
-echo "Later, 'baton update' fetches the latest release."
+case "$HELP_TEXT" in
+  *'--user'*)
+    echo "Next, register Baton with every agent app on this machine, once:"
+    echo "  \"$DEST/baton\" install --user"
+    echo "Later, 'baton update' fetches the latest release."
+    ;;
+  *) echo "This pinned release uses older commands. Run \"$DEST/baton\" --help for usage." ;;
+esac

@@ -12,7 +12,7 @@ import {
 } from "./types.ts";
 
 /**
- * Instance pools and headroom-weighted spreading (PLAN.md §Instance pools).
+ * Instance pools and headroom-weighted spreading.
  * Pool membership is user-defined config: Baton trusts it, as it trusts the
  * rest of the environment. This module only ranks — it never spawns, and it
  * never removes a candidate; the supervisor decides what to do with cooling
@@ -68,7 +68,7 @@ export function setPool(db: Database, app: string, members: string[]): Pool {
  * Instances and pools only mean anything for an app whose identity can be
  * relocated by an env var: without one, every "instance" is the same account
  * under another name, and spreading across them would drain one window while
- * pretending to balance (PLAN.md §Instance mechanics — opencode, cursor).
+ * pretending to balance.
  * Unknown apps are not this check's business; the CLI rejects them by name.
  */
 export function requireIdentityEnv(app: string, subject: string): void {
@@ -128,12 +128,13 @@ export function candidatesFor(
   app: string,
   explicitInstance: string | undefined,
   nowIso: string,
+  cooldownScope = "",
 ): PoolCandidate[] {
   const members = explicitInstance
     ? [explicitInstance]
     : (getPool(db, app)?.members ?? [DEFAULT_INSTANCE]);
   return members.map((instance) => {
-    const observed = snapshot(db, app, instance, nowIso);
+    const observed = snapshot(db, app, instance, nowIso, cooldownScope);
     const preciousness = preciousnessFor(db, app, instance);
     return {
       instance,

@@ -1,9 +1,9 @@
 import type { Autonomy } from "../adapters/types.ts";
 
 /**
- * Logical run → attempts (PLAN.md §Execution). A run is the caller's request;
- * each execution is an attempt. Phase 1: one attempt per run (pools/failover
- * arrive in phase 2), but the schema and views already carry the split.
+ * Logical run → attempts. A run is the caller's request; each execution is an
+ * attempt. A run can have several attempts when admission failover moves it
+ * through a pool.
  */
 
 export type RunStatus =
@@ -34,7 +34,7 @@ export interface RunRequest {
 }
 
 /**
- * Continue a run's session (PLAN.md §Session affinity). The original run
+ * Continue a run's session. The original run
  * decides everything except the new prompt: model, app, slug, instance and cwd
  * are copied, because the session state lives in that instance's config dir.
  */
@@ -93,7 +93,7 @@ export const RESUMED_FROM = "resumed_from";
  * Keys inside a run's `options` JSON pinning the adapter revision the run
  * executed under. A session handle only means something to the invocation that
  * minted it, so a resume must check that the app's adapter has not been
- * replaced underneath it (PLAN.md §Session affinity). Built-ins are identified
+ * replaced underneath it. Built-ins are identified
  * by `adapterVersion` alone — they are pinned in the binary and bump it when
  * they change — while a discovered spec is content-addressed, so its digest is
  * recorded too.
@@ -107,7 +107,7 @@ export const DEFAULT_MAX_HOPS = 2;
 
 /** Settings keys (settings table). */
 export const SETTING_MAX_HOPS = "max_hops";
-/** Per-scope cap on attempts running at once (PLAN.md §Execution: resource limits). */
+/** Per-scope cap on attempts running at once. */
 export const SETTING_MAX_CONCURRENT = "max_concurrent";
 export const DEFAULT_MAX_CONCURRENT = 4;
 /** Per-app authority ceiling: key `max_autonomy:<app>`, value an Autonomy. */
