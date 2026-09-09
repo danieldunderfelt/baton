@@ -1,0 +1,31 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base title="Not found" noindex>
+  <div class="container nf">
+    <p class="eyebrow">404</p>
+    <h1>Nothing here.</h1>
+    <p class="muted">
+      If you followed a share link, the profile was revoked or the code is wrong. Shares are reachable only by
+      their exact code.
+    </p>
+    <p class="row">
+      <a class="btn" href="/">Home</a>
+      <a class="btn" href="/docs">Docs</a>
+    </p>
+  </div>
+</Base>
+
+<style>
+  .nf {
+    padding: 6rem 0;
+    max-width: 36rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  h1 {
+    font-size: 2rem;
+  }
+</style>

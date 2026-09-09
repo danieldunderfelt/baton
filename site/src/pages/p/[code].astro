@@ -1,5 +1,6 @@
 ---
 import CopyCommand from "../../components/CopyCommand.astro";
+import NotFound from "../../components/NotFound.astro";
 import Base from "../../layouts/Base.astro";
 import { currentUser } from "../../lib/auth.ts";
 import { normalizeShareCode } from "../../lib/codes.ts";
@@ -11,18 +12,17 @@ export const prerender = false;
 const env = appEnv();
 const code = normalizeShareCode(Astro.params.code ?? "");
 const share = code ? await profileByCode(env.DB, code) : null;
-if (!share) {
-  return Astro.rewrite("/404");
-}
-const user = await currentUser(env, Astro.cookies);
-const entries = [...share.profile.entries].sort(
+if (!share) Astro.response.status = 404;
+const user = share ? await currentUser(env, Astro.cookies) : null;
+const entries = [...(share?.profile.entries ?? [])].sort(
   (a, b) => b.mean - a.mean || a.model.localeCompare(b.model) || a.category.localeCompare(b.category),
 );
 const day = (iso: string) => iso.slice(0, 10);
 const fixed = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""));
-const isOwner = user?.login === share.owner.login;
+const isOwner = user?.login === share?.owner.login;
 ---
 
+{share ? (
 <Base
   title={`${share.name} · shared by @${share.owner.login}`}
   description={`A Baton profile with ${share.entry_count} model priors, shared by @${share.owner.login}.`}
@@ -97,6 +97,7 @@ const isOwner = user?.login === share.owner.login;
     </div>
   </div>
 </Base>
+) : <NotFound />}
 
 <style>
   .share {

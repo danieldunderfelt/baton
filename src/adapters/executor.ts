@@ -3,7 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 import type { AdapterSpec, ExecRequest, ExecResult, ExtractSpec } from "./types.ts";
 
 /**
- * The only place Baton spawns a callee CLI. Environment-transparent
+ * The only place Baton spawns a callee CLI.
  * Environment-transparent: req.env is passed verbatim — nothing added, nothing
  * scrubbed. argv is an array built from the declarative spec, never a shell
  * string. The child is detached so it leads its own process group, which lets

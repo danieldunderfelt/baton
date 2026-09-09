@@ -83,6 +83,24 @@ describe("openStore — connection pragmas", () => {
 });
 
 describe("openStore — schema and migrations", () => {
+  test("v8 cooldowns migrate without parking unrelated OpenCode providers", () => {
+    const { paths, db } = scopeStore("migrate-v8");
+    db.exec(`DROP TABLE cooldowns;
+      CREATE TABLE cooldowns (app TEXT NOT NULL, instance TEXT NOT NULL, until TEXT NOT NULL,
+        strikes INTEGER NOT NULL DEFAULT 1, reason TEXT, PRIMARY KEY (app, instance));
+      INSERT INTO cooldowns VALUES ('codex', 'default', '2099-01-01T00:00:00.000Z', 2, 'limited');
+      INSERT INTO cooldowns VALUES ('opencode', 'default', '2099-01-01T00:00:00.000Z', 3, 'limited');
+      DELETE FROM schema_migrations WHERE version = 9;`);
+    db.close();
+    const upgraded = openStore(paths.dbPath);
+    expect(upgraded.query("SELECT * FROM cooldowns").all()).toEqual([
+      { app: "codex", instance: "default", scope: "", until: "2099-01-01T00:00:00.000Z", strikes: 2, reason: "limited" },
+    ]);
+    expect(upgraded.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()!.version).toBe(9);
+    expect(upgraded.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    upgraded.close();
+  });
+
   test("base tables exist", () => {
     const { db } = scopeStore("schema");
     const tables = db

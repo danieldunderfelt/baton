@@ -68,7 +68,7 @@ describe("selfUpdate from a release", () => {
   });
 
   test("updates the target of a symlink without replacing the link", async () => {
-    const binary = "#!/bin/sh\necho new\n";
+    const binary = "#!/bin/sh\necho 99.0.0\n";
     const releases = fakeReleases("v99.0.0", { [TARGET]: binary, SHA256SUMS: `${sha256(binary)}  ${TARGET}\n` });
     const dir = mkdtempSync(join(tmpdir(), "baton-update-link-"));
     const target = join(dir, "real-baton");
@@ -84,7 +84,7 @@ describe("selfUpdate from a release", () => {
     }
   });
   test("replaces the binary with the verified artifact of a newer tag", async () => {
-    const binary = "#!/bin/sh\necho new\n";
+    const binary = "#!/bin/sh\necho 99.0.0\n";
     const releases = fakeReleases("v99.0.0", {
       [TARGET]: binary,
       SHA256SUMS: `${sha256(binary)}  ${TARGET}\n`,
@@ -118,6 +118,20 @@ describe("selfUpdate from a release", () => {
       releases.stop();
     }
   });
+
+  test.each(["#!/bin/sh\nexit 1\n", "#!/bin/sh\necho 0.1.0\n"])(
+    "a verified artifact that fails its version check preserves the installed binary: %s", async (binary) => {
+      const releases = fakeReleases("v99.0.0", { [TARGET]: binary, SHA256SUMS: `${sha256(binary)}  ${TARGET}\n` });
+      const execPath = join(mkdtempSync(join(tmpdir(), "baton-update-probe-")), "baton");
+      writeFileSync(execPath, "old", { mode: 0o755 });
+      try {
+        await expect(selfUpdate({ execPath, releasesUrl: releases.url, target: TARGET })).rejects.toThrow("version check");
+        expect(readFileSync(execPath, "utf8")).toBe("old");
+      } finally {
+        releases.stop();
+      }
+    },
+  );
 
   test("the current version is reported as up to date without downloading", async () => {
     const releases = fakeReleases(`v${CURRENT_VERSION}`, {});

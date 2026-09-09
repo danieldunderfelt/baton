@@ -8,7 +8,7 @@ Baton lets the agent you are talking to hand work to a model running in a differ
 
 ## From an agent, through MCP
 
-- `list_models` reports every model this machine can reach, with live ratings and remaining quota.
+- `list_models` reports every model this machine can reach, with live ratings and estimated quota headroom for pooled accounts.
 - `run_model(model, prompt, ...)` runs the prompt on another app and returns the answer. The prompt must be self-contained: the callee shares the filesystem but has none of the caller's conversation.
 - `get_run(run_id)` polls a long run started with `wait: false`.
 - `resume_run(run_id, prompt)` continues a finished run inside the callee's own session, on the same account it originally ran on.

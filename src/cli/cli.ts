@@ -70,6 +70,7 @@ import {
   setPool,
 } from "../quota/pools.ts";
 import { PRECIOUSNESS_FACTOR, SETTING_PRECIOUSNESS_PREFIX } from "../quota/types.ts";
+import { activeCooldowns } from "../quota/quota.ts";
 import {
   addBlock,
   blockFor,
@@ -1228,7 +1229,9 @@ function poolList(): number {
   const rows: string[][] = [["APP", "INSTANCE", "PRECIOUSNESS", "HEADROOM", "COOLING UNTIL"]];
   for (const p of pools) {
     for (const c of candidatesFor(db, p.app, undefined, now)) {
-      rows.push([p.app, c.instance, c.preciousness, fixed(c.headroom), c.coolingUntil ?? "-"]);
+      const cooling = activeCooldowns(db, p.app, c.instance, now)
+        .map(({ scope, until }) => scope ? `${scope}: ${until}` : until).join(", ");
+      rows.push([p.app, c.instance, c.preciousness, fixed(c.headroom), cooling || "-"]);
     }
   }
   console.log(table(rows));
@@ -1899,8 +1902,10 @@ function writeSetting(
 function install(args: string[]): number {
   const { flags, rest } = parseFlags(args, {
     value: ["dir"],
+    // --with-eval is retained for older invocations; grading is now the default.
     boolean: ["with-eval", "no-eval", "user"],
   });
+  if (flags["with-eval"] && flags["no-eval"]) return usage("choose either --with-eval or --no-eval");
   const scope: InstallScope = flags.user === true ? "user" : "project";
   if (scope === "user" && flags.dir !== undefined) {
     return usage("--user writes the hosts' own global configs; it takes no --dir");

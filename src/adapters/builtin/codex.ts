@@ -1,7 +1,7 @@
 import type { AdapterSpec } from "../types.ts";
 
 /**
- * codex-cli 0.149.0 (probed live on this machine).
+ * codex-cli 0.153.4 (argument parsing probed with closed stdin).
  *
  * Notes that are not obvious from the flags:
  * - `--skip-git-repo-check` is mandatory: without it, any cwd that is not a git
@@ -81,6 +81,8 @@ export const codexAdapter: AdapterSpec = {
   },
   autonomyFlags: {
     readonly: ["-s", "read-only"],
+    // This selects workspace-write itself. In 0.153.4 it conflicts with -s;
+    // --help exits before validating conflicts, so probe with closed stdin.
     edits: ["--approve-for-me"],
     full: ["--dangerously-bypass-approvals-and-sandbox"],
   },

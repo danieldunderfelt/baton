@@ -14,7 +14,7 @@ import type { DiscoveredAdapter } from "../discovery/types.ts";
 import { blend } from "../eval/decay.ts";
 import { effectiveRatings, targetRatings } from "../eval/evalStore.ts";
 import { candidatesFor, getPool } from "../quota/pools.ts";
-import { cooldownScopeFor, snapshot } from "../quota/quota.ts";
+import { cooldownScopeFor, coolingUntil, snapshot } from "../quota/quota.ts";
 import type { Preciousness } from "../quota/types.ts";
 import { nowIso } from "../store/store.ts";
 import { SETTING_MAX_AUTONOMY_PREFIX } from "../supervisor/types.ts";
@@ -770,11 +770,14 @@ function routeRows(
   // nothing to spread across, and 'default' is the whole story.
   const members = spec.identityEnv ? getPool(db, spec.app)?.members : undefined;
   const instances = members && members.length > 0 ? members : [DEFAULT_INSTANCE];
+  const headroom = members?.map((instance) => snapshot(db, spec.app, instance, at));
   return routes.map((route) => {
     const score = scores.get(route.model);
-    const observed = instances.map((instance) => snapshot(db, spec.app, instance, at, cooldownScopeFor(spec, route.slug)));
-    const pool = members ? observed.map((o) => ({ instance: o.instance, headroom: o.headroom,
-      ...(o.coolingUntil ? { coolingUntil: o.coolingUntil } : {}) })) : undefined;
+    const pool = headroom?.map((observed) => {
+      const until = coolingUntil(db, spec.app, observed.instance, at, cooldownScopeFor(spec, route.slug));
+      return { instance: observed.instance, headroom: observed.headroom,
+        ...(until ? { coolingUntil: until } : {}) };
+    });
     // A block only makes the route unusable when it covers every instance the
     // route could run on; a partial block just steers selection, and saying
     // "unavailable" would be a lie the pool view right beside it contradicts.

@@ -308,7 +308,8 @@ function mergeOpencodeJson(path: string, command: string, args: string[]): Regis
   if (!isRecord(doc)) throw new Error(`${path} must contain a JSON object.`);
   const servers = serverEntries(doc, "mcp", path);
   const preserved = Object.keys(servers).filter((name) => name !== SERVER_NAME);
-  const formattingOptions = { insertSpaces: true, tabSize: 2 };
+  const indentation = raw.match(/^[\t ]+(?=")/m)?.[0] ?? "  ";
+  const formattingOptions = { insertSpaces: !indentation.includes("\t"), tabSize: indentation.length };
   let output = raw.trim() || "{}";
   if (doc.$schema === undefined) {
     output = applyEdits(output, modify(output, ["$schema"], "https://opencode.ai/config.json", { formattingOptions }));
@@ -456,11 +457,6 @@ export const BLOCK_END = `<!-- ${SERVER_NAME}:end -->`;
  * block in place; a file with a begin marker and no end marker is a corruption
  * we refuse to guess at.
  */
-export function writeMarkedBlock(path: string, body: string): string {
-  atomicWrite(path, markedBlockContent(path, body));
-  return path;
-}
-
 function markedBlockContent(path: string, body: string): string {
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
   const block = `${BLOCK_BEGIN}\n${body.trim()}\n${BLOCK_END}\n`;

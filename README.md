@@ -41,7 +41,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Start a new agent session after installing or updating so it loads the new MCP server. A session that is already running keeps its old server.
 
-For usage, run `baton <command> --help`. `baton --help` lists the top-level commands.
+`baton --help` prints the command reference. `baton <command> --help` shows the same reference without running the command.
 
 ### Recovering a v0.1.0 install
 
@@ -72,7 +72,7 @@ baton update
 
 That replaces the binary with the latest release (or rebuilds it, if you run from a checkout). Sessions already running keep the old server until they restart.
 
-To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory: it writes `.mcp.json`, `.codex/config.toml`, `opencode.json` and the instruction files there. `--no-eval` leaves out the grading section; the default includes it, because ratings do not improve without grades.
+To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory. It writes the selected hosts' MCP and instruction files, including `.mcp.json`, `.codex/config.toml`, and `opencode.json` or an existing `opencode.jsonc`. Outside a repository root, Kimi uses `.kimi-code/mcp.json`. `--no-eval` leaves out the grading section; the default includes it, because ratings do not improve without grades.
 
 `baton detect` shows which app CLIs are installed and which models they serve. `baton status` shows where Baton's state lives and which identity variables are set.
 
@@ -82,7 +82,7 @@ Contributors: clone the repo, install [Bun](https://bun.sh), and `./install.sh` 
 
 From an agent, through MCP:
 
-- `list_models` reports every model this machine can reach, with live ratings and remaining quota.
+- `list_models` reports every model this machine can reach, with live ratings and estimated quota headroom for pooled accounts.
 - `run_model(model, prompt, ...)` runs the prompt on another app and returns the answer. The prompt must be self-contained: the callee shares the filesystem but has none of the caller's conversation.
 - `get_run(run_id)` polls a long run started with `wait: false`.
 - `resume_run(run_id, prompt)` continues a finished run inside the callee's own session, on the same account it originally ran on.
@@ -145,7 +145,7 @@ baton pool set claude-code default personal-2
 
 From then on every delegation to an opus or sonnet model picks an account automatically:
 
-- Selection favours the account with the most quota headroom, so both usage windows stay warm instead of one draining while the other sits idle. Subscription quota comes in rolling windows; two accounts drained evenly get you more work per day than two drained in sequence.
+- Selection favours the less-used account based on runs Baton observed in the last five hours and seven days. This estimates relative headroom; it does not read subscription limits or usage outside Baton.
 - An admission failure puts the account into an exponential cooldown backoff, and the run retries on the next account under the same run id.
 - Failover only happens when the refusal provably came before any work started. If a failure happens after work may have begun, Baton fails the run instead of silently re-running it, because the first attempt may have edited files.
 - Resumed runs skip the pool and go back to the account that holds the session.

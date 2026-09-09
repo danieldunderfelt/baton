@@ -28,6 +28,7 @@ baton profile import <code>    # from any scope, e.g. BATON_CONFIG_DIR=/tmp/othe
 ```
 
 Checks: `bun test` (helpers and local D1 integration tests), `bun run check` (Astro + TypeScript), `bun run build`.
+After building, `bun run check:production` checks the Worker and static assets together with disposable local D1, including OAuth cookies and missing share links. It makes no GitHub API calls.
 
 ## Deploy
 

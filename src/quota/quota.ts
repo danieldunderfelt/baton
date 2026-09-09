@@ -147,6 +147,13 @@ export function coolingUntil(
   return Date.parse(row.until) > Date.parse(iso(nowIso)) ? row.until : undefined;
 }
 
+/** Active cooldowns for display, including independent providers within an app. */
+export function activeCooldowns(db: Database, app: string, instance: string, nowIso: string): { scope: string; until: string }[] {
+  return db.query<{ scope: string; until: string }, [string, string, string]>(
+    "SELECT scope, until FROM cooldowns WHERE app = ? AND instance = ? AND until > ? ORDER BY scope",
+  ).all(app, instance, iso(nowIso));
+}
+
 /** Observed state of one instance's windows at `nowIso`. */
 export function snapshot(
   db: Database,

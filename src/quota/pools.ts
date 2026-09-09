@@ -118,7 +118,7 @@ export function listPools(db: Database): Pool[] {
 }
 
 /**
- * Candidates for this run, in the plan's precedence order: explicit instance
+ * Candidates for this run, in precedence order: explicit instance
  * argument > pool balancing > default. Each is annotated with what selection
  * needs — cooldown, observed headroom, user-owned preciousness and the derived
  * weight — leaving member order intact so equal weights break deterministically.

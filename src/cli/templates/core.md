@@ -9,7 +9,7 @@ Baton hands a self-contained task to a model running in another agent CLI on thi
 
 ### How
 
-1. Call `list_models` when you are unsure what this machine can reach. It reports what is available in this environment, each model's live rating (observed evidence and seeded prior, kept apart), and how much quota is left. Trust it over any static opinion about which model is best, including the roster below and your own.
+1. Call `list_models` when you are unsure what this machine can reach. It reports what is available in this environment, each model's live rating (observed evidence and seeded prior, kept apart), and estimated headroom for pooled accounts from runs Baton observed. It cannot see subscription limits or usage outside Baton. Trust its model roster and ratings over any static opinion, including the roster below and your own.
 2. Call `run_model(model, prompt, cwd?, wait?, category?, options?, idempotency_key?)`:
    - `prompt` must be self-contained. The callee shares your filesystem and none of your context: no chat history, no earlier tool output, no user messages. State the task, the paths to read, the constraints, and the exact shape of the answer you want back.
    - `cwd` defaults to your working directory. Set it to aim the callee at another checkout.

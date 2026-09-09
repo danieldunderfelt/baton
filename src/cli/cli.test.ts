@@ -562,6 +562,18 @@ function occurrences(haystack: string, needle: string): number {
 }
 
 describe("pool", () => {
+  test("list shows provider cooldowns without implying the whole app is cooling", async () => {
+    const scope = tmp("pool-provider");
+    expect((await baton(scope, "pool", "set", "opencode", "default")).code).toBe(0);
+    const db = openStore(join(scope, "state", "baton.db"));
+    db.query("INSERT INTO cooldowns (app, instance, scope, until) VALUES (?, ?, ?, ?)")
+      .run("opencode", "default", "anthropic", "2099-01-01T00:00:00.000Z");
+    db.close();
+    const list = await baton(scope, "pool", "list");
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("anthropic: 2099-01-01T00:00:00.000Z");
+  });
+
   test("set, list and clear round-trip", async () => {
     const scope = tmp("pool");
     expect((await baton(scope, "pool", "list")).stdout).toContain("No pools defined");

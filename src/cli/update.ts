@@ -89,7 +89,7 @@ function updateCheckout(root: string): UpdateResult {
   } else {
     notes.push(`${root} is not a git checkout; rebuilt what is there.`);
   }
-  run(["bun", "install", "--silent"], "bun install failed");
+  run(["bun", "install", "--frozen-lockfile", "--silent"], "bun install failed");
   run(["bun", "run", "build"], "build failed");
   const binary = join(root, "dist", "baton");
   notes.push(...resign(binary));
@@ -136,6 +136,12 @@ async function updateFromRelease(
     writeFileSync(tmp, binary, { mode: 0o755, flag: "wx" });
     chmodSync(tmp, 0o755);
     const notes = resign(tmp);
+    const probe = Bun.spawnSync([tmp, "--version"], {
+      stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000,
+    });
+    if (probe.exitCode !== 0 || probe.stdout.toString().trim() !== to) {
+      throw new Error(`Downloaded Baton failed its version check for ${tag}; the existing binary was kept.`);
+    }
     renameSync(tmp, path);
     return { source: "release", from: CURRENT_VERSION, to, changed: true, path, notes };
   } finally {

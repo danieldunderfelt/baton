@@ -1,7 +1,7 @@
 export const HELP = `baton — pass work between coding agents
 
 Usage:
-  baton --help | help [command]           Show usage without changing anything
+  baton --help | help [command]           Show the command reference without running a command
   baton --version                         Print the installed version
   baton mcp                               Run the stdio MCP server
   baton status                            Scope, identity env, adapter availability
@@ -42,8 +42,8 @@ Usage:
       preciousness:<app>:<instance>, max_autonomy:<app>
   baton install [host...] [--user] [--dir <dir>] [--no-eval]
                                           No host: every host CLI on PATH. --user: global configs
-  baton update                            Replace this binary with the latest release
       hosts: claude-code, codex, kimi, opencode
+  baton update                            Replace this binary with the latest release
 `;
 
 export const COMMANDS = [

@@ -8,6 +8,7 @@
     "build": "astro build",
     "preview": "wrangler dev",
     "check": "astro check",
+    "check:production": "bash scripts/check-production.sh",
     "test": "bun test",
     "db:migrate:local": "wrangler d1 migrations apply baton --local",
     "db:migrate:remote": "wrangler d1 migrations apply baton --remote",

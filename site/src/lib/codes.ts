@@ -1,15 +1,10 @@
 import { randomString } from "./crypto.ts";
 
-/**
- * Share codes: ten lowercase characters from an alphabet without look-alikes
- * (no 0/o, 1/l/i), shown as `xxxxx-xxxxx`. That is ~49 bits, and the code is
- * the only way to reach a share: enough that guessing one is not a strategy.
- */
-import { SHARE_ALPHABET, SHARE_LENGTH } from "../../../src/eval/shareCode.ts";
+import { formatShareCode, SHARE_ALPHABET, SHARE_LENGTH } from "../../../src/eval/shareCode.ts";
 export { normalizeShareCode } from "../../../src/eval/shareCode.ts";
 
 export function newShareCode(): string {
-  return format(randomString(SHARE_ALPHABET, SHARE_LENGTH), 5);
+  return formatShareCode(randomString(SHARE_ALPHABET, SHARE_LENGTH));
 }
 
 /**
