@@ -149,9 +149,18 @@ describe.skipIf(!BUILT)("compiled binary", () => {
     expect(duels.stdout).toContain("No duels in this scope yet");
   });
 
-  test("install writes the bundled skill and registers the binary itself", async () => {
+  test("install writes the bundled skill for every host and registers the binary itself", async () => {
     const target = scope();
-    const { code, stdout } = await run("install", "claude-code", "--dir", target);
+    const { code, stdout } = await run(
+      "install",
+      "claude-code",
+      "codex",
+      "kimi",
+      "opencode",
+      "cursor-agent",
+      "--dir",
+      target,
+    );
     expect(code, stdout).toBe(0);
 
     const mcp = JSON.parse(readFileSync(join(target, ".mcp.json"), "utf8")) as {
@@ -162,9 +171,15 @@ describe.skipIf(!BUILT)("compiled binary", () => {
     expect(mcp.mcpServers.baton?.args).toEqual(["mcp"]);
 
     // The template is embedded in the executable, not read from disk at runtime.
-    const skill = readFileSync(join(target, ".claude", "skills", "baton", "SKILL.md"), "utf8");
-    expect(skill).toContain("name: baton");
-    expect(skill).toContain("run_model");
+    const skillPaths = [
+      join(target, ".claude/skills/baton/SKILL.md"),
+      join(target, ".agents/skills/baton/SKILL.md"),
+    ];
+    const skills = skillPaths.map((path) => readFileSync(path, "utf8"));
+    expect(new Set(skills).size).toBe(1);
+    expect(skills[0]).toContain("name: baton");
+    expect(skills[0]).toContain("run_model");
+    expect(existsSync(join(target, "AGENTS.md"))).toBe(false);
   });
 
   test("serves MCP over stdio to a real SDK client", async () => {

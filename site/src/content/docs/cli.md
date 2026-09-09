@@ -20,6 +20,10 @@ The `baton` binary has two faces: `baton mcp` runs the MCP server over stdio tha
 | `baton install [host...] [--user] [--dir <dir>] [--no-eval]` | Register Baton with agent apps |
 | `baton update` | Replace this binary with the latest release |
 
+`baton install` supports Claude Code, Codex, Kimi Code, OpenCode, and Cursor Agent. With no host names it registers every supported CLI found on `PATH`; name hosts to select them explicitly. Codex, Kimi, OpenCode, and Cursor share `.agents/skills/baton/SKILL.md` at the nearest Git root (or target directory without one). Claude gets the same skill in `.claude/skills/baton/SKILL.md`. `--user` installs in the corresponding home directories. `--no-eval` omits the grading appendix.
+
+Installing a host that uses the shared skill also removes complete standalone Baton blocks from its old `AGENTS.md`, preserving surrounding content. A Claude-only install leaves that file alone. Fresh installs do not create `AGENTS.md`; malformed marker pairs stop migration for that host before its files are written.
+
 ## Running and judging
 
 | Command | What it does |

@@ -5,7 +5,7 @@ description: Delegate a self-contained task to another model running in a local 
 
 ## Delegating with Baton
 
-`/baton` invokes this skill explicitly; otherwise use it whenever the description above fits the request. If the `baton` tools are not visible, this session started before Baton was registered. Say so rather than shelling out to the agent CLIs by hand.
+Use the Baton MCP tools when this skill applies. If the tools are unavailable, tell the user to enable the registered Baton server and start a new session. Do not substitute direct calls to the agent CLIs.
 
 Baton hands a self-contained task to a model running in another agent CLI on this machine, on that app's own subscription, with its own tools and a fresh context, and returns its final answer. The tools come from the MCP server `baton`: `list_models`, `run_model`, `get_run`, `report_result`, `run_duel`, `report_duel`.
 
@@ -18,7 +18,7 @@ Baton hands a self-contained task to a model running in another agent CLI on thi
 
 ### How
 
-1. Call `list_models` when you are unsure what this machine can reach. It reports what is available in this environment, each model's live rating (observed evidence and seeded prior, kept apart), and how much quota is left. Trust it over any static opinion about which model is best, including the roster below and your own.
+1. Call `list_models` when you are unsure what this machine can reach. It reports what is available in this environment, each model's live rating (observed evidence and seeded prior, kept apart), and estimated headroom for pooled accounts from runs Baton observed. It cannot see subscription limits or usage outside Baton. Trust its model roster and ratings over any static opinion, including the roster below and your own.
 2. Call `run_model(model, prompt, cwd?, wait?, category?, options?, idempotency_key?)`:
    - `prompt` must be self-contained. The callee shares your filesystem and none of your context: no chat history, no earlier tool output, no user messages. State the task, the paths to read, the constraints, and the exact shape of the answer you want back.
    - `cwd` defaults to your working directory. Set it to aim the callee at another checkout.
@@ -49,9 +49,11 @@ These are the user's starting priors. `list_models` reports what the evidence sa
 
 When you are driving subagents or a multi-stage workflow, the workers should delegate too:
 
-- Give each bulk stage (the mechanical implementation, the migration, the test sweep) to a cheap model through `run_model`, and keep Claude's context for the parts that need the conversation.
+- Give bulk stages to a cheap model through `run_model`, and keep the current conversation for decisions that need its context.
 - Route cross-model review through Baton as well. A worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
 - Tell workers to grade what they actually used. A workflow that fires off a hundred delegations and grades none leaves routing exactly where it started.
+
+When you are the callee, work within the delegated task, return a standalone answer, and stop. Do not assume access to the caller's conversation or permission to expand the task.
 
 ### Grading what came back
 

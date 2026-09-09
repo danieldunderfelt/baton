@@ -42,7 +42,7 @@ Usage:
       preciousness:<app>:<instance>, max_autonomy:<app>
   baton install [host...] [--user] [--dir <dir>] [--no-eval]
                                           No host: every host CLI on PATH. --user: global configs
-      hosts: claude-code, codex, kimi, opencode
+      hosts: claude-code, codex, kimi, opencode, cursor-agent
   baton update                            Replace this binary with the latest release
 `;
 

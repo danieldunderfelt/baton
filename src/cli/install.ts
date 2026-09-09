@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -15,20 +16,15 @@ import { applyEdits, modify } from "jsonc-parser";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
 // the source tree, and install must work from any cwd.
-import AGENTS_TEMPLATE from "./templates/agents.md" with { type: "text" };
-import CLAUDE_CODE_TEMPLATE from "./templates/claude-code.md" with { type: "text" };
+import SKILL_TEMPLATE from "./templates/skill.md" with { type: "text" };
 import CORE_TEMPLATE from "./templates/core.md" with { type: "text" };
 import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
 
 /**
  * `baton install [host...]`: register the MCP server in the host's own config
- * and render the instruction layer in the host's dialect — a skill for Claude
- * Code, a markered `AGENTS.md` block for the AGENTS.md family. The project
- * scope keeps an install inside one checkout; the user scope (`--user`) writes
- * the host's global configs once, for every project. The substance is one shared core; each host wraps it in its own
- * framing, because what changes per host is how the file gets read (a skill
- * that must earn its trigger vs. a block that is always in context) and what
- * that host is usually good for.
+ * and install the shared skill in the host's discovery directory. Project and
+ * user scopes use the same skill content. Old Baton blocks are removed from
+ * AGENTS.md only after the skill and MCP registration have been written.
  *
  * Three rules hold for every host:
  * - **Merge, never replace.** Other servers and other instructions in those
@@ -40,7 +36,7 @@ import EVAL_TEMPLATE from "./templates/eval.md" with { type: "text" };
 
 export const SERVER_NAME = "baton";
 
-export const INSTALL_HOSTS = ["claude-code", "codex", "kimi", "opencode"] as const;
+export const INSTALL_HOSTS = ["claude-code", "codex", "kimi", "opencode", "cursor-agent"] as const;
 export type InstallHost = (typeof INSTALL_HOSTS)[number];
 
 export function isInstallHost(host: string): host is InstallHost {
@@ -50,7 +46,7 @@ export function isInstallHost(host: string): host is InstallHost {
 export type InstallScope = "project" | "user";
 
 export interface InstallOptions {
-  /** "project" writes into `dir`; "user" writes into the host's own home configs. */
+  /** "project" uses `dir` and its Git root; "user" uses home config and skill directories. */
   scope?: InstallScope;
   /** Project directory; ignored for the user scope. Defaults to cwd. */
   dir?: string;
@@ -67,8 +63,9 @@ export interface InstallResult {
   mcpPath: string;
   /** Anything the user has to know for the registration to actually apply. */
   mcpNote?: string;
-  /** File carrying the instruction layer. */
-  instructionsPath: string;
+  skillPath: string;
+  /** The old instruction file, when a Baton block was removed. */
+  migratedInstructionsPath: string | null;
   command: string;
   args: string[];
   /** Server names already registered in that file, left untouched. */
@@ -84,7 +81,8 @@ interface Registration {
 
 interface Location {
   mcpPath: string;
-  instructionsPath: string;
+  skillPath: string;
+  legacyInstructionsPath: string | null;
   mcpNote?: string;
 }
 
@@ -95,10 +93,6 @@ interface HostInstaller {
   locate(scope: InstallScope, dir: string, env: Env): Location;
   /** The host's own MCP config format. */
   merge(path: string, command: string, args: string[]): Registration;
-  /** A skill file is written whole; an AGENTS.md block is merged into the file. */
-  instructions: "skill" | "agents";
-  /** Host variant: the shared core goes where its `{core}` placeholder is. */
-  template: string;
   restart: string;
 }
 
@@ -110,8 +104,8 @@ function home(env: Env): string {
 
 /**
  * The user scope is the host's own global config: the place its docs say a
- * machine-wide MCP server and a global instruction file live, honouring the
- * same env var the host itself honours to relocate it.
+ * machine-wide MCP server lives, honouring the host's env overrides. Skills
+ * use the shared home directory, except for Claude's own skill directory.
  */
 const HOSTS: Record<InstallHost, HostInstaller> = {
   "claude-code": {
@@ -119,18 +113,18 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
       if (scope === "project") {
         return {
           mcpPath: join(dir, ".mcp.json"),
-          instructionsPath: join(dir, ".claude", "skills", SERVER_NAME, "SKILL.md"),
+          skillPath: join(dir, ".claude", "skills", SERVER_NAME, "SKILL.md"),
+          legacyInstructionsPath: null,
         };
       }
       const config = env.CLAUDE_CONFIG_DIR || join(home(env), ".claude");
       return {
         mcpPath: join(env.CLAUDE_CONFIG_DIR || home(env), ".claude.json"),
-        instructionsPath: join(config, "skills", SERVER_NAME, "SKILL.md"),
+        skillPath: join(config, "skills", SERVER_NAME, "SKILL.md"),
+        legacyInstructionsPath: null,
       };
     },
     merge: mergeMcpJson,
-    instructions: "skill",
-    template: CLAUDE_CODE_TEMPLATE,
     restart: "Restart Claude Code to pick both up.",
   },
   codex: {
@@ -138,43 +132,74 @@ const HOSTS: Record<InstallHost, HostInstaller> = {
       if (scope === "project") {
         return {
           mcpPath: join(dir, ".codex", "config.toml"),
-          instructionsPath: join(dir, AGENTS_FILE),
+          skillPath: sharedSkillPath(scope, dir, env),
+          legacyInstructionsPath: join(dir, AGENTS_FILE),
           mcpNote: `Codex applies a project's .codex/config.toml only to trusted projects: accept the trust prompt on first run in ${dir}, or add projects."${dir}".trust_level = "trusted" to ~/.codex/config.toml.`,
         };
       }
       const config = env.CODEX_HOME || join(home(env), ".codex");
-      return { mcpPath: join(config, "config.toml"), instructionsPath: join(config, AGENTS_FILE) };
+      return {
+        mcpPath: join(config, "config.toml"),
+        skillPath: sharedSkillPath(scope, dir, env),
+        legacyInstructionsPath: join(config, AGENTS_FILE),
+      };
     },
     merge: mergeCodexToml,
-    instructions: "agents",
-    template: AGENTS_TEMPLATE,
     restart: "Start a new codex session to pick both up.",
   },
   kimi: {
     locate: (scope, dir, env) => {
-      if (scope === "project") return locateKimiProject(dir);
+      if (scope === "project") return locateKimiProject(dir, env);
       const config = env.KIMI_CODE_HOME || join(home(env), ".kimi-code");
-      return { mcpPath: join(config, "mcp.json"), instructionsPath: join(config, AGENTS_FILE) };
+      return {
+        mcpPath: join(config, "mcp.json"),
+        skillPath: sharedSkillPath(scope, dir, env),
+        legacyInstructionsPath: join(config, AGENTS_FILE),
+      };
     },
     merge: mergeMcpJson,
-    instructions: "agents",
-    template: AGENTS_TEMPLATE,
     restart: "MCP servers load at session start: start a new kimi session.",
   },
   opencode: {
     locate: (scope, dir, env) => {
       if (scope === "project") {
-        return { mcpPath: opencodeConfig(dir), instructionsPath: join(dir, AGENTS_FILE) };
+        return {
+          mcpPath: opencodeConfig(dir),
+          skillPath: sharedSkillPath(scope, dir, env),
+          legacyInstructionsPath: join(dir, AGENTS_FILE),
+        };
       }
       const config = join(env.XDG_CONFIG_HOME || join(home(env), ".config"), "opencode");
-      return { mcpPath: env.OPENCODE_CONFIG ? resolve(env.OPENCODE_CONFIG) : opencodeConfig(config), instructionsPath: join(config, AGENTS_FILE) };
+      return {
+        mcpPath: env.OPENCODE_CONFIG ? resolve(env.OPENCODE_CONFIG) : opencodeConfig(config),
+        skillPath: sharedSkillPath(scope, dir, env),
+        legacyInstructionsPath: join(config, AGENTS_FILE),
+      };
     },
     merge: mergeOpencodeJson,
-    instructions: "agents",
-    template: AGENTS_TEMPLATE,
     restart: "Start a new opencode session to pick both up.",
   },
+  "cursor-agent": {
+    locate: (scope, dir, env) => {
+      const config = join(scope === "project" ? dir : home(env), ".cursor");
+      return {
+        mcpPath: join(config, "mcp.json"),
+        skillPath: sharedSkillPath(scope, dir, env),
+        legacyInstructionsPath: scope === "project" ? join(dir, AGENTS_FILE) : null,
+        mcpNote:
+          "Approve Baton when Cursor prompts, or enable it with 'cursor-agent mcp enable baton'.",
+      };
+    },
+    merge: mergeMcpJson,
+    restart: "Start a new Cursor Agent session to pick both up.",
+  },
 };
+
+/** One copy serves Codex, Kimi, OpenCode and Cursor, even with relocated app configs. */
+function sharedSkillPath(scope: InstallScope, dir: string, env: Env): string {
+  const root = scope === "user" ? home(env) : projectRoot(dir);
+  return join(root, ".agents", "skills", SERVER_NAME, "SKILL.md");
+}
 
 function opencodeConfig(dir: string): string {
   const jsonc = join(dir, "opencode.jsonc");
@@ -188,6 +213,7 @@ export function detectedHosts(env: Env = process.env): InstallHost[] {
     codex: "codex",
     kimi: "kimi",
     opencode: "opencode",
+    "cursor-agent": "cursor-agent",
   };
   return INSTALL_HOSTS.filter((host) => Bun.which(binary[host], { PATH: env.PATH ?? "" }) !== null);
 }
@@ -203,21 +229,24 @@ export function installHost(host: InstallHost, opts: InstallOptions = {}): Insta
   const installer = HOSTS[host];
   const { command, args } = serverCommand();
   const location = installer.locate(scope, dir, env);
-  const body = instructionText(host, opts.withEval ?? true);
-  const instructions = installer.instructions === "skill"
-    ? body
-    : markedBlockContent(location.instructionsPath, body);
+  const body = skillText(opts.withEval ?? true);
+  const legacy = legacyCleanup(location.legacyInstructionsPath);
   mkdirSync(dirname(location.mcpPath), { recursive: true });
   const registration = installer.merge(location.mcpPath, command, args);
-  mkdirSync(dirname(location.instructionsPath), { recursive: true });
-  atomicWrite(location.instructionsPath, instructions);
+  mkdirSync(dirname(location.skillPath), { recursive: true });
+  atomicWrite(location.skillPath, body);
+  if (legacy) {
+    if (legacy.content === "" && !lstatSync(legacy.path).isSymbolicLink()) unlinkSync(legacy.path);
+    else atomicWrite(legacy.path, legacy.content);
+  }
 
   return {
     host,
     scope,
     ...registration,
     ...(location.mcpNote ? { mcpNote: location.mcpNote } : {}),
-    instructionsPath: location.instructionsPath,
+    skillPath: location.skillPath,
+    migratedInstructionsPath: legacy?.path ?? null,
     command,
     args,
     restart: installer.restart,
@@ -225,17 +254,13 @@ export function installHost(host: InstallHost, opts: InstallOptions = {}): Insta
 }
 
 /**
- * The instruction layer for one host: its own variant with the shared core
- * spliced in, and the opt-in eval section appended. The core is a whole line of
- * the variant, so it needs no indentation handling — a host that ever drops the
- * placeholder would silently ship a preamble with no instructions, hence the throw.
+ * All hosts load the same skill, with the optional grading section appended.
  */
-export function instructionText(host: InstallHost, withEval: boolean): string {
-  const template = HOSTS[host].template;
-  if (!template.includes(CORE_PLACEHOLDER)) {
-    throw new Error(`The ${host} instruction template lost its ${CORE_PLACEHOLDER} placeholder.`);
+export function skillText(withEval: boolean): string {
+  if (!SKILL_TEMPLATE.includes(CORE_PLACEHOLDER)) {
+    throw new Error(`The skill template lost its ${CORE_PLACEHOLDER} placeholder.`);
   }
-  const body = template.replace(CORE_PLACEHOLDER, CORE_TEMPLATE.trim()).trimEnd();
+  const body = SKILL_TEMPLATE.replace(CORE_PLACEHOLDER, CORE_TEMPLATE.trim()).trimEnd();
   return withEval ? `${body}\n\n${EVAL_TEMPLATE.trimEnd()}\n` : `${body}\n`;
 }
 
@@ -256,7 +281,7 @@ function serverCommand(): { command: string; args: string[] } {
   return { command: process.execPath, args: ["run", join(root, "src", "index.ts"), "mcp"] };
 }
 
-/** Claude Code and Kimi Code: `mcpServers.<name>` in an `.mcp.json`-shaped file. */
+/** Claude Code, Kimi and Cursor: `mcpServers.<name>` in an `.mcp.json`-shaped file. */
 function mergeMcpJson(path: string, command: string, args: string[]): Registration {
   const doc = readJsonObject(path);
   const servers = serverEntries(doc, "mcpServers", path);
@@ -280,21 +305,32 @@ function mergeMcpJson(path: string, command: string, args: string[]): Registrati
  * project-local file is the one that loads, so that is where the registration
  * goes.
  */
-function locateKimiProject(dir: string): Location {
-  const instructionsPath = join(dir, AGENTS_FILE);
+function locateKimiProject(dir: string, env: Env): Location {
+  const skillPath = sharedSkillPath("project", dir, env);
+  const legacyInstructionsPath = join(dir, AGENTS_FILE);
   if (existsSync(join(dir, ".git"))) {
     return {
       mcpPath: join(dir, ".mcp.json"),
-      instructionsPath,
+      skillPath,
+      legacyInstructionsPath,
       mcpNote:
         "Kimi Code reads the project-root .mcp.json (the Claude-compatible file), so this one registration serves both hosts.",
     };
   }
   return {
     mcpPath: join(dir, ".kimi-code", "mcp.json"),
-    instructionsPath,
+    skillPath,
+    legacyInstructionsPath,
     mcpNote: `${dir} is not a repository root, so Kimi Code would look for the Claude-compatible .mcp.json somewhere else entirely; this went to Kimi's own project-local file, which loads for sessions started in ${dir}. Re-run the install at the repository root to register once for both hosts.`,
   };
+}
+
+/** Kimi discovers project skills at the nearest Git root, or cwd without one. */
+function projectRoot(dir: string): string {
+  for (let candidate = dir; ; candidate = dirname(candidate)) {
+    if (existsSync(join(candidate, ".git"))) return candidate;
+    if (dirname(candidate) === candidate) return dir;
+  }
 }
 
 /**
@@ -309,13 +345,26 @@ function mergeOpencodeJson(path: string, command: string, args: string[]): Regis
   const servers = serverEntries(doc, "mcp", path);
   const preserved = Object.keys(servers).filter((name) => name !== SERVER_NAME);
   const indentation = raw.match(/^[\t ]+(?=")/m)?.[0] ?? "  ";
-  const formattingOptions = { insertSpaces: !indentation.includes("\t"), tabSize: indentation.length };
+  const formattingOptions = {
+    insertSpaces: !indentation.includes("\t"),
+    tabSize: indentation.length,
+  };
   let output = raw.trim() || "{}";
   if (doc.$schema === undefined) {
-    output = applyEdits(output, modify(output, ["$schema"], "https://opencode.ai/config.json", { formattingOptions }));
+    output = applyEdits(
+      output,
+      modify(output, ["$schema"], "https://opencode.ai/config.json", { formattingOptions }),
+    );
   }
-  output = applyEdits(output, modify(output, ["mcp", SERVER_NAME],
-    { type: "local", command: [command, ...args], enabled: true }, { formattingOptions }));
+  output = applyEdits(
+    output,
+    modify(
+      output,
+      ["mcp", SERVER_NAME],
+      { type: "local", command: [command, ...args], enabled: true },
+      { formattingOptions },
+    ),
+  );
   atomicWrite(path, `${output.trimEnd()}\n`);
   return { mcpPath: path, preserved };
 }
@@ -385,7 +434,9 @@ function mergeCodexToml(path: string, command: string, args: string[]): Registra
     return result;
   };
   if (!isDeepStrictEqual(withoutBaton(original), withoutBaton(updated))) {
-    throw new Error(`Cannot merge ${path} without changing unrelated TOML values; nothing was written.`);
+    throw new Error(
+      `Cannot merge ${path} without changing unrelated TOML values; nothing was written.`,
+    );
   }
   atomicWrite(path, output);
   return { mcpPath: path, preserved: [...preserved].sort() };
@@ -447,37 +498,36 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-export const BLOCK_BEGIN = `<!-- ${SERVER_NAME}:begin -->`;
-export const BLOCK_END = `<!-- ${SERVER_NAME}:end -->`;
-
 /**
- * The AGENTS.md dialect: our instructions live between HTML-comment markers and
- * everything else in the file is opaque — those hosts read the whole file, and
- * the user's own instructions are the reason it exists. Re-running replaces the
- * block in place; a file with a begin marker and no end marker is a corruption
- * we refuse to guess at.
+ * Prepare migration before writing any files. Only complete, standalone Baton
+ * marker pairs belong to us; surrounding bytes and symlinks are preserved.
  */
-function markedBlockContent(path: string, body: string): string {
-  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const block = `${BLOCK_BEGIN}\n${body.trim()}\n${BLOCK_END}\n`;
-  const start = existing.indexOf(BLOCK_BEGIN);
-  const end = existing.indexOf(BLOCK_END);
-  if ((start === -1 && end !== -1) ||
-      (start !== -1 && existing.indexOf(BLOCK_BEGIN, start + BLOCK_BEGIN.length) !== -1) ||
-      (end !== -1 && existing.indexOf(BLOCK_END, end + BLOCK_END.length) !== -1)) {
-    throw new Error(`${path} has unmatched or duplicate Baton markers; repair the block before installing.`);
+function legacyCleanup(path: string | null): { path: string; content: string } | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  const existing = readFileSync(path, "utf8");
+  let inside = false;
+  let cursor = 0;
+  let content = "";
+  for (const marker of existing.matchAll(/^<!-- baton:(begin|end) -->\r?$/gm)) {
+    const begins = marker[1] === "begin";
+    if (begins === inside) {
+      throw new Error(
+        `${path} has unmatched or nested Baton markers; repair the block before installing, refusing to guess.`,
+      );
+    }
+    if (begins) content += existing.slice(cursor, marker.index);
+    else {
+      cursor = marker.index + marker[0].length;
+      if (existing[cursor] === "\n") cursor++;
+    }
+    inside = begins;
   }
-  if (start === -1) {
-    const before = existing.replace(/\s+$/, "");
-    return before ? `${before}\n\n${block}` : block;
-  }
-  if (end < start) {
+  if (inside)
     throw new Error(
-      `${path} has a ${BLOCK_BEGIN} marker without a matching ${BLOCK_END} after it. Repair or remove the block; refusing to guess where it ends.`,
+      `${path} has an unfinished Baton block; repair it before installing, refusing to guess.`,
     );
-  }
-  const after = existing.slice(end + BLOCK_END.length).replace(/^\n/, "");
-  return `${existing.slice(0, start)}${block}${after}`;
+  if (cursor === 0) return undefined;
+  return { path, content: content + existing.slice(cursor) };
 }
 
 function readJsonObject(path: string): Record<string, unknown> {
@@ -513,7 +563,11 @@ function atomicWrite(path: string, content: string): void {
   }
 }
 
-function serverEntries(doc: Record<string, unknown>, key: string, path: string): Record<string, unknown> {
+function serverEntries(
+  doc: Record<string, unknown>,
+  key: string,
+  path: string,
+): Record<string, unknown> {
   const value = doc[key];
   if (value === undefined) return {};
   if (!isRecord(value)) throw new Error(`${path}: ${key} must be an object; nothing was written.`);

@@ -1930,7 +1930,10 @@ function install(args: string[]): number {
     command = [res.command, ...res.args].join(" ");
     console.log(`${host}: registered in ${res.mcpPath}`);
     if (res.preserved.length > 0) console.log(`  kept: ${res.preserved.join(", ")}`);
-    console.log(`  instructions: ${res.instructionsPath}`);
+    console.log(`  skill: ${res.skillPath}`);
+    if (res.migratedInstructionsPath) {
+      console.log(`  removed legacy Baton instructions from ${res.migratedInstructionsPath}`);
+    }
     if (res.mcpNote) console.log(`  note: ${res.mcpNote}`);
     restarts.add(res.restart);
   }

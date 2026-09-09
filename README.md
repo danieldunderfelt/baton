@@ -9,7 +9,7 @@ The two roles work differently:
 - Calling *into* Baton takes nothing special: any app that can use MCP tools can be a caller. Point it at `baton mcp` and it can delegate.
 - Being a *callee* is what needs support, because Baton runs callees through their command-line interface, not through MCP. Built-in callees: Claude Code, Codex, Kimi Code, OpenCode, Cursor Agent. Unknown apps can be added at runtime without editing any config file (see "Adding a new app" below).
 
-For the built-in apps, `baton install` also writes instructions in each app's own dialect (a skill for Claude Code, an AGENTS.md block for the rest), so their agents know when to delegate without being told.
+For all five built-in apps, `baton install` writes the same on-demand `SKILL.md`. Its description lets the host load Baton when a task fits, and its content stays consistent across callers.
 
 ## How it works
 
@@ -29,9 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/danieldunderfelt/baton/main/install
 baton install --user
 ```
 
-The first command puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second command registers Baton with the four caller hosts it finds on PATH: Claude Code, Codex, Kimi Code, and OpenCode. It writes each host's global config and the instructions that teach its agent when to delegate and how to grade what comes back.
-
-Cursor Agent is a callee, not one of the caller hosts configured by `baton install --user`. Configure its MCP server manually if you want Cursor Agent to call Baton.
+The first command puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second command registers Baton with the five caller hosts it finds on `PATH`: Claude Code, Codex, Kimi Code, OpenCode, and Cursor Agent. It writes each host's global config and the same skill, which teaches the agent when to delegate and how to grade what comes back.
 
 Shells use the first matching executable in `PATH`. Check which binary your shell will run with `type -a baton`, and put the user install first when needed:
 
@@ -72,7 +70,23 @@ baton update
 
 That replaces the binary with the latest release (or rebuilds it, if you run from a checkout). Sessions already running keep the old server until they restart.
 
-To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory. It writes the selected hosts' MCP and instruction files, including `.mcp.json`, `.codex/config.toml`, and `opencode.json` or an existing `opencode.jsonc`. Outside a repository root, Kimi uses `.kimi-code/mcp.json`. `--no-eval` leaves out the grading section; the default includes it, because ratings do not improve without grades.
+To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory. It writes the selected hosts' MCP files and skills. `--no-eval` leaves out the grading appendix; the default includes it, because ratings do not improve without grades.
+
+Codex, Kimi, OpenCode, and Cursor share one skill at `.agents/skills/baton/SKILL.md`. Project installs place it at the nearest Git root, or the target directory when there is no Git root. User installs place it at `~/.agents/skills/baton/SKILL.md`. Claude gets the same content in `.claude/skills/baton/SKILL.md` (project) or `~/.claude/skills/baton/SKILL.md` (user).
+
+| Host | Project MCP config | User MCP config |
+|---|---|---|
+| Claude Code | `.mcp.json` | `~/.claude.json` |
+| Codex | `.codex/config.toml` | `~/.codex/config.toml` |
+| Kimi Code | `.mcp.json` when the target is a Git root; otherwise `.kimi-code/mcp.json` | `~/.kimi-code/mcp.json` |
+| OpenCode | `opencode.json` or existing `opencode.jsonc` | `~/.config/opencode/opencode.json` or existing `opencode.jsonc` |
+| Cursor Agent | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, and `XDG_CONFIG_HOME` relocate their corresponding user MCP configs; `OPENCODE_CONFIG` selects OpenCode's MCP config file. Claude's skill also follows `CLAUDE_CONFIG_DIR`. The shared skill stays in `~/.agents/skills` regardless of these overrides. Cursor may prompt you to approve Baton; you can also run `cursor-agent mcp enable baton`.
+
+Reinstalling updates the skill and MCP registration. When installing a host that uses the shared skill, Baton also removes its complete standalone `<!-- baton:begin -->` … `<!-- baton:end -->` blocks from the old `AGENTS.md`, preserving the surrounding file. A Claude-only install leaves that file alone. Fresh installs do not create `AGENTS.md`; incomplete or nested markers stop migration for that host before its files are written.
+
+Baton-only regular files are removed after migration; symlinks stay intact.
 
 `baton detect` shows which app CLIs are installed and which models they serve. `baton status` shows where Baton's state lives and which identity variables are set.
 

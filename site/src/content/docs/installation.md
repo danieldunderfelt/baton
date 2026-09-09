@@ -11,9 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/danieldunderfelt/baton/main/install
 baton install --user
 ```
 
-The first command puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second command registers Baton with the four caller hosts it finds on PATH: Claude Code, Codex, Kimi Code, and OpenCode. It writes each host's global config and the instructions that teach its agent when to delegate and how to grade what comes back.
-
-Cursor Agent is a callee, not one of the caller hosts configured by `baton install --user`. Configure its MCP server manually if you want Cursor Agent to call Baton.
+The first command puts a self-contained `baton` in `~/.local/bin` (macOS or Linux, arm64 or x64, checksum verified; no Bun needed). The second command registers Baton with the five caller hosts it finds on `PATH`: Claude Code, Codex, Kimi Code, OpenCode, and Cursor Agent. It writes each host's global config and the same on-demand skill, which teaches its agent when to delegate and how to grade what comes back.
 
 Shells use the first matching executable in `PATH`. Check which binary your shell will run with `type -a baton`, and put the user install first when needed:
 
@@ -48,7 +46,7 @@ After a release that includes these commands is published, rerunning the curl in
 
 ## Single checkout
 
-To keep an install inside one checkout instead of the whole machine, run `baton install` in that directory. It writes `.mcp.json`, `.codex/config.toml`, `opencode.json` and the instruction files there instead of in the global configs.
+To keep an install inside one checkout instead of the whole machine, run `baton install` in that directory. It writes the selected hosts' MCP files and the same `SKILL.md` content at each host's discovery path.
 
 ```sh
 baton install claude-code codex    # only these hosts
@@ -56,7 +54,23 @@ baton install --dir ~/work/other   # install into another directory
 baton install --no-eval            # leave out the grading instructions
 ```
 
-Host names limit which apps get registered. `--no-eval` leaves out the grading section of the instructions; the default includes it, because ratings do not improve without grades.
+Host names limit which apps get registered. `--no-eval` leaves out the grading appendix; the default includes it, because ratings do not improve without grades. Reinstalling updates the MCP registration and skill. For hosts using the shared skill, it also removes complete standalone `<!-- baton:begin -->` … `<!-- baton:end -->` blocks from the old `AGENTS.md`, preserving the surrounding file. A Claude-only install leaves that file alone. Fresh installs do not create `AGENTS.md`; incomplete or nested markers stop migration for that host before its files are written.
+
+Baton-only regular files are removed after migration; symlinks stay intact.
+
+## Discovery paths
+
+Codex, Kimi, OpenCode, and Cursor share one skill at `.agents/skills/baton/SKILL.md`. Project installs place it at the nearest Git root, or the target directory when there is no Git root. User installs place it at `~/.agents/skills/baton/SKILL.md`. Claude gets the same content in `.claude/skills/baton/SKILL.md` (project) or `~/.claude/skills/baton/SKILL.md` (user).
+
+| Host | Project MCP config | User MCP config |
+|---|---|---|
+| Claude Code | `.mcp.json` | `~/.claude.json` |
+| Codex | `.codex/config.toml` | `~/.codex/config.toml` |
+| Kimi Code | `.mcp.json` when the target is a Git root; otherwise `.kimi-code/mcp.json` | `~/.kimi-code/mcp.json` |
+| OpenCode | `opencode.json` or existing `opencode.jsonc` | `~/.config/opencode/opencode.json` or existing `opencode.jsonc` |
+| Cursor Agent | `.cursor/mcp.json` | `~/.cursor/mcp.json` |
+
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `KIMI_CODE_HOME`, and `XDG_CONFIG_HOME` relocate their corresponding user MCP configs; `OPENCODE_CONFIG` selects OpenCode's MCP config file. Claude's skill also follows `CLAUDE_CONFIG_DIR`. The shared skill stays in `~/.agents/skills` regardless of these overrides. Cursor may prompt you to approve Baton; you can also run `cursor-agent mcp enable baton`.
 
 ## Updating
 

@@ -318,7 +318,7 @@ describe("install --user", () => {
       ["install", "--user"],
     );
     expect(res.code).toBe(0);
-    for (const host of ["claude-code", "codex", "kimi", "opencode"]) {
+    for (const host of ["claude-code", "codex", "kimi", "opencode", "cursor-agent"]) {
       expect(res.stdout).toContain(`${host}: registered in `);
     }
 
@@ -327,25 +327,38 @@ describe("install --user", () => {
     };
     expect(claude.mcpServers.baton?.args.at(-1)).toBe("mcp");
     expect(existsSync(join(home, ".claude", "skills", "baton", "SKILL.md"))).toBe(true);
-    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toContain("[mcp_servers.baton]");
-    expect(readFileSync(join(home, ".codex", "AGENTS.md"), "utf8")).toContain("baton:begin");
+    expect(readFileSync(join(home, ".codex", "config.toml"), "utf8")).toContain(
+      "[mcp_servers.baton]",
+    );
+    expect(existsSync(join(home, ".agents", "skills", "baton", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(home, ".codex", "AGENTS.md"))).toBe(false);
     const kimi = (await Bun.file(join(home, ".kimi-code", "mcp.json")).json()) as {
       mcpServers: Record<string, unknown>;
     };
     expect(Object.keys(kimi.mcpServers)).toEqual(["baton"]);
-    expect(existsSync(join(home, ".kimi-code", "AGENTS.md"))).toBe(true);
-    const opencode = (await Bun.file(join(home, ".config", "opencode", "opencode.json")).json()) as {
+    expect(existsSync(join(home, ".kimi-code", "AGENTS.md"))).toBe(false);
+    const opencode = (await Bun.file(
+      join(home, ".config", "opencode", "opencode.json"),
+    ).json()) as {
       mcp: Record<string, unknown>;
     };
     expect(Object.keys(opencode.mcp)).toEqual(["baton"]);
-    expect(existsSync(join(home, ".config", "opencode", "AGENTS.md"))).toBe(true);
+    expect(existsSync(join(home, ".config", "opencode", "AGENTS.md"))).toBe(false);
+    const cursor = (await Bun.file(join(home, ".cursor", "mcp.json")).json()) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(Object.keys(cursor.mcpServers)).toEqual(["baton"]);
   });
 
   test("a bare install registers only the hosts on PATH, and says so when there are none", async () => {
     const home = fakeHome();
     const bin = tmp("only-codex-bin");
     writeFileSync(join(bin, "codex"), `#!/bin/sh\n${VERSION_SHIM}\nexit 1\n`, { mode: 0o755 });
-    const env = { BATON_CONFIG_DIR: tmp("install-detect-scope"), HOME: home, CODEX_HOME: undefined };
+    const env = {
+      BATON_CONFIG_DIR: tmp("install-detect-scope"),
+      HOME: home,
+      CODEX_HOME: undefined,
+    };
     const some = await spawnBaton({ ...env, PATH: bin }, ["install", "--user"]);
     expect(some.code).toBe(0);
     expect(some.stdout).toContain("codex: registered in ");
@@ -398,14 +411,15 @@ theme = "dark"
     expect(toml).toContain(`command = ${JSON.stringify(process.execPath)}`);
     expect(toml).toMatch(/args = \["run", ".*\/src\/index.ts", "mcp"\]/);
 
-    // The instruction block is appended, the user's own AGENTS.md content stays.
+    // Fresh installs write the skill and leave the user's own AGENTS.md alone.
     const agents = readFileSync(join(target, "AGENTS.md"), "utf8");
-    expect(agents).toContain("Always run the tests before you commit.");
-    expect(agents).toContain("<!-- baton:begin -->");
-    expect(agents).toContain("run_model");
+    expect(agents).toBe("# House rules\n\nAlways run the tests before you commit.\n");
+    expect(readFileSync(join(target, ".agents/skills/baton/SKILL.md"), "utf8")).toContain(
+      "name: baton",
+    );
   });
 
-  test("re-running replaces the block instead of stacking copies", async () => {
+  test("re-running replaces the skill instead of stacking copies", async () => {
     const target = tmp("codex-twice");
     const scope = tmp("codex-twice-scope");
     await baton(scope, "install", "codex", "--dir", target);
@@ -414,10 +428,10 @@ theme = "dark"
 
     const toml = readFileSync(join(target, ".codex", "config.toml"), "utf8");
     expect(occurrences(toml, "[mcp_servers.baton]")).toBe(1);
-    const agents = readFileSync(join(target, "AGENTS.md"), "utf8");
-    expect(occurrences(agents, "<!-- baton:begin -->")).toBe(1);
-    expect(occurrences(agents, "<!-- baton:end -->")).toBe(1);
-    expect(agents).toContain("report_result");
+    expect(existsSync(join(target, "AGENTS.md"))).toBe(false);
+    const skill = readFileSync(join(target, ".agents/skills/baton/SKILL.md"), "utf8");
+    expect(occurrences(skill, "name: baton")).toBe(1);
+    expect(skill).toContain("report_result");
   });
 
   // Appending our table beside any of these produces a config codex refuses to
@@ -499,7 +513,10 @@ describe("install opencode", () => {
     expect(doc.mcp.baton?.type).toBe("local");
     expect(doc.mcp.baton?.command?.at(-1)).toBe("mcp");
     expect(doc.mcp.baton?.enabled).toBe(true);
-    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain("<!-- baton:begin -->");
+    expect(readFileSync(join(target, ".agents/skills/baton/SKILL.md"), "utf8")).toContain(
+      "name: baton",
+    );
+    expect(existsSync(join(target, "AGENTS.md"))).toBe(false);
   });
 });
 
@@ -519,9 +536,10 @@ describe("install kimi", () => {
       mcpServers: Record<string, { command: string; args: string[] }>;
     };
     expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
-    expect(readFileSync(join(target, "AGENTS.md"), "utf8")).toContain(
-      "Delegating through Baton",
+    expect(readFileSync(join(target, ".agents/skills/baton/SKILL.md"), "utf8")).toContain(
+      "name: baton",
     );
+    expect(existsSync(join(target, "AGENTS.md"))).toBe(false);
   });
 
   test("registers in .kimi-code/mcp.json where a root .mcp.json would never be read", async () => {
@@ -536,6 +554,22 @@ describe("install kimi", () => {
       mcpServers: Record<string, { command: string; args: string[] }>;
     };
     expect(doc.mcpServers.baton?.args.at(-1)).toBe("mcp");
+    expect(readFileSync(join(target, ".agents", "skills", "baton", "SKILL.md"), "utf8")).toContain(
+      "name: baton",
+    );
+  });
+
+  test("discovers a project skill at the nearest Git root from a subdirectory", async () => {
+    const root = tmp("kimi-root-skill");
+    const target = join(root, "packages/app");
+    mkdirSync(join(root, ".git"));
+    mkdirSync(target, { recursive: true });
+
+    const res = await baton(tmp("kimi-root-skill-scope"), "install", "kimi", "--dir", target);
+
+    expect(res.code).toBe(0);
+    expect(existsSync(join(root, ".agents", "skills", "baton", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(target, ".agents", "skills", "baton", "SKILL.md"))).toBe(false);
   });
 
   test("merges into an existing .kimi-code/mcp.json instead of replacing it", async () => {
@@ -566,8 +600,12 @@ describe("pool", () => {
     const scope = tmp("pool-provider");
     expect((await baton(scope, "pool", "set", "opencode", "default")).code).toBe(0);
     const db = openStore(join(scope, "state", "baton.db"));
-    db.query("INSERT INTO cooldowns (app, instance, scope, until) VALUES (?, ?, ?, ?)")
-      .run("opencode", "default", "anthropic", "2099-01-01T00:00:00.000Z");
+    db.query("INSERT INTO cooldowns (app, instance, scope, until) VALUES (?, ?, ?, ?)").run(
+      "opencode",
+      "default",
+      "anthropic",
+      "2099-01-01T00:00:00.000Z",
+    );
     db.close();
     const list = await baton(scope, "pool", "list");
     expect(list.code).toBe(0);
@@ -647,13 +685,17 @@ describe("block", () => {
       "subscription",
     );
     expect(add.code).toBe(0);
-    expect(add.stdout).toContain("Blocked opencode:*/fake-provider/* (client enterprise subscription)");
+    expect(add.stdout).toContain(
+      "Blocked opencode:*/fake-provider/* (client enterprise subscription)",
+    );
     // The confirmation is the routes it covers right now, not just the pattern.
     expect(add.stdout).toContain("opencode:default/fake-provider/fake-model");
     expect(add.stdout).not.toContain("opencode/x-preview-f-free");
 
     const list = await baton(scope, "block", "list");
-    expect(list.stdout).toMatch(/opencode:\*\/fake-provider\/\*\s+1\s+client enterprise subscription/);
+    expect(list.stdout).toMatch(
+      /opencode:\*\/fake-provider\/\*\s+1\s+client enterprise subscription/,
+    );
 
     // The blocked model is unavailable with the user's own reason attached...
     const models = await baton(scope, "models");
@@ -1353,7 +1395,14 @@ describe("adapters review and approval", () => {
 
     // A tool call or a pasted command has no terminal behind it. This is the
     // whole reason approval is not an MCP tool.
-    const noTty = await baton(scope, "adapters", "approve", "fakeagent", "--digest", digestOf(spec));
+    const noTty = await baton(
+      scope,
+      "adapters",
+      "approve",
+      "fakeagent",
+      "--digest",
+      digestOf(spec),
+    );
     expect(noTty.code).toBe(1);
     expect(noTty.stderr).toContain("stdin is not a terminal");
     expect(noTty.stderr).toContain("no override flag");
@@ -1646,7 +1695,11 @@ describe("serve --http", () => {
     async () => {
       const scope = tmp("serve-busy");
       // Same address the daemon binds: a wildcard holder would let it start.
-      const holder = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("busy") });
+      const holder = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () => new Response("busy"),
+      });
       try {
         const res = await baton(scope, "serve", "--http", "--port", String(holder.port));
         // A daemon that cannot bind must say so and exit, not run half-alive.
