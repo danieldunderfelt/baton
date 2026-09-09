@@ -1,11 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import pkg from "../package.json" with { type: "json" };
 
 // Exercise the artifact we will ship, with no source tree, Bun, or agent CLI
 // on PATH. All global registrations go into a disposable home.
-const binary = resolve(process.argv[2] ?? "dist/baton");
+const binary = realpathSync(resolve(process.argv[2] ?? "dist/baton"));
 const dir = mkdtempSync(join(tmpdir(), "baton-release-check-"));
 function run(...args: string[]): string {
   const result = Bun.spawnSync([binary, ...args], {
