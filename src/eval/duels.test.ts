@@ -222,7 +222,6 @@ describe("startDuel", () => {
 
   test("assigns labels randomly across duels", async () => {
     const h = harness(async (slug) => ok(slug));
-    h.db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '100')").run();
     const seen = new Set<string>();
     for (let i = 0; i < 24; i++) {
       const view = await startDuel({ db: h.db, supervisor: h.supervisor }, request());
@@ -407,7 +406,6 @@ describe("btRatings", () => {
    */
   test("a tie and a decisive duel each contribute exactly one comparison", async () => {
     const h = harness(async (slug) => ok(slug));
-    h.db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '100')").run();
     const first = await judged(h, [ALPHA, OMEGA], "A");
     const second = await judged(h, [BETA, GAMMA], "tie");
     const at = second > first ? second : first;
@@ -422,7 +420,6 @@ describe("btRatings", () => {
 
   test("resolves the prior per category, not one flattened mean per model", async () => {
     const h = harness(async (slug) => ok(slug));
-    h.db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '100')").run();
     seedPriors(h.db, "daniel", [
       { model: ALPHA, category: "impl", mean: 5, weight: PRIOR_WEIGHT_CAP },
       { model: ALPHA, category: "review", mean: 1, weight: PRIOR_WEIGHT_CAP },

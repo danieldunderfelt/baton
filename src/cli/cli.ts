@@ -94,7 +94,6 @@ import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
 import {
   HOPS_ENV,
   SETTING_MAX_AUTONOMY_PREFIX,
-  SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type RunStatus,
   type RunView,
@@ -1790,9 +1789,6 @@ function set(args: string[]): number {
     const hops = parseNonNegativeInt(value, SETTING_MAX_HOPS);
     return writeSetting(key, String(hops));
   }
-  if (key === SETTING_MAX_CONCURRENT) {
-    return writeSetting(key, String(parsePositiveInt(value, SETTING_MAX_CONCURRENT)));
-  }
   if (key === SETTING_HALF_LIFE_DAYS) return setHalfLife(value, args.slice(2));
   if (key === SETTING_PROFILE_WEIGHT) {
     return writeSetting(key, String(parsePositiveNumber(value, SETTING_PROFILE_WEIGHT)), {
@@ -1970,7 +1966,7 @@ function usage(problem: string): number {
 }
 
 function validKeys(): string {
-  return `Valid keys: ${SETTING_MAX_HOPS} <int>, ${SETTING_MAX_CONCURRENT} <int>, ${SETTING_HALF_LIFE_DAYS} <int>, ${SETTING_PROFILE_WEIGHT} <number>, ${SETTING_ACTIVE_PROFILE} <profile>, ${SETTING_PRECIOUSNESS_PREFIX}<app>:<instance> <${Object.keys(
+  return `Valid keys: ${SETTING_MAX_HOPS} <int>, ${SETTING_HALF_LIFE_DAYS} <int>, ${SETTING_PROFILE_WEIGHT} <number>, ${SETTING_ACTIVE_PROFILE} <profile>, ${SETTING_PRECIOUSNESS_PREFIX}<app>:<instance> <${Object.keys(
     PRECIOUSNESS_FACTOR,
   ).join("|")}>, ${knownApps()
     .map((app) => `${SETTING_MAX_AUTONOMY_PREFIX}${app}`)

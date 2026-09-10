@@ -38,7 +38,7 @@ Usage:
   baton profile share [--profile <n>]     Publish to the sharing site; prints code and link
   baton profile shares | profile unshare <code>
   baton login | logout                    Sign in to the sharing site with GitHub
-  baton set <key> <value>                 Settings: max_hops, max_concurrent, half_life_days, profile_weight, active_profile,
+  baton set <key> <value>                 Settings: max_hops, half_life_days, profile_weight, active_profile,
       preciousness:<app>:<instance>, max_autonomy:<app>
   baton install [host...] [--user] [--dir <dir>] [--no-eval]
                                           No host: every host CLI on PATH. --user: global configs

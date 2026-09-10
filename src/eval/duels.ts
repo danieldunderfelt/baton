@@ -61,7 +61,7 @@ const FAILED: ReadonlySet<RunStatus> = new Set<RunStatus>([
  * Launches both sides and records the duel. Label assignment is a crypto coin
  * flip, so the caller cannot infer the mapping from the request order.
  *
- * The second launch failing (an unresolvable model, a concurrency cap) cancels
+ * The second launch failing (for example, an unresolvable model) cancels
  * the first: half a duel is not evidence, and leaving it running would burn a
  * quota window for an answer nobody will ever judge.
  */

@@ -33,11 +33,9 @@ import { newId, nowIso, withBusyRetry } from "../store/store.ts";
 import {
   ADAPTER_DIGEST,
   ADAPTER_VERSION,
-  DEFAULT_MAX_CONCURRENT,
   DEFAULT_MAX_HOPS,
   HOPS_ENV,
   RESUMED_FROM,
-  SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type AttemptView,
   type ResumeRequest,
@@ -676,8 +674,7 @@ export class Supervisor {
   /**
    * One transaction: the finished attempt, and either the run's terminal status
    * or the failover attempt that continues it. The successor is inserted
-   * already `running` so the run is never momentarily idle, and it inherits the
-   * concurrency slot the finished attempt just released.
+   * already `running` so the run is never momentarily idle.
    */
   private commit(
     ctx: AttemptCtx,
@@ -814,26 +811,11 @@ export class Supervisor {
     options: Record<string, unknown>;
   }): void {
     const now = nowIso();
-    // BEGIN IMMEDIATE: the admission count and the insert that consumes a slot
-    // must not interleave with another process doing the same.
+    // BEGIN IMMEDIATE keeps the session-holder check and insertion atomic
+    // across processes, so two resumes cannot claim the same session.
     this.db
       .transaction(() => {
         this.guardSessionHolder(a.options[RESUMED_FROM]);
-        const cap = this.maxConcurrent();
-        // 'queued' counts too: an attempt is inserted queued and only then
-        // flipped to running, so counting 'running' alone lets two processes
-        // in the gap both pass a cap of one.
-        const running =
-          this.db
-            .query<{ n: number }, []>(
-              "SELECT COUNT(*) AS n FROM attempts WHERE status IN ('queued','running')",
-            )
-            .get()?.n ?? 0;
-        if (running >= cap) {
-          throw new Error(
-            `Refusing to delegate: ${running} attempt(s) are already running and this scope's concurrency cap ('${SETTING_MAX_CONCURRENT}') is ${cap}. Retry once one finishes, or raise it with 'baton set ${SETTING_MAX_CONCURRENT} <n>'.`,
-          );
-        }
         this.db
           .query(
             `INSERT INTO runs (id, idempotency_key, payload_hash, model, app, slug, instance, prompt, cwd, category, options, status, policy_version, created_at, updated_at)
@@ -973,10 +955,6 @@ export class Supervisor {
 
   private maxHops(): number {
     return this.intSetting(SETTING_MAX_HOPS, DEFAULT_MAX_HOPS, 0);
-  }
-
-  private maxConcurrent(): number {
-    return this.intSetting(SETTING_MAX_CONCURRENT, DEFAULT_MAX_CONCURRENT, 1);
   }
 
   private intSetting(key: string, fallback: number, min: number): number {

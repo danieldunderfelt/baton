@@ -107,8 +107,5 @@ export const DEFAULT_MAX_HOPS = 2;
 
 /** Settings keys (settings table). */
 export const SETTING_MAX_HOPS = "max_hops";
-/** Per-scope cap on attempts running at once. */
-export const SETTING_MAX_CONCURRENT = "max_concurrent";
-export const DEFAULT_MAX_CONCURRENT = 4;
 /** Per-app authority ceiling: key `max_autonomy:<app>`, value an Autonomy. */
 export const SETTING_MAX_AUTONOMY_PREFIX = "max_autonomy:";

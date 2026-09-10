@@ -111,18 +111,16 @@ describe("run flags", () => {
   });
 });
 
-describe("set max_concurrent", () => {
-  test("round-trips a positive integer and rejects anything else", async () => {
-    const env = { BATON_CONFIG_DIR: tmp("concurrent") };
-    const ok = await baton(env, "set", "max_concurrent", "2");
-    expect(ok.code).toBe(0);
-    expect(ok.stdout).toContain("max_concurrent = 2");
-    expect((await baton(env, "set", "max_concurrent", "0")).code).toBe(2);
+describe("removed max_concurrent setting", () => {
+  test("rejects max_concurrent as an unknown setting", async () => {
+    const res = await baton({ BATON_CONFIG_DIR: tmp("concurrent") }, "set", "max_concurrent", "1");
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("unknown setting 'max_concurrent'");
   });
 
-  test("is listed among the valid keys", async () => {
-    const res = await baton({ BATON_CONFIG_DIR: tmp("keys") }, "set", "nonsense", "1");
-    expect(res.code).toBe(2);
-    expect(res.stderr).toContain("max_concurrent");
+  test("is not advertised in help", async () => {
+    const res = await baton({ BATON_CONFIG_DIR: tmp("keys") }, "frobnicate");
+    expect(res.stderr).toContain("Usage:");
+    expect(res.stderr).not.toContain("max_concurrent");
   });
 });

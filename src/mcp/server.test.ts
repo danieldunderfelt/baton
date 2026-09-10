@@ -202,10 +202,10 @@ describe("tools/list", () => {
     // The caller-facing contract lives in the description; agents route on it.
     expect(runModel.description).toContain("idempotency_key");
     expect(runModel.description).toContain("get_run");
-    // A key reused for a changed payload errors, and the cap is a tool error the
-    // caller has to back off from rather than retry — both must be stated.
+    // A key reused for a changed payload errors, so the caller must use a new
+    // key for a changed request.
     expect(runModel.description).toContain("payload-bound");
-    expect(runModel.description).toContain("max_concurrent");
+    expect(runModel.description).not.toContain("max_concurrent");
 
     const listModels = tools.find((t) => t.name === "list_models")!;
     expect(listModels.description).toContain("degradedReason");

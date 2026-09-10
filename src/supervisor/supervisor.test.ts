@@ -11,7 +11,6 @@ import type { Target } from "../registry/registry.ts";
 import { newId, nowIso, openStore } from "../store/store.ts";
 import {
   HOPS_ENV,
-  SETTING_MAX_CONCURRENT,
   SETTING_MAX_HOPS,
   type RunStatus,
 } from "./types.ts";
@@ -350,17 +349,6 @@ describe("failover on admission failure", () => {
     ]);
   }, 30_000);
 
-  test("a failover attempt inherits the finished attempt's concurrency slot", async () => {
-    const db = newDb();
-    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
-    const sup = poolSupervisor(db, [refusing("acct-a"), answering("acct-b", "answer from b")]);
-
-    const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
-    await settled;
-    expect(sup.getRun(view.runId)!.status).toBe("succeeded");
-    expect(sup.getRun(view.runId)!.attempts).toHaveLength(2);
-  }, 30_000);
-
   test("an admission pattern printed after work started fails the run, never replays it", async () => {
     const db = newDb();
     const STARTED = "<<tool call>>";
@@ -592,60 +580,76 @@ describe("idempotency", () => {
   });
 });
 
-describe("concurrency cap", () => {
-  test("refuses a run once the scope's cap is reached, and admits again after", async () => {
+describe("concurrent runs", () => {
+  test("admits more than four independent runs while a legacy cap setting remains", async () => {
     const db = newDb();
-    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
-    const sup = supervisorFor(evalTarget("setTimeout(() => process.stdout.write('slow'), 800)"), {
+    db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '1')").run();
+    let active = 0;
+    const completion = Promise.withResolvers<void>();
+    const fiveActive = Promise.withResolvers<void>();
+    const sup = supervisorFor(evalTarget("unused"), {
       db,
+      exec: async () => {
+        active++;
+        if (active === 5) fiveActive.resolve();
+        await completion.promise;
+        active--;
+        return {
+          ok: true,
+          started: true,
+          output: "answer",
+          exitCode: 0,
+          timedOut: false,
+          rawTail: "answer",
+          durationMs: 1,
+        };
+      },
     });
 
-    const first = await sup.startRun({ model: "fake-model", prompt: "one" });
-    await expect(sup.startRun({ model: "fake-model", prompt: "two" })).rejects.toThrow(
-      /concurrency cap.*max_concurrent.*is 1/s,
+    const launches = [1, 2, 3, 4, 5].map((n) =>
+      sup.startRun({ model: "fake-model", prompt: `p${n}` }),
     );
-    // The refused run was never recorded: no corpse, no quota spent.
-    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(1);
-
-    await first.settled;
-    const second = await sup.startRun({ model: "fake-model", prompt: "two" });
-    await second.settled;
-    expect(sup.getRun(second.view.runId)!.status).toBe("succeeded");
-  }, 30_000);
-
-  test("a queued attempt already holds a slot, so a racing launch is refused", async () => {
-    const db = newDb();
-    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
-    const sup = supervisorFor(evalTarget("process.stdout.write('ok')"), { db });
-
-    // Another process, caught between its insert and its flip to 'running'.
-    const runId = newId("run");
-    const now = nowIso();
-    db.query(
-      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
-       VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', 'queued', ?, ?)`,
-    ).run(runId, now, now);
-    db.query(
-      "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'queued')",
-    ).run(newId("att"), runId);
-
-    await expect(sup.startRun({ model: "fake-model", prompt: "two" })).rejects.toThrow(
-      /concurrency cap.*is 1/s,
-    );
-    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(1);
-  }, 20_000);
-
-  test("the default cap admits several concurrent runs", async () => {
-    const db = newDb();
-    const sup = supervisorFor(evalTarget("setTimeout(() => process.stdout.write('slow'), 500)"), {
-      db,
-    });
-    const runs = await Promise.all(
-      [1, 2, 3, 4].map((n) => sup.startRun({ model: "fake-model", prompt: `p${n}` })),
-    );
+    const runs = await Promise.all(launches)
+      .then(async (runs) => {
+        await fiveActive.promise;
+        expect(active).toBe(5);
+        expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()!.n).toBe(5);
+        return runs;
+      })
+      .finally(() => completion.resolve());
     await Promise.all(runs.map((r) => r.settled));
     expect(runs.every((r) => sup.getRun(r.view.runId)!.status === "succeeded")).toBe(true);
   }, 30_000);
+
+  test("legacy queued and running attempts do not block an independent launch", async () => {
+    const db = newDb();
+    db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '1')").run();
+    const sup = supervisorFor(evalTarget("process.stdout.write('ok')"), { db });
+
+    // Rows written by an older supervisor must not become a global admission
+    // lock for a fresh, unrelated request.
+    const now = nowIso();
+    const queuedRun = newId("run");
+    db.query(
+      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+       VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', 'queued', ?, ?)`,
+    ).run(queuedRun, now, now);
+    db.query(
+      "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'queued')",
+    ).run(newId("att"), queuedRun);
+    const runningRun = newId("run");
+    db.query(
+      `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
+       VALUES (?, 'fake-model', 'fake', 'fake/slug', 'default', 'p', '/tmp', 'running', ?, ?)`,
+    ).run(runningRun, now, now);
+    db.query(
+      "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'running')",
+    ).run(newId("att"), runningRun);
+
+    const fresh = await sup.startRun({ model: "fake-model", prompt: "fresh" });
+    await fresh.settled;
+    expect(sup.getRun(fresh.view.runId)!.status).toBe("succeeded");
+  }, 20_000);
 });
 
 describe("hop guard", () => {
@@ -1378,11 +1382,11 @@ describe("resumeRun", () => {
     expect(runCount(db)).toBe(1);
   }, 30_000);
 
-  test("the concurrency cap counts a resume like any other launch", async () => {
+  test("a resume is allowed despite an unrelated running run and legacy cap setting", async () => {
     const db = newDb();
+    db.query("INSERT INTO settings (key, value) VALUES ('max_concurrent', '1')").run();
     const { sup, runId } = await originRun(db, "default");
-    db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(SETTING_MAX_CONCURRENT, "1");
-    // Someone else's attempt is already holding the scope's only slot.
+    // Someone else's legacy attempt is unrelated to this session.
     const otherRun = newId("run");
     db.query(
       `INSERT INTO runs (id, model, app, slug, instance, prompt, cwd, status, created_at, updated_at)
@@ -1392,8 +1396,8 @@ describe("resumeRun", () => {
       "INSERT INTO attempts (id, run_id, seq, target, status) VALUES (?, ?, 1, 'fake:default/fake/slug@a1+full', 'running')",
     ).run(newId("att"), otherRun);
 
-    await expect(sup.resumeRun({ runId, prompt: "again" })).rejects.toThrow(
-      /concurrency cap/,
-    );
+    const { view, settled } = await sup.resumeRun({ runId, prompt: "again" });
+    await settled;
+    expect(sup.getRun(view.runId)!.status).toBe("succeeded");
   }, 30_000);
 });

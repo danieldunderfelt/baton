@@ -232,8 +232,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "idempotency_key is retry-safe and payload-bound: the same key with the same request returns the existing run (deduplicated:true) instead of launching a second one, so a transport retry cannot double-spend quota; the same key with a changed prompt, cwd or options is an error, so use a NEW key for anything you actually changed. " +
         "cwd defaults to this host's working directory; pointing the delegated agent at another checkout is allowed and deliberate — note that concurrent delegates mutating the same checkout can conflict. " +
         "options.autonomy narrows what the callee may do (readonly | edits | full); it can only narrow the user's per-app ceiling, never raise it. options.timeoutMs is the only deadline a run can have, and only if you set it. " +
-        "Errors (unknown model, no installed app for it, a route the user has blocked, delegation-depth refusal) come back as tool errors, not as a failed run; a block names itself in the message and is not something to route around — pick another model. " +
-        "So does hitting this scope's concurrency cap ('max_concurrent'): that one means too many attempts are already running, so let one finish instead of retrying in a loop — launch with wait:false and poll get_run rather than holding calls open.",
+        "Errors (unknown model, no installed app for it, a route the user has blocked, delegation-depth refusal) come back as tool errors, not as a failed run; a block names itself in the message and is not something to route around — pick another model.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       inputSchema: z.object({
         model: z

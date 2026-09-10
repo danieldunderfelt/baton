@@ -76,4 +76,4 @@ Installing a host that uses the shared skill also removes complete standalone Ba
 | Command | What it does |
 |---|---|
 | `baton serve --http [--port <n>]` | HTTP MCP daemon for this scope |
-| `baton set <key> <value>` | `max_hops`, `max_concurrent`, `half_life_days`, `profile_weight`, `active_profile`, `preciousness:<app>:<instance>`, `max_autonomy:<app>` |
+| `baton set <key> <value>` | `max_hops`, `half_life_days`, `profile_weight`, `active_profile`, `preciousness:<app>:<instance>`, `max_autonomy:<app>` |
