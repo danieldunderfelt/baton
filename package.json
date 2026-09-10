@@ -10,6 +10,7 @@
     "dev": "bun run src/index.ts",
     "test": "bun test ./src ./test",
     "check": "tsc --noEmit",
+    "release": "bun run scripts/release.ts",
     "check:release": "bun run scripts/check-release.ts",
     "build": "bun build --compile --outfile dist/baton src/index.ts",
     "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile dist/baton-darwin-arm64 src/index.ts && bun build --compile --target=bun-darwin-x64 --outfile dist/baton-darwin-x64 src/index.ts && bun build --compile --target=bun-linux-x64 --outfile dist/baton-linux-x64 src/index.ts && bun build --compile --target=bun-linux-arm64 --outfile dist/baton-linux-arm64 src/index.ts"

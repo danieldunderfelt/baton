@@ -90,7 +90,7 @@ Baton-only regular files are removed after migration; symlinks stay intact.
 
 `baton detect` shows which app CLIs are installed and which models they serve. `baton status` shows where Baton's state lives and which identity variables are set.
 
-Contributors: clone the repo, install [Bun](https://bun.sh), and `./install.sh` builds from source into `~/.local/bin`. `bun run build:all` builds every release target; a version tag matching `package.json` publishes them with a `SHA256SUMS` file through GitHub Actions. There is no Windows build because Baton's process-tree cleanup relies on POSIX process groups.
+Contributors: clone the repo, install [Bun](https://bun.sh), and `./install.sh` builds from source into `~/.local/bin`. See [Releasing](#releasing) to publish a version. There is no Windows build because Baton's process-tree cleanup relies on POSIX process groups.
 
 ## Delegating
 
@@ -224,3 +224,16 @@ bun run build
 Server: `baton mcp` (stdio) or `baton serve --http --port 7317` (one daemon per environment).
 
 The website and the profile-sharing service live in `site/` (Astro on Cloudflare Workers with D1); see `site/README.md` for running it locally and deploying. `BATON_SITE_URL` points the CLI at a local or self-hosted instance.
+
+## Releasing
+
+Commit and push your changes to `main`, then choose an unused version:
+
+```sh
+bun run release 0.2.2 --dry-run
+bun run release 0.2.2
+```
+
+The command updates `package.json`, validates the CLI and website, commits the version change, creates an annotated tag, and pushes the commit and tag together. GitHub Actions then builds, verifies, and publishes the release binaries. Existing tags are never moved or overwritten.
+
+See the [release guide](site/src/content/docs/releasing.md) for prerequisites, publication status, and recovery after a failed step.

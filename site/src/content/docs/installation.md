@@ -87,6 +87,6 @@ This replaces the binary with the latest release, or rebuilds it if you run from
 
 ## Building from a checkout
 
-Clone the repo, install [Bun](https://bun.sh), and run `./install.sh` — it builds from source into `~/.local/bin`. `bun run build:all` builds every release target; a version tag matching `package.json` publishes them with a `SHA256SUMS` file through GitHub Actions.
+Clone the repo, install [Bun](https://bun.sh), and run `./install.sh` to build from source into `~/.local/bin`. Maintainers can publish a version with `bun run release <version>`; see [Releasing](/docs/releasing) for the procedure.
 
 There is no Windows build: Baton's process-tree cleanup relies on POSIX process groups.
