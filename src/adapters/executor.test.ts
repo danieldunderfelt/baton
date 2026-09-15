@@ -28,6 +28,7 @@ interface Opts {
   slug?: string;
   autonomy?: Autonomy;
   autonomyFlags?: AdapterSpec["autonomyFlags"];
+  autonomyEnv?: AdapterSpec["autonomyEnv"];
   sessionRef?: ExtractSpec;
   onSpawn?: (pid: number) => void;
   patterns?: string[];
@@ -53,6 +54,7 @@ function request(o: Opts): ExecRequest {
       extract: o.extract ?? { kind: "text" },
     },
     autonomyFlags: o.autonomyFlags ?? { readonly: [], edits: [], full: [] },
+    ...(o.autonomyEnv ? { autonomyEnv: o.autonomyEnv } : {}),
     ...(o.sessionRef ? { sessionRef: o.sessionRef } : {}),
     defaultAutonomy: "full",
     defaultTimeoutMs: 5_000,
@@ -237,6 +239,27 @@ describe("argv construction", () => {
     expect(res.exitCode).toBeNull();
     expect(res.error).toContain("cannot run at autonomy 'edits'");
     expect(res.error).toContain("full");
+  });
+
+  test("the level's autonomyEnv reaches the child and wins over the request env", async () => {
+    const probe: ExtractSpec = { kind: "json", path: "env" };
+    const autonomyEnv = { readonly: { BATON_FAKE_PROBE: "deny-all" } };
+    const env = { BATON_FAKE_PROBE: "loose" };
+    const narrowed = await executeAdapter(
+      request({ mode: "env", extract: probe, autonomy: "readonly", autonomyEnv, env }),
+    );
+    expect(narrowed.output).toBe("deny-all");
+    const untouched = await executeAdapter(
+      request({ mode: "env", extract: probe, autonomy: "full", autonomyEnv, env }),
+    );
+    expect(untouched.output).toBe("loose");
+  });
+
+  test("PWD is pinned to the cwd, whatever the caller's shell had", async () => {
+    const res = await executeAdapter(
+      request({ mode: "env", extract: { kind: "json", path: "pwd" }, env: { PWD: "/somewhere/else" } }),
+    );
+    expect(res.output).toBe(import.meta.dir);
   });
 
   test("{slug} substitutes inside a joined flag as one element", async () => {

@@ -40,6 +40,10 @@ switch (mode) {
     await write(`${JSON.stringify({ argv: args })}\n`);
     break;
 
+  case "env":
+    await write(`${JSON.stringify({ env: Bun.env.BATON_FAKE_PROBE ?? null, pwd: Bun.env.PWD })}\n`);
+    break;
+
   case "stdin": {
     const stdin = await Bun.stdin.text();
     await write(`${JSON.stringify({ echo: stdin })}\n`);

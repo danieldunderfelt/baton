@@ -76,6 +76,7 @@ const extractSchema = z
 
 const argvElement = z.string().min(1);
 const autonomyFragment = z.array(argvElement);
+const autonomyEnvFragment = z.record(z.string().regex(/^[A-Z_][A-Z0-9_]*$/), z.string());
 
 const modelsExtractSchema = z
   .discriminatedUnion("kind", [
@@ -148,6 +149,16 @@ export const adapterSpecSchema = z.strictObject({
       full: autonomyFragment.optional(),
     })
     .describe("argv fragment per autonomy level. A missing level means unsupported — never faked."),
+  autonomyEnv: z
+    .strictObject({
+      readonly: autonomyEnvFragment.optional(),
+      edits: autonomyEnvFragment.optional(),
+      full: autonomyEnvFragment.optional(),
+    })
+    .optional()
+    .describe(
+      "Env vars set for a level, for apps whose permission model is config rather than flags. Layered over the callee env last.",
+    ),
   sessionRef: extractSchema.optional().describe("Where the app prints its session/thread id."),
   cooldownScope: z.literal("provider").optional(),
   resume: z
@@ -544,9 +555,10 @@ export function formatReview(review: DiscoveredReview): string {
   AUTONOMY_ORDER.forEach((level, i) => {
     const flags = review.autonomyFlags[level];
     const value = flags ? JSON.stringify(flags) : "unsupported — Baton refuses to run at this level";
+    const env = spec.autonomyEnv?.[level];
     const label = i === 0 ? "autonomy:  " : "           ";
     lines.push(
-      `${label} ${level.padEnd(8)} ${value}${level === spec.defaultAutonomy ? "   (default)" : ""}`,
+      `${label} ${level.padEnd(8)} ${value}${env ? ` env ${JSON.stringify(env)}` : ""}${level === spec.defaultAutonomy ? "   (default)" : ""}`,
     );
   });
   lines.push(

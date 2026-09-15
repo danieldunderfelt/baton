@@ -5,7 +5,12 @@ import type { AdapterSpec, ExecRequest, ExecResult, ExtractSpec } from "./types.
 /**
  * The only place Baton spawns a callee CLI.
  * Environment-transparent: req.env is passed verbatim — nothing added, nothing
- * scrubbed. argv is an array built from the declarative spec, never a shell
+ * scrubbed — with two exceptions. `PWD` is pinned to the cwd, as a shell would
+ * after `cd`: opencode 2 takes its project directory from `$PWD` ahead of the
+ * real cwd, and a caller's shell may sit in another repo entirely (verified:
+ * a run pointed at a temp dir edited the caller's repo instead). And the
+ * adapter's own `autonomyEnv` for the level is as much a part of the level as
+ * its argv. argv is an array built from the declarative spec, never a shell
  * string. The child is detached so it leads its own process group, which lets
  * a timeout kill the whole tree (`kill(-pid)`), not just the CLI wrapper.
  */
@@ -56,7 +61,7 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
     // name instead would let an instance's PATH overlay swap the binary.
     child = spawn(req.binaryPath ?? req.spec.binary, buildArgv(req, flags), {
       cwd: req.cwd,
-      env: req.env,
+      env: { ...req.env, PWD: req.cwd, ...req.spec.autonomyEnv?.[req.autonomy] },
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });

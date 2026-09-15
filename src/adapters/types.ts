@@ -120,6 +120,14 @@ export interface AdapterSpec {
    * authority. Options may narrow the ceiling, never raise it.
    */
   autonomyFlags: Partial<Record<Autonomy, string[]>>;
+  /**
+   * Environment variables set for a level, on top of `autonomyFlags`. For apps
+   * whose permission model lives in config rather than flags (opencode reads
+   * `OPENCODE_CONFIG_CONTENT`). Layered over the callee env last, so an
+   * instance overlay cannot loosen the level. Values are part of the spec a
+   * reviewer approves, so `adapters review` prints them beside the flags.
+   */
+  autonomyEnv?: Partial<Record<Autonomy, Record<string, string>>>;
   /** Where the app's own session/thread id appears in stdout, for resume. */
   sessionRef?: ExtractSpec;
   /**

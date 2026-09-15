@@ -716,7 +716,7 @@ describe("block", () => {
     const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
     expect(reject.code).toBe(0);
     expect(reject.stdout).toContain("Rejected opencode (client machine)");
-    expect(reject.stdout).toContain("muse-spark-1.3, nor anything the app reports");
+    expect(reject.stdout).toContain("muse-spark-1.3, glm-5.3-flash, nor anything the app reports");
     expect(reject.stdout).toContain("baton block remove 'opencode:*/*'");
 
     const list = await baton(scope, "adapters", "list");
@@ -1735,7 +1735,7 @@ describe("detect and unknown commands", () => {
     );
     const scope = tmp("detect-reported");
     const detect = await batonOnPath(scope, bin, "detect");
-    expect(detect.stdout).toMatch(/opencode.*muse-spark-1.3 \+1 reported by the app/);
+    expect(detect.stdout).toMatch(/opencode.*muse-spark-1.3, glm-5.3-flash \+1 reported by the app/);
     const models = await batonOnPath(scope, bin, "models");
     expect(models.stdout).toMatch(/zeta\/new-model\s+opencode\/zeta\/new-model\s+yes/);
     // And a block pattern sees it like any other route.

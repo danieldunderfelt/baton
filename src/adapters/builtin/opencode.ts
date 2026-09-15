@@ -17,11 +17,17 @@ import type { AdapterSpec } from "../types.ts";
  *   empty XDG_DATA_HOME still listed every logged-in provider without the
  *   flag, and nothing with it). A private server per run costs a couple of
  *   seconds of startup.
- * - Only `full` is declared. `opencode run` is already non-interactive, and
- *   `--auto` is its one permission flag — there is no readonly/edits tier
- *   outside `opencode.json`. As with kimi, declaring the level Baton cannot
- *   constrain as `full` makes a lower ceiling exclude the route instead of
- *   silently running above it.
+ * - Permissions are config, not flags. `--auto` is the one flag and it only
+ *   auto-approves what would otherwise *ask*; an explicit `deny` still holds.
+ *   Without `--auto` a non-interactive run auto-rejects every ask and aborts
+ *   the step (verified: `external_directory` killed a run with an "aborted"
+ *   error event). So every level passes `--auto`, and the lower levels narrow
+ *   it with denies in `OPENCODE_CONFIG_CONTENT`, which merges over the user's
+ *   opencode.json. Verified live at 2.0.3: `edit: deny` removes write/edit
+ *   from the toolset, `bash: deny` removes the `shell` tool (v2's name for
+ *   it), and the model reports having neither. `OPENCODE_PERMISSION`, the
+ *   documented inline-permission variable, is ignored in 2.0.3 — a write went
+ *   through with it set — so it is not relied on.
  * - Exit codes are unreliable in json mode (a live upstream 503 exited 0), so
  *   failure detection rests on the stream: an "error" event fails the run
  *   (`errorWhen`) even when text parts preceded it, and the event survives in
@@ -40,9 +46,12 @@ export const opencodeAdapter: AdapterSpec = {
   // ratings already use. Claude/GPT models also appear via opencode's copilot
   // provider; they route better through their native apps, and a user who
   // wants them out of the way blocks them ('baton block add
-  // opencode/github-copilot/*'). The previous pin, opencode/x-preview-f-free
-  // ("ox-alpha"), left the catalog with v2.
-  models: [{ model: "muse-spark-1.3", slug: "opencode/muse-spark-1.3-contributor-free" }],
+  // opencode/github-copilot/*'). glm-5.3-flash is what the opencode/x-preview-f-free
+  // preview ("ox-alpha") turned out to be; that slug left the catalog with v2.
+  models: [
+    { model: "muse-spark-1.3", slug: "opencode/muse-spark-1.3-contributor-free" },
+    { model: "glm-5.3-flash", slug: "zai-coding-plan/glm-5.3-flash" },
+  ],
   listModels: { argv: ["models", "--standalone"], extract: { kind: "lines" } },
   invoke: {
     argv: [
@@ -92,7 +101,14 @@ export const opencodeAdapter: AdapterSpec = {
       "{prompt}",
     ],
   },
-  autonomyFlags: { full: ["--auto"] },
+  autonomyFlags: { readonly: ["--auto"], edits: ["--auto"], full: ["--auto"] },
+  // readonly keeps read/glob/grep/webfetch; edits adds file writes but still no
+  // shell, matching claude-code's acceptEdits rather than codex's sandboxed
+  // workspace-write, because opencode cannot sandbox a command, only refuse it.
+  autonomyEnv: {
+    readonly: { OPENCODE_CONFIG_CONTENT: '{"permission":{"edit":"deny","bash":"deny"}}' },
+    edits: { OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":"deny"}}' },
+  },
   defaultAutonomy: "full",
   // The zen free models need no local credentials, so no auth failure could be
   // reproduced. What was observed live is the APIError envelope of an upstream
