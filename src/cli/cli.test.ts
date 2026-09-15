@@ -690,7 +690,7 @@ describe("block", () => {
     );
     // The confirmation is the routes it covers right now, not just the pattern.
     expect(add.stdout).toContain("opencode:default/fake-provider/fake-model");
-    expect(add.stdout).not.toContain("opencode/x-preview-f-free");
+    expect(add.stdout).not.toContain("opencode/muse-spark-1.3-contributor-free");
 
     const list = await baton(scope, "block", "list");
     expect(list.stdout).toMatch(
@@ -701,7 +701,7 @@ describe("block", () => {
     const models = await baton(scope, "models");
     expect(models.stdout).toMatch(/fake-provider\/fake-model.*client enterprise subscription/);
     // ...and the app's other route is untouched.
-    expect(models.stdout).not.toMatch(/ox-alpha.*client enterprise subscription/);
+    expect(models.stdout).not.toMatch(/muse-spark-1.3.*client enterprise subscription/);
 
     expect((await baton(scope, "block", "remove", "opencode:*/fake-provider/*")).code).toBe(0);
     const gone = await baton(scope, "block", "remove", "opencode/fake-provider/*");
@@ -716,7 +716,7 @@ describe("block", () => {
     const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
     expect(reject.code).toBe(0);
     expect(reject.stdout).toContain("Rejected opencode (client machine)");
-    expect(reject.stdout).toContain("ox-alpha, nor anything the app reports");
+    expect(reject.stdout).toContain("muse-spark-1.3, nor anything the app reports");
     expect(reject.stdout).toContain("baton block remove 'opencode:*/*'");
 
     const list = await baton(scope, "adapters", "list");
@@ -725,7 +725,7 @@ describe("block", () => {
     expect(list.stdout).toContain("Restore it with: baton block remove 'opencode:*/*'");
 
     const models = await baton(scope, "models");
-    expect(models.stdout).toMatch(/ox-alpha.*client machine/);
+    expect(models.stdout).toMatch(/muse-spark-1.3.*client machine/);
     expect(models.stdout).toMatch(/fake-provider\/fake-model.*client machine/);
     expect(models.stdout).not.toMatch(/gpt-5.6-sol.*client machine/);
 
@@ -1735,7 +1735,7 @@ describe("detect and unknown commands", () => {
     );
     const scope = tmp("detect-reported");
     const detect = await batonOnPath(scope, bin, "detect");
-    expect(detect.stdout).toMatch(/opencode.*ox-alpha \+1 reported by the app/);
+    expect(detect.stdout).toMatch(/opencode.*muse-spark-1.3 \+1 reported by the app/);
     const models = await batonOnPath(scope, bin, "models");
     expect(models.stdout).toMatch(/zeta\/new-model\s+opencode\/zeta\/new-model\s+yes/);
     // And a block pattern sees it like any other route.

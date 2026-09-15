@@ -1,7 +1,7 @@
 import type { AdapterSpec } from "../types.ts";
 
 /**
- * opencode 1.18.25 (probed live on this machine).
+ * opencode 2.0.3 (probed live on this machine).
  *
  * Notes that are not obvious from the flags:
  * - `--format json` is required: the default formatted mode prints ANSI text
@@ -11,6 +11,12 @@ import type { AdapterSpec } from "../types.ts";
  *   so it is the identity environment for named profiles. The profile overlay
  *   may also set `OPENCODE_CONFIG` and the other XDG roots, but XDG_DATA_HOME
  *   is the required account boundary.
+ * - `--standalone` is required for that boundary to hold. Since v2, `run` and
+ *   `models` talk to a persistent `opencode serve --service` daemon by default,
+ *   and the daemon's auth wins over the caller's environment (verified: an
+ *   empty XDG_DATA_HOME still listed every logged-in provider without the
+ *   flag, and nothing with it). A private server per run costs a couple of
+ *   seconds of startup.
  * - Only `full` is declared. `opencode run` is already non-interactive, and
  *   `--auto` is its one permission flag — there is no readonly/edits tier
  *   outside `opencode.json`. As with kimi, declaring the level Baton cannot
@@ -34,11 +40,21 @@ export const opencodeAdapter: AdapterSpec = {
   // ratings already use. Claude/GPT models also appear via opencode's copilot
   // provider; they route better through their native apps, and a user who
   // wants them out of the way blocks them ('baton block add
-  // opencode/github-copilot/*').
-  models: [{ model: "ox-alpha", slug: "opencode/x-preview-f-free" }],
-  listModels: { argv: ["models"], extract: { kind: "lines" } },
+  // opencode/github-copilot/*'). The previous pin, opencode/x-preview-f-free
+  // ("ox-alpha"), left the catalog with v2.
+  models: [{ model: "muse-spark-1.3", slug: "opencode/muse-spark-1.3-contributor-free" }],
+  listModels: { argv: ["models", "--standalone"], extract: { kind: "lines" } },
   invoke: {
-    argv: ["run", "-m", "{slug}", "--format", "json", "{autonomyFlags}", "{prompt}"],
+    argv: [
+      "run",
+      "--standalone",
+      "-m",
+      "{slug}",
+      "--format",
+      "json",
+      "{autonomyFlags}",
+      "{prompt}",
+    ],
     promptVia: "argv",
     // One "text" event per message part, each carrying that part's whole text
     // (verified: a five-line answer arrived as a single event, not per token).
@@ -65,6 +81,7 @@ export const opencodeAdapter: AdapterSpec = {
   resume: {
     argv: [
       "run",
+      "--standalone",
       "-m",
       "{slug}",
       "--format",

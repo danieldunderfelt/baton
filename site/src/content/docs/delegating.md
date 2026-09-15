@@ -28,7 +28,7 @@ Why run models from the shell through Baton instead of the CLI directly? Partly 
 
 Which models an app serves is the app's business, not Baton's. Each adapter knows how to ask its CLI (`codex debug models`, `kimi provider list --json`, `opencode models`, `cursor-agent models`), and every model reported is a route under the app's own slug. `baton run gpt-6-astra ...` works the day codex starts listing it, and `baton run github-copilot/claude-opus-5 ...` reaches whatever OpenCode's providers are logged into. Claude Code has no listing command, so any full `claude-*` id is passed through as given.
 
-The short canonical names (`kimi-k3`, `ox-alpha`, `gpt-5.6-sol`) are pinned aliases that ratings attach to. `baton detect` shows what each app reports right now, `baton models` the whole roster. Listings are cached for five minutes in `~/.cache/baton/catalog.json`, and a CLI that will not list keeps its pinned routes.
+The short canonical names (`kimi-k3`, `muse-spark-1.3`, `gpt-5.6-sol`) are pinned aliases that ratings attach to. `baton detect` shows what each app reports right now, `baton models` the whole roster. Listings are cached for five minutes in `~/.cache/baton/catalog.json`, and a CLI that will not list keeps its pinned routes.
 
 ## Safety rails
 

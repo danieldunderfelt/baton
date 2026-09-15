@@ -97,7 +97,7 @@ describe("blockFor", () => {
   });
 
   test("leaves the app's other providers alone", () => {
-    expect(blockFor(blocks, "opencode", "default", "opencode/x-preview-f-free")).toBeUndefined();
+    expect(blockFor(blocks, "opencode", "default", "opencode/muse-spark-1.3-contributor-free")).toBeUndefined();
   });
 
   test("an instance-scoped block only covers that instance", () => {
@@ -161,7 +161,7 @@ describe("selection", () => {
     addBlock(db, "opencode");
     let error = "";
     try {
-      withFakeBinary("opencode", () => selectTarget(db, "ox-alpha"));
+      withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
     } catch (err) {
       error = (err as Error).message;
     }
@@ -172,8 +172,8 @@ describe("selection", () => {
   test("the app's unblocked routes still route", () => {
     const db = scopeStore("blocks-select-sibling");
     addBlock(db, "opencode/fake-provider/*");
-    const target = withFakeBinary("opencode", () => selectTarget(db, "ox-alpha"));
-    expect(target.slug).toBe("opencode/x-preview-f-free");
+    const target = withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
+    expect(target.slug).toBe("opencode/muse-spark-1.3-contributor-free");
   });
 
   test("blocking one instance leaves the pool's others selectable", () => {
@@ -209,9 +209,9 @@ describe("resume", () => {
   test("an unblocked route of the same app still resumes", () => {
     const db = scopeStore("blocks-resume-sibling");
     addBlock(db, "opencode/fake-provider/*");
-    const ref = { app: "opencode", slug: "opencode/x-preview-f-free", instance: "default" };
+    const ref = { app: "opencode", slug: "opencode/muse-spark-1.3-contributor-free", instance: "default" };
     expect(withFakeBinary("opencode", () => targetFor(ref, db)).slug).toBe(
-      "opencode/x-preview-f-free",
+      "opencode/muse-spark-1.3-contributor-free",
     );
   });
 });
@@ -230,7 +230,7 @@ describe("list_models", () => {
   test("the app's other routes are unaffected", () => {
     const db = scopeStore("blocks-list-sibling");
     addBlock(db, "opencode/fake-provider/*");
-    const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === "ox-alpha")!;
+    const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === "muse-spark-1.3")!;
     expect(row.available).toBe(true);
     expect(row.degradedReason).toBeUndefined();
   });
@@ -253,7 +253,7 @@ describe("list_models", () => {
 
 describe("canarySlug", () => {
   const models = [
-    { model: "ox-alpha", slug: "opencode/x-preview-f-free" },
+    { model: "muse-spark-1.3", slug: "opencode/muse-spark-1.3-contributor-free" },
     { model: REPORTED, slug: REPORTED },
   ];
 

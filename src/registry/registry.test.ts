@@ -77,11 +77,11 @@ const NOW = "2026-08-24T12:00:00.000Z";
 test("OpenCode provider cooldowns do not block unrelated providers", () => {
   const db = scopeStore("provider-cooldown");
   const path = fakeBinary("opencode");
-  writeFileSync(path, '#!/bin/sh\ncase "$1" in --version) echo 1;; models) echo github-copilot/model; echo opencode/x-preview-f-free;; esac\n', { mode: 0o755 });
+  writeFileSync(path, '#!/bin/sh\ncase "$1" in --version) echo 1;; models) echo github-copilot/model; echo opencode/muse-spark-1.3-contributor-free;; esac\n', { mode: 0o755 });
   recordAdmissionFailure(db, "opencode", "default", NOW, "429", undefined, "github-copilot");
   withPath(dirname(path), () => {
     expect(() => selectTarget(db, "github-copilot/model", { nowIso: NOW })).toThrow(/cooling/i);
-    expect(selectTarget(db, "ox-alpha", { nowIso: NOW }).slug).toBe("opencode/x-preview-f-free");
+    expect(selectTarget(db, "muse-spark-1.3", { nowIso: NOW }).slug).toBe("opencode/muse-spark-1.3-contributor-free");
   });
 });
 const at = (offsetMs: number): string => new Date(Date.parse(NOW) + offsetMs).toISOString();
@@ -166,7 +166,7 @@ describe("resolveTargets", () => {
     const dir = mkdtempSync(join(tmpdir(), "baton-bin-"));
     writeFileSync(
       join(dir, "opencode"),
-      '#!/bin/sh\ncase "$1" in --version) echo 1.0.0; exit 0;; models) echo zeta/new-model; echo opencode/x-preview-f-free; exit 0;; esac\nexit 1\n',
+      '#!/bin/sh\ncase "$1" in --version) echo 1.0.0; exit 0;; models) echo zeta/new-model; echo opencode/muse-spark-1.3-contributor-free; exit 0;; esac\nexit 1\n',
       { mode: 0o755 },
     );
     const routes = withPath(dir, () => resolveTargets("zeta/new-model", db));
@@ -176,8 +176,8 @@ describe("resolveTargets", () => {
       expect.objectContaining({ model: "zeta/new-model", app: "opencode", available: true }),
     );
     // A reported slug that is pinned keeps its canonical id, once.
-    expect(rows.filter((r) => r.slug === "opencode/x-preview-f-free").map((r) => r.model)).toEqual([
-      "ox-alpha",
+    expect(rows.filter((r) => r.slug === "opencode/muse-spark-1.3-contributor-free").map((r) => r.model)).toEqual([
+      "muse-spark-1.3",
     ]);
     expect(withPath(dir, () => knownModels(db))).toContain("zeta/new-model");
   });

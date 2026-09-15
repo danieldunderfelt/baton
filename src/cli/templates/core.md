@@ -26,7 +26,7 @@ Baton hands a self-contained task to a model running in another agent CLI on thi
 - `kimi-k3`, a strong generalist with good taste. Second-opinion reviews, and implementation where code quality matters.
 - `opus-5` and `sonnet-5`, via Claude Code. Opus for hard reasoning, sonnet when speed matters more than depth.
 - `grok-4.6`, via cursor-agent. Quick, and a different family when two opinions have deadlocked.
-- `ox-alpha`, via opencode. A capable all-rounder from outside the other families.
+- `muse-spark-1.3`, via opencode. A capable all-rounder from outside the other families.
 
 These are the user's starting priors. `list_models` reports what the evidence says instead, so believe it when the two disagree. It also lists every model each app reports it can serve, under the app's own slug (`gpt-6-astra`, `github-copilot/claude-opus-5`, `cursor-grok-4.6-xhigh`), and Claude Code takes any full `claude-*` id. A newly released model needs no Baton change: name it as its app does.
 
