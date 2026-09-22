@@ -19,9 +19,13 @@ describe("help and argument validation", () => {
       const config = join(dir, "state");
       const res = await baton({ BATON_CONFIG_DIR: config }, ...args);
       expect(res.code, res.stderr).toBe(0);
-      expect(res.stdout).toContain("baton install [host...] [--user]");
-      expect(res.stdout).toContain("baton update");
-      expect(res.stdout).toContain("baton block");
+      const command = args[0] === "help" ? args[1] : args[0];
+      if (!command || command === "--help") {
+        expect(res.stdout).toContain("baton install [host...] [--user]");
+      } else {
+        expect(res.stdout).toContain(`baton ${command === "upgrade" ? "update" : command}`);
+        expect(res.stdout).not.toContain("baton block add");
+      }
       expect(existsSync(config)).toBe(false);
     });
   }

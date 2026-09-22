@@ -1,10 +1,10 @@
 import type { Database } from "bun:sqlite";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
-import { executeAdapter, killProcessGroup } from "../adapters/executor.ts";
+import { executeAdapter } from "../adapters/executor.ts";
 import {
   AUTONOMY_ORDER,
   DEFAULT_INSTANCE,
@@ -54,7 +54,7 @@ import {
   parseProfileDocument,
   renderProfile,
 } from "../eval/profileFile.ts";
-import { publishRatings, repairProjection, snapshotRatings } from "../eval/publish.ts";
+import { exportRatings, snapshotRatings } from "../eval/publish.ts";
 import {
   SETTING_ACTIVE_PROFILE,
   SETTING_HALF_LIFE_DAYS,
@@ -89,7 +89,7 @@ import {
   routableAdapters,
   routesOf,
 } from "../registry/registry.ts";
-import { nowIso, openStore, withBusyRetry } from "../store/store.ts";
+import { inTransaction, nowIso, openStore, withBusyRetry } from "../store/store.ts";
 import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
 import {
   HOPS_ENV,
@@ -102,6 +102,7 @@ import {
   INSTALL_HOSTS,
   detectedHosts,
   installHost,
+  refreshInstalledSkills,
   isInstallHost,
   type InstallHost,
   type InstallScope,
@@ -121,7 +122,7 @@ import {
   writeAuth,
   type AuthFile,
 } from "./share.ts";
-import { COMMANDS, HELP, wantsHelp } from "./help.ts";
+import { COMMANDS, HELP, helpFor, wantsHelp } from "./help.ts";
 import { CURRENT_VERSION, selfUpdate } from "./update.ts";
 
 /**
@@ -149,25 +150,27 @@ export async function runCli(command: string, args: string[]): Promise<number> {
   try {
     if (!COMMANDS.includes(command)) return usage(`unknown command '${command}'`);
     if (wantsHelp(args)) {
-      console.log(HELP);
+      console.log(helpFor(command));
       return 0;
     }
-    if (["status", "detect", "models", "update", "upgrade"].includes(command) && args.length > 0) {
+    if (["detect", "update", "upgrade"].includes(command) && args.length > 0) {
       return usage(`${command} takes no arguments, got '${args[0]}'.`);
     }
     switch (command) {
       case "status":
-        return status();
+        return await status(args);
       case "detect":
-        return detect();
+        return await detect();
       case "models":
-        return models();
+        return await models(args);
       case "run":
         return await run(args);
       case "resume":
         return await resume(args);
       case "runs":
         return runs(args);
+      case "cancel":
+        return await cancelRun(args);
       case "duel":
         return await duel(args);
       case "adapters":
@@ -179,7 +182,7 @@ export async function runCli(command: string, args: string[]): Promise<number> {
       case "pool":
         return pool(args);
       case "block":
-        return block(args);
+        return await block(args);
       case "ratings":
         return ratings(args);
       case "profile":
@@ -210,7 +213,9 @@ export async function runCli(command: string, args: string[]): Promise<number> {
 /** Bad invocation (exit 2), as opposed to a failure while doing the work (1). */
 class UsageError extends Error {}
 
-function status(): number {
+async function status(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { boolean: ["json"] });
+  if (rest.length) return usage("status takes no positional arguments");
   const env = process.env;
   const paths = resolvePaths(env);
   const rows: string[][] = [
@@ -222,17 +227,21 @@ function status(): number {
     ["hops", `${hopDepth(env)} (${HOPS_ENV}=${env[HOPS_ENV] ?? "unset"})`],
   ];
   for (const key of IDENTITY_ENV) rows.push([key, env[key] ?? "(unset)"]);
-  console.log(table(rows));
-
-  console.log("\nadapters:");
   const { db } = openScope();
-  for (const app of detectApps({ probeVersion: false, db })) {
+  const adapters = await detectApps({ probeVersion: false, db });
+  if (flags.json) {
+    console.log(JSON.stringify({ version: CURRENT_VERSION, executable: process.execPath, paths, hops: hopDepth(env), identityEnv: Object.fromEntries(IDENTITY_ENV.map((key) => [key, env[key] ?? null])), adapters }));
+    return 0;
+  }
+  console.log(table(rows));
+  console.log("\nadapters:");
+  for (const app of adapters) {
     console.log(`  ${app.app.padEnd(12)} ${app.binaryPath ?? "not on PATH in this scope"}`);
   }
   return 0;
 }
 
-function detect(): number {
+async function detect(): Promise<number> {
   const { db } = openScope();
   // A version bump means the canary's evidence is stale, so detect is also
   // where an active discovered adapter drops out of the registry until it is
@@ -241,9 +250,9 @@ function detect(): number {
   const specs = new Map(routableAdapters(db).map((spec) => [spec.app, spec]));
   const rows: string[][] = [["APP", "BINARY", "VERSION", "MODELS"]];
   const listingErrors: string[] = [];
-  for (const app of detectApps({ db })) {
+  for (const app of await detectApps({ db })) {
     const spec = specs.get(app.app)!;
-    const catalog = catalogFor(spec);
+    const catalog = await catalogFor(spec);
     if (catalog.listingError) listingErrors.push(`${app.app}: ${catalog.listingError}`);
     // The pinned ids by name; the rest as a count, since an app can report
     // hundreds and 'baton models' is the place for the full list.
@@ -266,12 +275,19 @@ function detect(): number {
   return 0;
 }
 
-function models(): number {
+async function models(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { boolean: ["json"] });
+  if (rest.length) return usage("models takes no positional arguments");
   const db = openDb();
+  const listing = await listModels(db);
+  if (flags.json) {
+    console.log(JSON.stringify(listing));
+    return 0;
+  }
   // "no" on its own sends the user hunting: the reason is the actionable half,
   // and for a blocked route it is the user's own words coming back to them.
   const rows: string[][] = [["MODEL", "ROUTE", "AVAILABLE", "MAX AUTONOMY", "WHY NOT"]];
-  for (const m of listModels(db)) {
+  for (const m of listing) {
     rows.push([
       m.model,
       `${m.app}/${m.slug}`,
@@ -287,6 +303,7 @@ function models(): number {
 async function run(args: string[]): Promise<number> {
   const { flags, rest } = parseFlags(args, {
     value: ["cwd", "timeout", "autonomy", "instance"],
+    boolean: ["json"],
   });
   const model = rest[0];
   if (!model) return usage("run needs a model: baton run <model> <prompt...>");
@@ -310,16 +327,14 @@ async function run(args: string[]): Promise<number> {
       ...(timeoutMs ? { timeoutMs } : {}),
     },
   });
-  return await settle(db, supervisor, started);
+  return await settle(supervisor, started, flags.json === true);
 }
 
 /**
- * A second turn on a finished run's own session, on the instance that holds it.
- * The supervisor pins both. Everything else about
- * the original request is inherited; only the prompt is new.
+ * Continue a session on its original instance, inheriting omitted options.
  */
 async function resume(args: string[]): Promise<number> {
-  const { flags, rest } = parseFlags(args, { value: ["timeout", "autonomy"] });
+  const { flags, rest } = parseFlags(args, { value: ["timeout", "autonomy"], boolean: ["json"] });
   const runId = rest[0];
   if (!runId) return usage("resume needs a run: baton resume <run-id> <prompt...>");
   const prompt = await readPrompt(rest.slice(1));
@@ -339,7 +354,7 @@ async function resume(args: string[]): Promise<number> {
       ...(timeoutMs ? { timeoutMs } : {}),
     },
   });
-  return await settle(db, supervisor, started);
+  return await settle(supervisor, started, flags.json === true);
 }
 
 /**
@@ -349,43 +364,36 @@ async function resume(args: string[]): Promise<number> {
  * the call.
  */
 async function settle(
-  db: Database,
   supervisor: Supervisor,
   started: { view: RunView; settled: Promise<void> },
+  json: boolean,
 ): Promise<number> {
-  const release = guardCancellation(db, supervisor, [started.view.runId]);
+  console.error(`baton: run ${started.view.runId} ${started.view.status}`);
+  console.error(`baton: permissions ${started.view.options.autonomy}; timeout ${started.view.options.timeoutMs === undefined ? "none" : `${started.view.options.timeoutMs} ms`}`);
+  const release = guardCancellation(supervisor, [started.view.runId]);
   try {
     await started.settled;
   } finally {
     release();
   }
   const final = supervisor.getRun(started.view.runId) ?? started.view;
+  console.error(`baton: run ${final.runId} ${final.status}`);
+  if (json) console.log(JSON.stringify(final));
   if (final.status === "succeeded") {
-    console.log(final.output ?? "");
+    if (!json) console.log(final.output ?? "");
     return 0;
   }
   console.error(`baton: run ${final.runId} ${final.status}: ${final.error ?? "no error recorded"}`);
   return 1;
 }
 
-/**
- * Ctrl-C must not leave a callee's process group running: the CLI is its only
- * supervisor, and cancelRun merely SIGTERMs (its SIGKILL escalation is an
- * unref'd timer that an exiting process never fires). Cancel, wait for the
- * groups to be verifiably dead, then leave with the signal's exit code.
- * Returns the handler removal, so a finished command stops intercepting signals.
- */
-function guardCancellation(db: Database, supervisor: Supervisor, runIds: string[]): () => void {
+/** Wait for the supervisor to stop and settle its processes before exiting on a signal. */
+function guardCancellation(supervisor: Supervisor, runIds: string[]): () => void {
   let cancelling = false;
   const cancel = async (exitCode: number): Promise<void> => {
-    if (cancelling) return; // a second Ctrl-C while the groups are dying changes nothing
+    if (cancelling) return;
     cancelling = true;
-    for (const runId of runIds) supervisor.cancelRun(runId);
-    const pids = runIds.flatMap((runId) => attemptPids(db, runId));
-    const kills = pids.map((pid) => killProcessGroup(pid));
-    for (const outcome of await Promise.all(kills)) {
-      if (!outcome.dead) console.error(`baton: ${outcome.why}`);
-    }
+    await supervisor.shutdown();
     console.error(`baton: run ${runIds.join(", ")} cancelled`);
     process.exit(exitCode);
   };
@@ -399,19 +407,12 @@ function guardCancellation(db: Database, supervisor: Supervisor, runIds: string[
   };
 }
 
-/** Process groups this run launched — everything the CLI is allowed to kill. */
-function attemptPids(db: Database, runId: string): number[] {
-  return db
-    .query<{ pid: number | null }, [string]>("SELECT pid FROM attempts WHERE run_id = ?")
-    .all(runId)
-    .map((row) => row.pid)
-    .filter((pid): pid is number => pid !== null && pid > 0);
-}
-
 function runs(args: string[]): number {
   const db = openDb();
-  const runId = args[0];
-  if (!runId) return runList(db);
+  const { flags, rest } = parseFlags(args, { boolean: ["json"] });
+  if (rest.length > 1) return usage("runs takes at most one run id");
+  const runId = rest[0];
+  if (!runId) return runList(db, flags.json === true);
 
   const row = db
     .query<RunDetailRow, [string]>(
@@ -421,6 +422,17 @@ function runs(args: string[]): number {
   if (!row) {
     console.error(`baton: unknown run '${runId}'. 'baton runs' lists the most recent ones.`);
     return 1;
+  }
+
+  if (flags.json) {
+    const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
+    const view = supervisor.getRun(runId);
+    const duelId = blindDuelOf(db, runId);
+    console.log(JSON.stringify(duelId === undefined ? view : {
+      runId, status: view?.status, model: blindLabel(duelId), output: view?.output,
+      createdAt: view?.createdAt,
+    }));
+    return 0;
   }
 
   // A side of an unjudged duel describes itself by label only: model, route and
@@ -464,17 +476,24 @@ function runs(args: string[]): number {
   return 0;
 }
 
-function runList(db: Database): number {
+function runList(db: Database, json = false): number {
   const rows = db
     .query<RunListRow, [number]>(
       "SELECT id, model, status, created_at, prompt FROM runs ORDER BY created_at DESC, id DESC LIMIT ?",
     )
     .all(RUNS_LIMIT);
+  const blind = blindRuns(db);
+  if (json) {
+    console.log(JSON.stringify(rows.map((row) => {
+      const duelId = blind.get(row.id);
+      return { runId: row.id, model: duelId ? blindLabel(duelId) : row.model, status: row.status, createdAt: row.created_at, prompt: row.prompt };
+    })));
+    return 0;
+  }
   if (rows.length === 0) {
     console.log("No runs in this scope yet.");
     return 0;
   }
-  const blind = blindRuns(db);
   const table_: string[][] = [["ID", "MODEL", "STATUS", "AGE", "PROMPT"]];
   for (const r of rows) {
     const duelId = blind.get(r.id);
@@ -487,6 +506,25 @@ function runList(db: Database): number {
     ]);
   }
   console.log(table(table_));
+  return 0;
+}
+
+async function cancelRun(args: string[]): Promise<number> {
+  const { flags, rest } = parseFlags(args, { boolean: ["json"] });
+  const [runId] = rest;
+  if (!runId || rest.length !== 1) return usage("cancel needs one run id: baton cancel <run-id>");
+  const supervisor = createSupervisor({ db: openDb(), env: { ...process.env }, hostCwd: process.cwd() });
+  let view = supervisor.getRun(runId);
+  if (!view) throw new Error(`unknown run '${runId}'`);
+  if (view.status === "running" || view.status === "queued") {
+    supervisor.cancelRun(runId);
+    console.error(`baton: cancelling run ${runId}`);
+    do {
+      view = await supervisor.waitForRun(runId, 1_000);
+    } while (view.status === "running" || view.status === "queued");
+  }
+  if (flags.json) console.log(JSON.stringify(view));
+  else console.log(`Run ${runId} ${view.status}.`);
   return 0;
 }
 
@@ -540,7 +578,6 @@ async function duelStart(args: string[]): Promise<number> {
   );
 
   const release = guardCancellation(
-    db,
     supervisor,
     started.runs.map((r) => r.runId),
   );
@@ -586,9 +623,8 @@ function duelReport(args: string[]): number {
     return usage("duel report needs: <duel-id> <A|B|tie>");
   }
   const winner = parseWinner(verdict);
-  const { db, paths } = openScope();
+  const db = openDb();
   const view = reportDuel(db, duelId, winner);
-  publishRatings(db, paths.configDir);
   const revealed = view.revealed ?? { A: "?", B: "?" };
   console.log(
     table([
@@ -1081,8 +1117,9 @@ function instanceAdd(args: string[]): number {
   const { flags, rest } = parseFlags(args, { value: [], repeat: ["env"] });
   const [app, name] = rest;
   if (!app || !name) return usage("instance add needs: <app> <name> [--env KEY=VAL ...]");
-  const spec = getAdapter(app);
-  if (!spec) return usage(`unknown app '${app}'. Known apps: ${knownApps().join(", ")}.`);
+  const db = openDb();
+  const spec = routableAdapters(db).find((candidate) => candidate.app === app);
+  if (!spec) return usage(`unknown app '${app}'. Known apps: ${knownApps(db).join(", ")}.`);
   if (name === "default") {
     return usage("'default' is the inherited environment and cannot be redefined.");
   }
@@ -1109,7 +1146,6 @@ function instanceAdd(args: string[]): number {
     );
   }
 
-  const db = openDb();
   withBusyRetry(() =>
     db
       .query(
@@ -1255,13 +1291,13 @@ function poolClear(args: string[]): number {
  * this is the user saying which reachable routes are off limits, and Baton
  * obeying without pretending to know whose account is behind one.
  */
-function block(args: string[]): number {
+async function block(args: string[]): Promise<number> {
   const sub = args[0];
   switch (sub) {
     case "add":
-      return blockAdd(args.slice(1));
+      return await blockAdd(args.slice(1));
     case "list":
-      return blockList();
+      return await blockList();
     case "remove":
       return blockRemove(args.slice(1));
     default:
@@ -1274,7 +1310,7 @@ function block(args: string[]): number {
  * silently matches nothing is worse than no deny list, and a typo in a slug is
  * invisible otherwise.
  */
-function blockAdd(args: string[]): number {
+async function blockAdd(args: string[]): Promise<number> {
   const [pattern, ...reason] = args;
   if (!pattern) {
     return usage(
@@ -1284,11 +1320,11 @@ function blockAdd(args: string[]): number {
   const db = openDb();
   const saved = addBlock(db, pattern, reason.length > 0 ? reason.join(" ") : undefined);
   console.log(`Blocked ${saved.pattern}${saved.reason ? ` (${saved.reason})` : ""}`);
-  printMatches(db, saved.pattern);
+  await printMatches(db, saved.pattern);
   return 0;
 }
 
-function blockList(): number {
+async function blockList(): Promise<number> {
   const db = openDb();
   const blocks = listBlocks(db);
   if (blocks.length === 0) {
@@ -1299,7 +1335,7 @@ function blockList(): number {
   }
   const rows: string[][] = [["PATTERN", "ROUTES", "REASON"]];
   for (const b of blocks) {
-    rows.push([b.pattern, String(matchingRoutes(db, b.pattern).length), b.reason ?? "-"]);
+    rows.push([b.pattern, String((await matchingRoutes(db, b.pattern)).length), b.reason ?? "-"]);
   }
   console.log(table(rows));
   return 0;
@@ -1320,7 +1356,7 @@ function blockRemove(args: string[]): number {
 }
 
 /** Routes this scope knows that the pattern covers, as `app:instance/slug`. */
-function matchingRoutes(db: Database, pattern: string): string[] {
+async function matchingRoutes(db: Database, pattern: string): Promise<string[]> {
   const one: RouteBlock[] = [{ pattern, createdAt: "" }];
   const keys: string[] = [];
   for (const spec of routableAdapters(db)) {
@@ -1328,7 +1364,7 @@ function matchingRoutes(db: Database, pattern: string): string[] {
       DEFAULT_INSTANCE,
       ...(spec.identityEnv ? instanceNames(db, spec.app) : []),
     ];
-    for (const route of routesOf(spec)) {
+    for (const route of await routesOf(spec)) {
       for (const instance of instances) {
         if (blockFor(one, spec.app, instance, route.slug)) {
           keys.push(routeKey(spec.app, instance, route.slug));
@@ -1339,8 +1375,8 @@ function matchingRoutes(db: Database, pattern: string): string[] {
   return keys;
 }
 
-function printMatches(db: Database, pattern: string): void {
-  const matches = matchingRoutes(db, pattern);
+async function printMatches(db: Database, pattern: string): Promise<void> {
+  const matches = await matchingRoutes(db, pattern);
   if (matches.length === 0) {
     console.log(
       "It matches no route this scope currently knows — check the app and slug against 'baton models', or leave it as a standing rule for a route that does not exist yet.",
@@ -1364,8 +1400,8 @@ function instanceNames(db: Database, app: string): string[] {
  */
 function ratings(args: string[]): number {
   const sub = args[0];
-  if (sub === "publish") return ratingsPublish();
-  if (sub !== undefined) return usage("ratings takes: (nothing) | publish");
+  if (sub === "publish" || sub === "export") return ratingsPublish();
+  if (sub !== undefined) return usage("ratings takes: (nothing) | export");
 
   const db = openDb();
   const snap = snapshotRatings(db);
@@ -1420,12 +1456,8 @@ function btSection(db: Database, at = nowIso()): string | null {
 
 function ratingsPublish(): number {
   const { db, paths } = openScope();
-  const res = repairProjection(db, paths.configDir);
-  console.log(
-    res.published
-      ? `Published ${res.path} at revision ${res.revision}`
-      : `${res.path} is already at revision ${res.revision}`,
-  );
+  const res = exportRatings(db, paths.configDir);
+  console.log(`Exported ${res.path} at revision ${res.revision}`);
   return 0;
 }
 
@@ -1443,7 +1475,7 @@ async function profile(args: string[]): Promise<number> {
       return await profileUnshare(args.slice(1));
     default:
       return usage(
-        "profile takes: import <file|code|url> [--name <n>] [--activate] [--yes] | export [--profile <n>] [--out <file>] | share [--profile <n>] | shares | unshare <code>",
+        "profile takes: import <file|code|url> [--name <n>] [--activate] [--dry-run] | export [--profile <n>] [--out <file>] | share [--profile <n>] | shares | unshare <code>",
       );
   }
 }
@@ -1487,41 +1519,40 @@ function warnCategories(doc: ProfileDocument): void {
   }
 }
 
-/**
- * Import shows a summary diff and never silently reweights.
- * There is no interactive prompt — the caller is usually an agent — so the diff
- * is the dry run and `--yes` is the commit.
- */
+/** Import immediately; previews are explicit and replacements keep a portable backup. */
 async function profileImport(args: string[]): Promise<number> {
-  const { flags, rest } = parseFlags(args, { value: ["name"], boolean: ["activate", "yes"] });
-  const ref = rest[0];
-  if (!ref) return usage("profile import needs: <file|code|url> [--name <n>] [--activate] [--yes]");
+  const { flags, rest } = parseFlags(args, { value: ["name"], boolean: ["activate", "dry-run", "yes"] });
+  const [ref] = rest;
+  if (!ref || rest.length !== 1) return usage("profile import needs: <file|code|url> [--name <n>] [--activate] [--dry-run]");
   const loaded = await loadProfile(ref);
   const { doc, source } = loaded;
   const target = flags.name === undefined ? loaded.defaultName : String(flags.name);
-  const activate = flags.activate === true;
   const { db, paths } = openScope();
   if (loaded.from) console.log(loaded.from);
-
-  if (flags.yes !== true) {
+  if (flags["dry-run"]) {
     printDiff(source, target, diffProfileDocument(db, doc, target, undefined, source, true));
-    console.log(
-      `\nNothing was written. Re-run with --yes to commit${activate ? " and activate" : ""}.`,
-    );
+    console.log("\nNothing was written (--dry-run).");
     return 0;
   }
-
-  // The document *is* the profile: priors it no longer names go, so a
-  // refreshed share does not leave the recipient routing on retracted opinions.
-  const diff = importProfileDocument(db, doc, { name: target, activate, source, replace: true });
+  let backup: string | undefined;
+  const diff = inTransaction(db, () => {
+    const activate = flags.activate === true || activeProfile(db) === null;
+    const preview = diffProfileDocument(db, doc, target, undefined, source, true);
+    const exists = db.query("SELECT 1 FROM priors WHERE profile = ? LIMIT 1").get(target);
+    if (exists && (preview.changed.length || preview.removed.length || preview.added.length)) {
+      const dir = join(paths.configDir, "profile-backups");
+      mkdirSync(dir, { recursive: true });
+      backup = join(dir, `${crypto.randomUUID()}.yaml`);
+      writeFileSync(backup, renderProfile(exportProfile(db, target)), { mode: 0o600, flag: "wx" });
+    }
+    return importProfileDocument(db, doc, { name: target, activate, source, replace: true });
+  });
   printDiff(diff.source, target, diff);
-  publishRatings(db, paths.configDir);
   console.log(`\nImported into profile '${target}' at revision ${diff.revision}.`);
-  console.log(
-    activate
-      ? `Active profile is now '${target}'.`
-      : `Not activated: 'baton set ${SETTING_ACTIVE_PROFILE} ${target}' switches to it.`,
-  );
+  if (backup) console.log(`Previous version saved to ${backup}. Restore with: baton profile import '${backup}'`);
+  console.log(activeProfile(db) === target
+    ? `Active profile is now '${target}'.`
+    : `Activate with: baton set ${SETTING_ACTIVE_PROFILE} '${target}'`);
   return 0;
 }
 
@@ -1738,7 +1769,7 @@ function grade(args: string[]): number {
     throw new UsageError(`grade must be a number between 1 and 5, got '${value}'.`);
   }
 
-  const { db, paths } = openScope();
+  const db = openDb();
   const run = db
     .query<
       { model: string; category: string | null; status: RunStatus; created_at: string },
@@ -1773,7 +1804,6 @@ function grade(args: string[]): number {
     model: run.model,
     runAt: answering.finished_at ?? answering.started_at ?? run.created_at,
   });
-  publishRatings(db, paths.configDir);
   console.log(
     `Graded run ${runId} ${score}/5 for ${run.model} via ${answering.target} (revision ${revision}).`,
   );
@@ -1844,7 +1874,7 @@ function setPreciousness(key: string, value: string): number {
 
 /** Switching profiles swaps the prior; nothing observed is overwritten. */
 function activateProfile(name: string): number {
-  const { db, paths } = openScope();
+  const db = openDb();
   const known = db
     .query<{ profile: string }, []>("SELECT DISTINCT profile FROM priors ORDER BY profile")
     .all()
@@ -1853,29 +1883,23 @@ function activateProfile(name: string): number {
     return usage(
       known.length > 0
         ? `unknown profile '${name}'. Known profiles: ${known.join(", ")}.`
-        : `unknown profile '${name}'. This scope has no profiles yet — seed one with the seed_ratings tool, or 'baton profile import <file> --yes'.`,
+        : `unknown profile '${name}'. This scope has no profiles yet — seed one with the seed_ratings tool, or 'baton profile import <file>'.`,
     );
   }
   setActiveProfile(db, name);
-  publishRatings(db, paths.configDir);
   console.log(`${SETTING_ACTIVE_PROFILE} = ${name}`);
   return 0;
 }
 
-/**
- * Settings that change what ratings.yaml would say are outcome commits too:
- * they bump the revision in the same transaction, otherwise the publisher
- * discards the refreshed render as stale.
- */
+/** Rating settings update their revision alongside the stored value. */
 function writeSetting(
   key: string,
   value: string,
   opts: { ratings?: boolean; resetEvidence?: boolean } = {},
 ): number {
-  const { db, paths } = openScope();
+  const db = openDb();
   if (opts.ratings) {
     setRatingSetting(db, key, value, { resetEvidence: opts.resetEvidence === true });
-    publishRatings(db, paths.configDir);
   } else {
     withBusyRetry(() =>
       db
@@ -1892,8 +1916,7 @@ function writeSetting(
 /**
  * `baton install [host...] [--user] [--dir <d>] [--no-eval]`. No host means
  * every supported host whose CLI is on PATH; `--user` writes each host's global
- * config once instead of one checkout's. Grading instructions are included
- * unless refused: ratings do not improve without grades.
+ * config once instead of one checkout's. Optional rating guidance is included.
  */
 function install(args: string[]): number {
   const { flags, rest } = parseFlags(args, {
@@ -1937,7 +1960,7 @@ function install(args: string[]): number {
   console.log(
     flags["no-eval"] === true
       ? "Instructions written without the grading section."
-      : "Instructions include the grading + onboarding section.",
+      : "Instructions include optional ratings and comparisons.",
   );
   for (const restart of restarts) console.log(restart);
   return 0;
@@ -1947,9 +1970,17 @@ function install(args: string[]): number {
 async function update(): Promise<number> {
   const res = await selfUpdate();
   if (!res.changed) {
+    for (const path of refreshInstalledSkills()) console.log(`Refreshed skill: ${path}`);
     console.log(`Baton ${res.from} is up to date (latest release: ${res.to}).`);
     return 0;
   }
+  // This process still has the old templates. Ask the replacement binary to refresh them.
+  const refresh = Bun.spawn([res.path, "--refresh-skills"], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const [output, error, code] = await Promise.all([
+    new Response(refresh.stdout).text(), new Response(refresh.stderr).text(), refresh.exited,
+  ]);
+  if (output) process.stdout.write(output);
+  if (code !== 0) console.error(`baton: binary updated, but refreshing installed skills failed: ${error.trim() || `exit ${code}`}`);
   console.log(
     res.source === "release"
       ? `Updated ${res.path}: ${res.from} → ${res.to}.`
@@ -1957,7 +1988,7 @@ async function update(): Promise<number> {
   );
   for (const note of res.notes) if (note) console.log(note);
   console.log("Running agent sessions keep the old server until they restart.");
-  return 0;
+  return code === 0 ? 0 : 1;
 }
 
 function usage(problem: string): number {
@@ -2002,7 +2033,7 @@ function openDb(): Database {
   return openScope().db;
 }
 
-/** The DB plus the config dir the derived ratings projection lives in. */
+/** The database and paths for this scope. */
 function openScope(): { db: Database; paths: BatonPaths } {
   const paths: BatonPaths = ensurePaths(resolvePaths(process.env));
   return { db: openStore(paths.dbPath), paths };

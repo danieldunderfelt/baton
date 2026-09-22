@@ -8,6 +8,7 @@ import {
   SiteError,
   deviceLogin,
   fetchShare,
+  listShares,
   parseShareRef,
   readAuth,
   shareProfile,
@@ -215,6 +216,24 @@ describe("device login", () => {
 });
 
 describe("share client", () => {
+  test("lists every page and refuses a repeated cursor", async () => {
+    const cursors: (string | null)[] = [];
+    let repeat = false;
+    const server = Bun.serve({ port: 0, fetch: (req) => {
+      const cursor = new URL(req.url).searchParams.get("cursor");
+      cursors.push(cursor);
+      return Response.json({ shares: [{ code: cursor ? "second" : "first" }], next_cursor: !cursor || repeat ? "page/two" : null });
+    } });
+    const url = `http://127.0.0.1:${server.port}`;
+    try {
+      expect((await listShares(url, TOKEN)).map((share) => share.code)).toEqual(["first", "second"]);
+      expect(cursors).toEqual([null, "page/two"]);
+      repeat = true;
+      await expect(listShares(url, TOKEN)).rejects.toThrow("repeated pagination cursor");
+    } finally {
+      server.stop(true);
+    }
+  });
   test("shares, fetches, and reports a revoked token as unauthorized", async () => {
     const shared = await shareProfile(site.url, TOKEN, DOC);
     expect(shared.created).toBe(true);
@@ -248,7 +267,7 @@ describe("CLI", () => {
     const scope = tmp("import");
     const shared = await shareProfile(site.url, OTHER_TOKEN, { ...DOC, name: "picks" });
 
-    const preview = await baton(scope, "profile", "import", shared.code);
+    const preview = await baton(scope, "profile", "import", shared.code, "--dry-run");
     expect(preview.code).toBe(0);
     expect(preview.stdout).toContain("shared by @someone");
     expect(preview.stdout).toContain("Profile 'someone/picks' → local profile 'someone/picks'");

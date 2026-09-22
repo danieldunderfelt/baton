@@ -27,6 +27,21 @@ function installHost(host: Parameters<typeof install>[0], opts: Parameters<typeo
 }
 
 describe("refresh installed skills", () => {
+  test("the update entry point refreshes recorded skills from the running executable", async () => {
+    const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
+    const installation = install("codex", { dir: temp(), env });
+    writeFileSync(installation.skillPath, skillText(true).replace("Delegate a task", "Old instructions"));
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "index.ts"), "--refresh-skills"], {
+      cwd: temp(), env, stdout: "pipe", stderr: "pipe", stdin: "ignore",
+    });
+    const [output, error, code] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect(code, error).toBe(0);
+    expect(output).toContain(installation.skillPath);
+    expect(readFileSync(installation.skillPath, "utf8")).toBe(skillText(true));
+  });
+
   test("refreshes recorded projects from another directory and preserves configs and no-eval", () => {
     const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
     const project = temp();

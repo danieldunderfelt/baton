@@ -171,8 +171,20 @@ export async function fetchShare(site: string, code: string): Promise<SharedProf
 }
 
 export async function listShares(site: string, token: string): Promise<ShareSummary[]> {
-  const res = await call<{ shares: ShareSummary[] }>(site, "GET", "/api/profiles", { token });
-  return res.shares;
+  const shares: ShareSummary[] = [];
+  let cursor: string | null | undefined;
+  const seen = new Set<string>();
+  do {
+    const path = cursor ? `/api/profiles?cursor=${encodeURIComponent(cursor)}` : "/api/profiles";
+    const page = await call<{ shares: ShareSummary[]; next_cursor?: string | null }>(site, "GET", path, { token });
+    shares.push(...page.shares);
+    cursor = page.next_cursor;
+    if (cursor) {
+      if (seen.has(cursor)) throw new Error("The sharing service returned a repeated pagination cursor.");
+      seen.add(cursor);
+    }
+  } while (cursor);
+  return shares;
 }
 
 export function revokeShare(site: string, token: string, code: string): Promise<void> {

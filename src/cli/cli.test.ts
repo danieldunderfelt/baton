@@ -4,10 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import type { AdapterSpec } from "../adapters/types.ts";
-import { canonicalSpecJson, shortDigest, specDigest } from "../discovery/discovery.ts";
-import type { DiscoveredStatus } from "../discovery/types.ts";
 import { newId, nowIso, openStore } from "../store/store.ts";
-import { adaptersApprove } from "./cli.ts";
 
 /**
  * The CLI is tested as a subprocess: exit codes and the two streams are its
@@ -242,8 +239,8 @@ describe("install claude-code", () => {
     // The parallel-delegation advice has to be actionable, the key's payload
     // binding has to be stated, and ratings have to point at the live source.
     expect(skill).toContain('options.autonomy: "readonly"');
-    expect(skill).toContain("byte-identical retry");
-    expect(skill).toContain("live rating");
+    expect(skill).toContain("identical retries");
+    expect(skill).toContain("Use `list_models`");
   });
 
   test("creates .mcp.json when absent and leaves no tmp files", async () => {
@@ -271,25 +268,24 @@ describe("install claude-code", () => {
     expect(res.stderr).toContain("codex");
   });
 
-  test("grading and the onboarding interview are included unless --no-eval", async () => {
+  test("optional ratings guidance is included without mandatory onboarding", async () => {
     const plain = tmp("install-plain");
     await baton(tmp("install-plain-scope"), "install", "claude-code", "--dir", plain, "--no-eval");
     const without = readFileSync(join(plain, ".claude", "skills", "baton", "SKILL.md"), "utf8");
-    // The core tells every host to grade what it used; the grading rubric and
-    // the seeding interview are what the eval section adds on top.
     expect(without).not.toContain("seed_ratings");
 
     const target = tmp("install-eval");
     const res = await baton(tmp("install-eval-scope"), "install", "claude-code", "--dir", target);
     expect(res.code).toBe(0);
-    expect(res.stdout).toContain("grading + onboarding");
+    expect(res.stdout).toContain("optional ratings and comparisons");
     const skill = readFileSync(join(target, ".claude", "skills", "baton", "SKILL.md"), "utf8");
     expect(skill).toContain("report_result(run_id, grade, notes?)");
-    // Consumer grades, the interview, and the upsert rule for duel verdicts.
-    expect(skill).toContain("after you have used its result");
+    expect(skill).toContain("After using an answer");
     expect(skill).toContain("seed_ratings");
-    expect(skill).toContain("Echo the normalized entries back");
-    expect(skill).toContain("`report_duel` is an upsert too");
+    expect(skill).not.toContain("Echo the normalized entries back");
+    expect(skill).toContain("Baton works without ratings");
+    expect(skill).not.toContain("trigger word");
+    expect(skill).not.toContain("workers should delegate too");
   });
 });
 
@@ -709,36 +705,16 @@ describe("block", () => {
     expect(gone.stderr).toContain("no block 'opencode:*/fake-provider/*'");
   });
 
-  test("rejecting a built-in takes the whole app out of service", async () => {
-    const scope = tmp("reject-builtin");
+  test("disabling a built-in blocks its pinned and reported models until enabled", async () => {
+    const scope = tmp("disable-builtin");
     const bin = reportedBin();
-    const baton = (s: string, ...args: string[]) => batonOnPath(s, bin, ...args);
-    const reject = await baton(scope, "adapters", "reject", "opencode", "client", "machine");
-    expect(reject.code).toBe(0);
-    expect(reject.stdout).toContain("Rejected opencode (client machine)");
-    expect(reject.stdout).toContain("muse-spark-1.3, glm-5.3-flash, nor anything the app reports");
-    expect(reject.stdout).toContain("baton block remove 'opencode:*/*'");
-
-    const list = await baton(scope, "adapters", "list");
-    expect(list.stdout).toMatch(/opencode\s+builtin\s+rejected/);
-    expect(list.stdout).toMatch(/codex\s+builtin\s+pinned/);
-    expect(list.stdout).toContain("Restore it with: baton block remove 'opencode:*/*'");
-
-    const models = await baton(scope, "models");
-    expect(models.stdout).toMatch(/muse-spark-1.3.*client machine/);
-    expect(models.stdout).toMatch(/fake-provider\/fake-model.*client machine/);
-    expect(models.stdout).not.toMatch(/gpt-5.6-sol.*client machine/);
-
-    // The restore path the output promises actually restores it.
-    expect((await baton(scope, "block", "remove", "opencode:*/*")).code).toBe(0);
-    expect((await baton(scope, "adapters", "list")).stdout).toMatch(/opencode\s+builtin\s+pinned/);
-  });
-
-  test("rejecting an app that is neither built-in nor discovered still says so", async () => {
-    const scope = tmp("reject-unknown");
-    const bad = await baton(scope, "adapters", "reject", "vim");
-    expect(bad.code).toBe(1);
-    expect(bad.stderr).toContain("no discovered adapter 'vim'");
+    expect((await batonOnPath(scope, bin, "adapters", "disable", "opencode")).code).toBe(0);
+    expect((await baton(scope, "adapters", "list")).stdout).toMatch(/opencode\s+built-in\s+disabled/);
+    const listing = JSON.parse((await batonOnPath(scope, bin, "models", "--json")).stdout);
+    expect(listing.filter((model: { app: string }) => model.app === "opencode").every((model: { available: boolean }) => !model.available)).toBe(true);
+    expect((await baton(scope, "adapters", "enable", "opencode")).code).toBe(0);
+    expect((await baton(scope, "adapters", "list")).stdout).toMatch(/opencode\s+built-in\s+enabled/);
+    expect((await baton(scope, "adapters", "disable", "missing")).code).toBe(1);
   });
 
   test("a pattern matching nothing known is kept, but says so", async () => {
@@ -803,16 +779,16 @@ describe("set keys", () => {
     expect((await baton(scope, "set", "profile_weight", "-1")).code).toBe(2);
   });
 
-  test("a setting that changes what ratings.yaml says reaches the projection", async () => {
+  test("settings leave exported files alone until the next export", async () => {
     const scope = tmp("evalpublish");
     await baton(scope, "ratings", "publish");
     const before = readFileSync(join(scope, "ratings.yaml"), "utf8");
     expect(before).toContain("source_revision: 0");
     expect(before).toContain("profile_weight: 1");
 
-    // These settings mutate no eval table, so without a revision bump in the
-    // same commit the publisher would discard the refreshed render as stale.
     expect((await baton(scope, "set", "profile_weight", "0.25")).code).toBe(0);
+    expect(readFileSync(join(scope, "ratings.yaml"), "utf8")).toBe(before);
+    expect((await baton(scope, "ratings", "export")).code).toBe(0);
     const after = readFileSync(join(scope, "ratings.yaml"), "utf8");
     expect(after).toContain("source_revision: 1");
     expect(after).toContain("profile_weight: 0.25");
@@ -863,7 +839,7 @@ function seedRun(scope: string, opts: { succeeded: boolean; sessionRef?: string 
 }
 
 describe("grade and ratings", () => {
-  test("a graded run shows up in ratings and in the published projection", async () => {
+  test("a graded run shows up in ratings without writing an export", async () => {
     const scope = tmp("grade");
     const runId = seedRun(scope, { succeeded: true });
 
@@ -877,6 +853,8 @@ describe("grade and ratings", () => {
     expect(ratings.stdout).toMatch(/kimi-k3\s+-\s+4(\.00)? \(1(\.00)?\)/);
     expect(ratings.stdout).toContain("revision");
 
+    expect(existsSync(join(scope, "ratings.yaml"))).toBe(false);
+    await baton(scope, "ratings", "export");
     const yaml = readFileSync(join(scope, "ratings.yaml"), "utf8");
     expect(yaml).toContain("source_revision: 1");
     expect(yaml).toContain("kimi-k3");
@@ -912,9 +890,10 @@ describe("grade and ratings", () => {
 
     const already = await baton(scope, "ratings", "publish");
     expect(already.code).toBe(0);
-    expect(already.stdout).toContain("already at revision");
+    expect(already.stdout).toContain("Exported");
 
     await baton(scope, "set", "profile_weight", "2");
+    await baton(scope, "ratings", "export");
     const yaml = readFileSync(join(scope, "ratings.yaml"), "utf8");
     expect(yaml).toContain("profile_weight: 2");
   });
@@ -934,12 +913,31 @@ entries:
 `;
 
 describe("profile import", () => {
-  test("shows the diff, writes nothing without --yes, then commits with it", async () => {
+  test("replacing a profile keeps a restorable backup and later profiles stay inactive", async () => {
+    const scope = tmp("profile-backup");
+    const file = join(tmp("profile-backup-file"), "team.yaml");
+    writeFileSync(file, PROFILE_FILE);
+    expect((await baton(scope, "profile", "import", file)).code).toBe(0);
+    writeFileSync(file, PROFILE_FILE.replace("mean: 4.5", "mean: 2"));
+    const replaced = await baton(scope, "profile", "import", file);
+    expect(replaced.code, replaced.stderr).toBe(0);
+    const backup = /Previous version saved to (.+\.yaml)\./.exec(replaced.stdout)?.[1];
+    expect(backup).toBeDefined();
+    expect(readFileSync(backup!, "utf8")).toContain("mean: 4.5");
+    expect((await baton(scope, "profile", "import", backup!)).code).toBe(0);
+    expect((await baton(scope, "profile", "export")).stdout).toContain("mean: 4.5");
+
+    const later = await baton(scope, "profile", "import", file, "--name", "alternative");
+    expect(later.code).toBe(0);
+    expect(later.stdout).toContain("Activate with:");
+    expect((await baton(scope, "profile", "export")).stdout).toContain("name: team");
+  });
+  test("previews with --dry-run and imports and activates by default", async () => {
     const scope = tmp("import");
     const file = join(tmp("import-file"), "team.yaml");
     writeFileSync(file, PROFILE_FILE);
 
-    const dry = await baton(scope, "profile", "import", file);
+    const dry = await baton(scope, "profile", "import", file, "--dry-run");
     expect(dry.code).toBe(0);
     expect(dry.stdout).toContain("Profile 'team' → local profile 'team'");
     expect(dry.stdout).toContain("+ kimi-k3 mean 4.50 weight 5");
@@ -948,7 +946,7 @@ describe("profile import", () => {
     expect(dry.stdout).toContain("Nothing was written");
     expect((await baton(scope, "ratings")).stdout).toContain("No ratings yet");
 
-    const committed = await baton(scope, "profile", "import", file, "--yes", "--activate");
+    const committed = await baton(scope, "profile", "import", file);
     expect(committed.code).toBe(0);
     expect(committed.stdout).toContain("2 added");
     expect(committed.stdout).toContain("Active profile is now 'team'");
@@ -976,7 +974,7 @@ describe("profile import", () => {
 
     // Same mean and weight, a year and a half newer: the prior's precision is
     // restored, so this is a change — and the preview has to show why.
-    const dry = await baton(scope, "profile", "import", newer);
+    const dry = await baton(scope, "profile", "import", newer, "--dry-run");
     expect(dry.stdout).toContain("0 added, 1 changed, 0 unchanged");
     expect(dry.stdout).toContain("as_of 2025-01-01");
     // The preview must match what committing then reports.
@@ -993,7 +991,7 @@ describe("profile import", () => {
     const res = await baton(scope, "profile", "import", file, "--name", "mine", "--yes");
     expect(res.code).toBe(0);
     expect(res.stdout).toContain("Profile 'team' → local profile 'mine'");
-    expect(res.stdout).toContain("Not activated");
+    expect(res.stdout).toContain("Active profile is now 'mine'");
 
     const activated = await baton(scope, "set", "active_profile", "mine");
     expect(activated.code).toBe(0);
@@ -1016,6 +1014,40 @@ describe("profile import", () => {
 });
 
 describe("run and runs", () => {
+  test("JSON status, models and run inspection stay machine-readable", async () => {
+    const scope = tmp("json-inspect");
+    const status = await baton(scope, "status", "--json");
+    expect(status.code, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout).paths.configDir).toBe(scope);
+    const models = await baton(scope, "models", "--json");
+    expect(models.code, models.stderr).toBe(0);
+    expect(JSON.parse(models.stdout).some((model: { model: string }) => model.model === "kimi-k3")).toBe(true);
+    expect(JSON.parse((await baton(scope, "runs", "--json")).stdout)).toEqual([]);
+    const runId = seedRun(scope, { succeeded: true });
+    expect(JSON.parse((await baton(scope, "runs", runId, "--json")).stdout).runId).toBe(runId);
+    expect(JSON.parse((await baton(scope, "runs", "--json")).stdout)[0].runId).toBe(runId);
+    const cancel = await baton(scope, "cancel", runId, "--json");
+    expect(JSON.parse(cancel.stdout)).toMatchObject({ runId, status: "succeeded" });
+    expect((await baton(scope, "cancel", "run_nope")).code).toBe(1);
+  });
+
+  test("run and resume JSON include the handle while plain answers stay on stdout", async () => {
+    const scope = tmp("json-run");
+    const bin = tmp("json-run-bin");
+    writeFileSync(join(bin, "kimi"), `#!/bin/sh\n${VERSION_SHIM}\nprintf '%s\\n' '{"role":"assistant","content":"The answer"}' '{"role":"meta","type":"session.resume_hint","session_id":"json-session"}'\n`, { mode: 0o755 });
+    const run = await batonOnPath(scope, bin, "run", "kimi-k3", "hello", "--json");
+    expect(run.code, run.stderr).toBe(0);
+    const record = JSON.parse(run.stdout);
+    expect(record).toMatchObject({ status: "succeeded", output: "The answer" });
+    expect(run.stderr).toContain(record.runId);
+    expect(run.stderr).toContain("running");
+    const resumed = await batonOnPath(scope, bin, "resume", record.runId, "continue", "--json");
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(JSON.parse(resumed.stdout)).toMatchObject({ resumedFrom: record.runId, output: "The answer" });
+    const plain = await batonOnPath(scope, bin, "run", "kimi-k3", "hello");
+    expect(plain.stdout).toBe("The answer\n");
+    expect(plain.stderr).toMatch(/baton: run run_\S+ succeeded/);
+  });
   test("an unknown model fails before anything is spawned", async () => {
     const scope = tmp("run-unknown");
     const res = await baton(scope, "run", "gpt-9", "do the thing");
@@ -1039,6 +1071,31 @@ describe("run and runs", () => {
 });
 
 describe("run cancellation", () => {
+  test("cancel from another CLI waits until the owner's whole process group is dead", async () => {
+    const scope = tmp("cancel-command");
+    const { bin, pidfile } = fakeKimi();
+    const proc = Bun.spawn([process.execPath, ENTRY, "run", "kimi-k3", "wait"], {
+      env: { ...process.env, BATON_CONFIG_DIR: scope, BATON_HOPS: undefined, PATH: `${bin}:${process.env.PATH ?? ""}` },
+      stdout: "pipe", stderr: "pipe", stdin: "ignore",
+    });
+    try {
+      const pids = await poll("the fake callee to spawn", 15_000, () => {
+        const found = readPids(pidfile);
+        return found.length >= 2 ? found : undefined;
+      });
+      const records = JSON.parse((await baton(scope, "runs", "--json")).stdout);
+      const runId: string = records[0].runId;
+      const cancelled = await baton(scope, "cancel", runId, "--json");
+      expect(cancelled.code, cancelled.stderr).toBe(0);
+      expect(JSON.parse(cancelled.stdout)).toMatchObject({ runId, status: "cancelled" });
+      expect(pids.every((pid) => !alive(pid))).toBe(true);
+      expect(await proc.exited).toBe(1);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGINT");
+      await proc.exited;
+    }
+  }, 45_000);
+
   test("SIGINT kills the callee's process group and leaves the run cancelled", async () => {
     const scope = tmp("cancel");
     const { bin, pidfile } = fakeKimi();
@@ -1267,306 +1324,40 @@ describe("duel", () => {
   });
 });
 
-/** A discovered spec, quarantined exactly as `register_app` would leave it. */
-function seedDiscovered(
-  scope: string,
-  binary: string,
-  opts: { status?: DiscoveredStatus; overrides?: Partial<AdapterSpec> } = {},
-): AdapterSpec {
-  mkdirSync(join(scope, "state"), { recursive: true, mode: 0o700 });
-  const db = openStore(join(scope, "state", "baton.db"));
-  const spec: AdapterSpec = {
-    app: "fakeagent",
-    adapterVersion: 1,
-    binary,
-    models: [{ model: "fake-1", slug: "fake/1" }],
-    invoke: {
-      argv: ["--model", "{slug}", "{autonomyFlags}"],
-      promptVia: "stdin",
-      extract: { kind: "json", path: "result" },
-    },
-    autonomyFlags: { readonly: ["--readonly"] },
-    defaultAutonomy: "readonly",
-    defaultTimeoutMs: 60_000,
-    admissionFailurePatterns: [],
-    ...opts.overrides,
-  };
-  db.query(
-    `INSERT INTO discovered_adapters (app, spec, status, submitted_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (app) DO UPDATE SET
-       spec = excluded.spec, status = excluded.status, submitted_at = excluded.submitted_at`,
-  ).run(spec.app, canonicalSpecJson(spec), opts.status ?? "quarantined", nowIso());
-  db.close();
-  return spec;
-}
-
-/**
- * The CLI is otherwise tested as a subprocess, but approval refuses to run
- * without a terminal and a subprocess never has one. These two calls exercise
- * the handler in-process with the interactivity gate injected — the refusal
- * itself is asserted through the subprocess, where stdin really is not a tty.
- */
-async function approveInteractively(
-  scope: string,
-  ...args: string[]
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  const previous = process.env.BATON_CONFIG_DIR;
-  process.env.BATON_CONFIG_DIR = scope;
-  const out: string[] = [];
-  const err: string[] = [];
-  const { log, error } = console;
-  console.log = (...parts: unknown[]): void => void out.push(parts.join(" "));
-  console.error = (...parts: unknown[]): void => void err.push(parts.join(" "));
-  try {
-    const code = await adaptersApprove(args, { isInteractive: () => true });
-    return { code, stdout: out.join("\n"), stderr: err.join("\n") };
-  } finally {
-    console.log = log;
-    console.error = error;
-    if (previous === undefined) delete process.env.BATON_CONFIG_DIR;
-    else process.env.BATON_CONFIG_DIR = previous;
-  }
-}
-
-/** The digest a human would have copied out of `baton adapters review`. */
-function digestOf(spec: AdapterSpec): string {
-  return shortDigest(specDigest(spec));
-}
-
-/** The discovered app's binary: answers with the token it was asked for. */
-function fakeAgentBinary(): string {
-  const path = join(tmp("agentbin"), "fakeagent");
-  writeFileSync(
-    path,
-    `#!${process.execPath}
-const prompt = await Bun.stdin.text();
-const token = prompt.trim().split(/\\s+/).at(-1) ?? "";
-await Bun.write(Bun.stdout, JSON.stringify({ result: token, argv: process.argv.slice(2) }));
-`,
-    { mode: 0o755 },
-  );
-  return path;
-}
-
-describe("adapters review and approval", () => {
-  test("review prints the exact mechanics, approval canaries it into active", async () => {
-    const scope = tmp("adapters");
-    const binary = fakeAgentBinary();
-    const spec = seedDiscovered(scope, binary);
-
-    const quarantined = await baton(scope, "adapters", "list");
-    expect(quarantined.stdout).toContain("fakeagent");
-    expect(quarantined.stdout).toContain("quarantined");
-    expect(quarantined.stdout).toContain("has been executed");
-
-    const review = await baton(scope, "adapters", "review", "fakeagent");
-    expect(review.code).toBe(0);
-    expect(review.stdout).toContain(binary);
-    // argv as a JSON array: where one element ends and the next begins is the
-    // difference between one program and another.
-    expect(review.stdout).toContain('["--model","{slug}","{autonomyFlags}"]');
-    expect(review.stdout).toContain("prompt via: stdin");
-    expect(review.stdout).toContain('JSON stdout, path "result"');
-    expect(review.stdout).toContain("fake-1 → fake/1");
-    expect(review.stdout).toContain(digestOf(spec));
-    expect(review.stdout).toContain("Nothing from this spec has been executed");
-    expect(review.stdout).toContain("Approve running this exact binary");
-    // The review is honest about how far the terminal check reaches.
-    expect(review.stdout).toContain("already holds full shell access");
-
-    const approved = await approveInteractively(scope, "fakeagent", "--digest", digestOf(spec));
-    expect(approved.code).toBe(0);
-    expect(approved.stdout).toContain("Canary passed");
-    expect((await baton(scope, "adapters", "list")).stdout).toContain("active");
-
-    const rejected = await baton(scope, "adapters", "reject", "fakeagent", "changed", "my", "mind");
-    expect(rejected.code).toBe(0);
-    // Approval is consent to run one reviewed spec, and withdrawing it takes
-    // execution rights back immediately.
-    const refused = await baton(scope, "adapters", "canary", "fakeagent");
-    expect(refused.code).toBe(1);
-    expect(refused.stdout).toContain("failed");
-    expect(refused.stderr).toContain("approval precedes execution");
-  }, 30_000);
-
-  test("approval refuses without a terminal, and without the reviewed digest", async () => {
-    const scope = tmp("adapters-gate");
-    const spec = seedDiscovered(scope, fakeAgentBinary());
-
-    // A tool call or a pasted command has no terminal behind it. This is the
-    // whole reason approval is not an MCP tool.
-    const noTty = await baton(
-      scope,
-      "adapters",
-      "approve",
-      "fakeagent",
-      "--digest",
-      digestOf(spec),
-    );
-    expect(noTty.code).toBe(1);
-    expect(noTty.stderr).toContain("stdin is not a terminal");
-    expect(noTty.stderr).toContain("no override flag");
-
-    const noDigest = await baton(scope, "adapters", "approve", "fakeagent");
-    expect(noDigest.code).toBe(2);
-    expect(noDigest.stderr).toContain("--digest");
-
-    // Right terminal, wrong spec: the digest is what makes approval a statement
-    // about content instead of about an app name.
-    const wrong = await approveInteractively(scope, "fakeagent", "--digest", "0".repeat(12));
-    expect(wrong.code).toBe(1);
-    expect(wrong.stderr).toContain("digest mismatch");
-
-    // Nothing has been approved and nothing has been executed.
-    expect((await baton(scope, "adapters", "list")).stdout).toContain("quarantined");
+describe("registered adapter commands", () => {
+  test("registers immediately, preserves a repeated registration and supports named accounts", async () => {
+    const scope = tmp("register");
+    const dir = tmp("register-files");
+    const binary = join(dir, "fakeagent");
+    const executed = join(dir, "executed");
+    writeFileSync(binary, `#!${process.execPath}\nawait Bun.write(${JSON.stringify(executed)}, "ran");\nconst prompt = await Bun.stdin.text();\nconsole.log(JSON.stringify({ result: prompt }));\n`, { mode: 0o755 });
+    const spec: AdapterSpec = {
+      app: "fakeagent", adapterVersion: 1, binary, identityEnv: "FAKE_HOME",
+      models: [{ model: "fake-1", slug: "fake/1" }],
+      invoke: { argv: ["--model", "{slug}", "{autonomyFlags}"], promptVia: "stdin", extract: { kind: "json", path: "result" } },
+      autonomyFlags: { readonly: [] }, defaultAutonomy: "readonly", admissionFailurePatterns: [],
+    };
+    const file = join(dir, "adapter.json");
+    writeFileSync(file, JSON.stringify(spec));
+    const registered = await baton(scope, "adapters", "add", file);
+    expect(registered.code, registered.stderr).toBe(0);
+    expect(registered.stdout).toContain("enabled");
+    expect(existsSync(executed)).toBe(false);
+    expect(JSON.parse((await baton(scope, "adapters", "show", "fakeagent")).stdout)).toMatchObject(spec);
+    expect((await baton(scope, "adapters", "test", "--all", "--structural")).code).toBe(0);
+    expect(existsSync(executed)).toBe(false);
+    expect((await baton(scope, "adapters", "add", file)).stdout).toContain("unchanged");
+    const instance = await baton(scope, "instance", "add", "fakeagent", "work", "--env", `FAKE_HOME=${dir}`);
+    expect(instance.code, instance.stderr).toBe(0);
+    const run = await baton(scope, "run", "fake-1", "hello", "--instance", "work", "--json");
+    expect(run.code, run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({ instance: "work", output: "hello" });
+    expect((await baton(scope, "adapters", "disable", "fakeagent")).code).toBe(0);
+    expect((await baton(scope, "adapters", "add", file)).stdout).toContain("disabled");
+    expect((await baton(scope, "adapters", "enable", "fakeagent")).code).toBe(0);
+    expect((await baton(scope, "set", "max_autonomy:fakeagent", "readonly")).code).toBe(0);
+    expect((await baton(scope, "adapters", "show", "missing")).code).toBe(1);
   });
-
-  test("approving a digest the agent has already replaced is refused", async () => {
-    const scope = tmp("adapters-swap");
-    const binary = fakeAgentBinary();
-    const reviewed = seedDiscovered(scope, binary);
-    // Between the human reading the review and typing approve, the agent
-    // resubmits — same app name, different argv.
-    seedDiscovered(scope, binary, {
-      overrides: { adapterVersion: 2, autonomyFlags: { readonly: ["--readonly", "--trust-all"] } },
-    });
-
-    const res = await approveInteractively(scope, "fakeagent", "--digest", digestOf(reviewed));
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("not approving what you reviewed");
-    expect((await baton(scope, "adapters", "list")).stdout).toContain("quarantined");
-  });
-
-  test("--no-canary approves without executing anything", async () => {
-    const scope = tmp("adapters-nocanary");
-    const spec = seedDiscovered(scope, fakeAgentBinary());
-    const res = await approveInteractively(
-      scope,
-      "fakeagent",
-      "--digest",
-      digestOf(spec),
-      "--no-canary",
-    );
-    expect(res.code).toBe(0);
-    expect(res.stdout).toContain("Not active yet");
-    const list = await baton(scope, "adapters", "list");
-    expect(list.stdout).toMatch(/fakeagent\s+discovered\s+approved/);
-  });
-
-  test("the canary fails an adapter that returns the token inside other text", async () => {
-    const scope = tmp("adapters-echo");
-    // Extraction that hands back the whole prompt "contains" the token and has
-    // verified nothing about the declared path.
-    const path = join(tmp("echobin"), "echoagent");
-    writeFileSync(
-      path,
-      `#!${process.execPath}
-const prompt = await Bun.stdin.text();
-await Bun.write(Bun.stdout, JSON.stringify({ result: "The agent says: " + prompt.trim() }));
-`,
-      { mode: 0o755 },
-    );
-    seedDiscovered(scope, path, { status: "approved" });
-
-    const res = await baton(scope, "adapters", "canary", "fakeagent");
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("instead of BATON_CANARY");
-    expect((await baton(scope, "adapters", "list")).stdout).not.toContain("active");
-  }, 30_000);
-
-  test("an active discovered adapter is a known app for settings, and its ceiling clamps", async () => {
-    const scope = tmp("adapters-ceiling");
-    // A fake that reports the argv it was actually spawned with.
-    const path = join(tmp("argvbin"), "argvagent");
-    writeFileSync(
-      path,
-      `#!${process.execPath}
-await Bun.stdin.text();
-await Bun.write(Bun.stdout, JSON.stringify({ result: process.argv.slice(2).join(" ") }));
-`,
-      { mode: 0o755 },
-    );
-    seedDiscovered(scope, path, {
-      status: "active",
-      overrides: {
-        autonomyFlags: { readonly: ["--readonly"], full: ["--full"] },
-        defaultAutonomy: "full",
-      },
-    });
-
-    const set = await baton(scope, "set", "max_autonomy:fakeagent", "readonly");
-    expect(set.code).toBe(0);
-    expect(set.stdout).toContain("max_autonomy:fakeagent = readonly");
-
-    // The ceiling is not decoration: a run that asks for more gets less.
-    const run = await baton(scope, "run", "fake-1", "hello", "--autonomy", "full");
-    expect(run.code).toBe(0);
-    expect(run.stdout).toContain("--readonly");
-    expect(run.stdout).not.toContain("--full");
-  }, 30_000);
-
-  test("a review of an app this scope never heard of fails without guessing", async () => {
-    const res = await baton(tmp("adapters-unknown"), "adapters", "review", "ghost");
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("no discovered adapter 'ghost'");
-  });
-});
-
-describe("adapters canary --all (conformance suite)", () => {
-  test("--structural validates every built-in without executing one", async () => {
-    const scope = tmp("conformance");
-    // Every built-in binary is a fake that records having been run: the marker
-    // is what proves the structural half really executes nothing.
-    const bin = tmp("conformance-bin");
-    const marker = join(bin, "ran");
-    for (const app of ["codex", "kimi", "claude", "opencode", "cursor-agent"]) {
-      writeFileSync(join(bin, app), `#!/bin/sh\necho ran >> "${marker}"\n`, { mode: 0o755 });
-    }
-    seedDiscovered(scope, fakeAgentBinary());
-
-    const res = await batonOnPath(scope, bin, "adapters", "canary", "--all", "--structural");
-    expect(res.code).toBe(0);
-    expect(res.stdout).toContain("STRUCTURE");
-    expect(res.stdout).toMatch(/codex\s+builtin\s+ok/);
-    expect(res.stdout).toMatch(/kimi\s+builtin\s+ok/);
-    expect(res.stdout).toMatch(/fakeagent\s+quarantined\s+ok/);
-    expect(res.stdout).toContain("not run (--structural)");
-    expect(existsSync(marker)).toBe(false);
-  });
-
-  test("a built-in whose answer merely contains the token fails the canary", async () => {
-    const scope = tmp("conformance-loose");
-    const bin = tmp("conformance-loose-bin");
-    // Answers in codex's own JSONL shape, so extraction succeeds — and returns
-    // the token wrapped in prose, which is not what the canary asked for.
-    writeFileSync(
-      join(bin, "codex"),
-      `#!/bin/sh\necho '{"type":"item.completed","item":{"type":"agent_message","text":"Sure thing: BATON_CANARY"}}'\n`,
-      { mode: 0o755 },
-    );
-
-    const res = await batonOnPath(scope, bin, "adapters", "canary", "codex");
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("instead of BATON_CANARY");
-  }, 30_000);
-
-  test("an adapter nobody has heard of is a usage error, not an empty pass", async () => {
-    const res = await baton(tmp("conformance-unknown"), "adapters", "canary", "ghost");
-    expect(res.code).toBe(2);
-    expect(res.stderr).toContain("unknown adapter 'ghost'");
-  });
-
-  // The live half runs every installed agent CLI for real: opt in with
-  // BATON_LIVE_TESTS=1.
-  test.skipIf(process.env.BATON_LIVE_TESTS !== "1")(
-    "runs a real canary against every installed built-in",
-    async () => {
-      const res = await baton(tmp("conformance-live"), "adapters", "canary", "--all");
-      expect(res.stdout).toContain("passed");
-      expect(res.code).toBe(0);
-    },
-    600_000,
-  );
 });
 
 describe("profile export", () => {
