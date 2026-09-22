@@ -1,12 +1,10 @@
 import type { APIRoute } from "astro";
 
 import { ApiError, handle, json, readJsonObject } from "../../../lib/api.ts";
-import { createDeviceCode, pendingDeviceCount, purgeExpired } from "../../../lib/db.ts";
+import { createDeviceCode, DeviceLimitError, purgeExpired } from "../../../lib/db.ts";
 import { appEnv, siteOrigin } from "../../../lib/env.ts";
 
 export const prerender = false;
-
-const MAX_PENDING_DEVICES = 500;
 
 /** Step one of `baton login`: a device code for the CLI, a user code for the human. */
 export const POST: APIRoute = ({ request }) =>
@@ -18,12 +16,18 @@ export const POST: APIRoute = ({ request }) =>
       throw new ApiError(400, "bad_request", "label must be a single line.");
     }
     await purgeExpired(env.DB);
-    // Nobody signs in a thousand CLIs at once; a flood of anonymous requests is
-    // the only thing that gets here, and this keeps it from growing the table.
-    if ((await pendingDeviceCount(env.DB)) >= MAX_PENDING_DEVICES) {
-      throw new ApiError(429, "too_many_requests", "Too many sign-ins are pending. Try again in a few minutes.");
+    let start;
+    try {
+      // Cloudflare supplies this address. Do not accept a caller's forwarded-for
+      // header; a missing edge header shares a bucket, including local preview.
+      start = await createDeviceCode(env.DB, label, request.headers.get("cf-connecting-ip") ?? "unknown");
+    } catch (err) {
+      if (err instanceof DeviceLimitError) {
+        return json({ error: "too_many_requests", message: err.message }, 429,
+          { "retry-after": String(err.retryAfterSeconds) });
+      }
+      throw err;
     }
-    const start = await createDeviceCode(env.DB, label);
     const origin = siteOrigin(request);
     return json({
       ...start,

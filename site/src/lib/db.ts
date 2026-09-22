@@ -1,5 +1,5 @@
 import { isoAfter, nowIso, randomSecret, sha256Hex } from "./crypto.ts";
-import { newShareCode, newUserCode } from "./codes.ts";
+import { newShareCode, newUserCode, normalizeShareCode } from "./codes.ts";
 import type { ProfileDocument } from "../../../src/eval/profileDocument.ts";
 
 /**
@@ -19,6 +19,17 @@ export interface User {
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEVICE_TTL_MS = 15 * 60 * 1000;
 export const DEVICE_POLL_SECONDS = 5;
+// A shared network can start several CLIs without occupying the global pool.
+export const MAX_PENDING_DEVICES = 500;
+export const MAX_CLIENT_PENDING_DEVICES = 5;
+export const MAX_CLIENT_DEVICE_STARTS = 10;
+export const DEVICE_RATE_WINDOW_MS = 15 * 60 * 1000;
+
+// Stored JSON bytes, across every profile belonging to one account.
+export const MAX_ACCOUNT_PROFILES = 100;
+export const MAX_ACCOUNT_PROFILE_BYTES = 5 * 1024 * 1024;
+export const PROFILE_PAGE_SIZE = 25;
+export const MAX_PROFILE_PAGE_SIZE = 100;
 
 export async function upsertUser(
   db: D1Database,
@@ -85,16 +96,39 @@ export interface DeviceStart {
   interval: number;
 }
 
-export async function createDeviceCode(db: D1Database, label: string): Promise<DeviceStart> {
+export class DeviceLimitError extends Error {
+  readonly retryAfterSeconds = DEVICE_RATE_WINDOW_MS / 1000;
+
+  constructor() {
+    super("Too many sign-in requests. Finish a pending sign-in or try again in 15 minutes.");
+  }
+}
+
+export async function createDeviceCode(db: D1Database, label: string, clientAddress: string): Promise<DeviceStart> {
   const deviceCode = randomSecret();
+  const deviceHash = await sha256Hex(deviceCode);
+  const clientHash = await sha256Hex(clientAddress);
   const userCode = newUserCode();
-  await db
-    .prepare(
-      `INSERT INTO device_codes (device_code_hash, user_code, label, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    )
-    .bind(await sha256Hex(deviceCode), userCode, label, nowIso(), isoAfter(DEVICE_TTL_MS))
-    .run();
+  const now = Date.now();
+  const startedAt = new Date(now).toISOString();
+  const windowStart = new Date(now - DEVICE_RATE_WINDOW_MS).toISOString();
+  // D1 batches are transactions. Checking capacity inside the INSERT prevents
+  // concurrent callers from claiming the same last slot; history commits with it.
+  const [inserted] = await db.batch([
+    db.prepare(`INSERT INTO device_codes
+      (device_code_hash, user_code, label, client_hash, created_at, expires_at)
+      SELECT ?, ?, ?, ?, ?, ?
+      WHERE (SELECT COUNT(*) FROM device_codes WHERE expires_at > ?) < ?
+        AND (SELECT COUNT(*) FROM device_codes WHERE client_hash = ? AND expires_at > ?) < ?
+        AND (SELECT COUNT(*) FROM device_starts WHERE client_hash = ? AND created_at > ?) < ?`)
+      .bind(deviceHash, userCode, label, clientHash, startedAt, isoAfter(DEVICE_TTL_MS, now),
+        startedAt, MAX_PENDING_DEVICES, clientHash, startedAt, MAX_CLIENT_PENDING_DEVICES,
+        clientHash, windowStart, MAX_CLIENT_DEVICE_STARTS),
+    db.prepare(`INSERT INTO device_starts (device_code_hash, client_hash, created_at)
+      SELECT device_code_hash, client_hash, created_at FROM device_codes WHERE device_code_hash = ?`)
+      .bind(deviceHash),
+  ]);
+  if (!inserted?.meta.changes) throw new DeviceLimitError();
   return {
     device_code: deviceCode,
     user_code: userCode,
@@ -174,21 +208,14 @@ export async function redeemDevice(db: D1Database, rawDeviceCode: string): Promi
   return { status: "ok", token, login: user.login };
 }
 
-/** Outstanding (unexpired) device requests: the cheap abuse ceiling. */
-export async function pendingDeviceCount(db: D1Database): Promise<number> {
-  const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM device_codes WHERE expires_at > ?")
-    .bind(nowIso())
-    .first<{ n: number }>();
-  return row?.n ?? 0;
-}
-
 /** Housekeeping on a path that is rare anyway (each `baton login`). */
 export async function purgeExpired(db: D1Database): Promise<void> {
   const now = nowIso();
   await db.batch([
     db.prepare("DELETE FROM device_codes WHERE expires_at <= ?").bind(now),
     db.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now),
+    db.prepare("DELETE FROM device_starts WHERE created_at <= ?")
+      .bind(new Date(Date.now() - DEVICE_RATE_WINDOW_MS).toISOString()),
   ]);
 }
 
@@ -212,6 +239,12 @@ export interface ShareSummary {
   updated_at: string;
 }
 
+export class ProfileLimitError extends Error {
+  constructor() {
+    super("An account can share up to 100 profiles and 5 MiB of profile data. Revoke an unused share or reduce a profile before sharing again.");
+  }
+}
+
 /**
  * One live share per (user, profile name): sharing again replaces the
  * document under the same code, so a link already handed out stays current.
@@ -223,18 +256,24 @@ export async function upsertProfile(
 ): Promise<ShareSummary & { created: boolean }> {
   const now = nowIso();
   const document = JSON.stringify(doc);
+  const documentBytes = new TextEncoder().encode(document).byteLength;
   const code = newShareCode();
   const row = await db
     .prepare(
       `INSERT INTO profiles (code, user_id, name, document, entry_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE (EXISTS (SELECT 1 FROM profiles WHERE user_id = ? AND name = ?)
+         OR (SELECT COUNT(*) FROM profiles WHERE user_id = ?) < ?)
+         AND COALESCE((SELECT SUM(document_bytes) FROM profiles WHERE user_id = ? AND name <> ?), 0) + ? <= ?
        ON CONFLICT (user_id, name) DO UPDATE SET
          document = excluded.document, entry_count = excluded.entry_count, updated_at = excluded.updated_at
        RETURNING code, name, entry_count, created_at, updated_at`,
     )
-    .bind(code, userId, doc.name, document, doc.entries.length, now, now)
+    .bind(code, userId, doc.name, document, doc.entries.length, now, now,
+      userId, doc.name, userId, MAX_ACCOUNT_PROFILES,
+      userId, doc.name, documentBytes, MAX_ACCOUNT_PROFILE_BYTES)
     .first<ShareSummary>();
-  if (!row) throw new Error("Profile upsert returned no row.");
+  if (!row) throw new ProfileLimitError();
   return { ...row, created: row.code === code };
 }
 
@@ -263,15 +302,40 @@ export async function profileByCode(db: D1Database, code: string): Promise<Share
   };
 }
 
-export async function listProfiles(db: D1Database, userId: string): Promise<ShareSummary[]> {
+export class InvalidProfilePageError extends Error {}
+
+export interface ProfilePage {
+  shares: ShareSummary[];
+  next_cursor: string | null;
+}
+
+export async function listProfiles(
+  db: D1Database,
+  userId: string,
+  { cursor = null, limit = PROFILE_PAGE_SIZE }: { cursor?: string | null; limit?: number } = {},
+): Promise<ProfilePage> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PROFILE_PAGE_SIZE) {
+    throw new InvalidProfilePageError(`limit must be an integer from 1 to ${MAX_PROFILE_PAGE_SIZE}.`);
+  }
+  const [createdAt = "", code = "", ...extra] = cursor?.split("/") ?? [];
+  if (cursor !== null && (extra.length > 0 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(createdAt)
+    || !Number.isFinite(Date.parse(createdAt)) || normalizeShareCode(code) !== code || !code)) {
+    throw new InvalidProfilePageError("Invalid profile page cursor.");
+  }
   const res = await db
     .prepare(
       `SELECT code, name, entry_count, created_at, updated_at FROM profiles
-       WHERE user_id = ? ORDER BY updated_at DESC`,
+       WHERE user_id = ? AND (? IS NULL OR (created_at, code) < (?, ?))
+       ORDER BY created_at DESC, code DESC LIMIT ?`,
     )
-    .bind(userId)
+    .bind(userId, cursor, createdAt, code, limit + 1)
     .all<ShareSummary>();
-  return res.results;
+  const shares = res.results.slice(0, limit);
+  const last = shares.at(-1);
+  return {
+    shares,
+    next_cursor: res.results.length > limit && last ? `${last.created_at}/${last.code}` : null,
+  };
 }
 
 export async function deleteProfile(db: D1Database, userId: string, code: string): Promise<boolean> {

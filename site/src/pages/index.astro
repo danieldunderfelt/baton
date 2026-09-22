@@ -150,8 +150,9 @@ const features = [
             the ceiling per app.
           </li>
           <li>
-            It does not send prompts anywhere. They stay in a capped local ring buffer. Only
-            aggregate ratings are shareable.
+            Baton stores run history locally. Delegated CLIs receive your prompts and may send
+            them to their model providers. The optional sharing service receives rating profiles,
+            not run prompts.
           </li>
         </ul>
       </div>

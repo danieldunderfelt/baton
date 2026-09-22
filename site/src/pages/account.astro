@@ -2,7 +2,7 @@
 import Base from "../layouts/Base.astro";
 import { crossSite, currentUser, isSameOrigin } from "../lib/auth.ts";
 import { normalizeShareCode } from "../lib/codes.ts";
-import { deleteProfile, deleteTokenForUser, listProfiles, listTokens } from "../lib/db.ts";
+import { deleteProfile, deleteTokenForUser, InvalidProfilePageError, listProfiles, listTokens } from "../lib/db.ts";
 import { appEnv, siteOrigin } from "../lib/env.ts";
 
 export const prerender = false;
@@ -26,7 +26,14 @@ if (Astro.request.method === "POST") {
 }
 
 const origin = siteOrigin(Astro.request);
-const shares = await listProfiles(env.DB, user.id);
+let page;
+try {
+  page = await listProfiles(env.DB, user.id, { cursor: Astro.url.searchParams.get("cursor") });
+} catch (err) {
+  if (err instanceof InvalidProfilePageError) return new Response(err.message, { status: 400 });
+  throw err;
+}
+const { shares, next_cursor } = page;
 const tokens = await listTokens(env.DB, user.id);
 const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
 ---
@@ -53,13 +60,14 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
         <h2>Shared profiles</h2>
         <p class="muted">
           Each is reachable only by its code. Sharing a profile again from the CLI updates it under the same
-          code; revoking one here stops its link immediately.
+          code; revoking one here stops its link immediately. You can share up to 100 profiles
+          and 5 MiB of profile data per account.
         </p>
       </div>
       {
         shares.length === 0 ? (
           <div class="card empty">
-            <p>Nothing shared yet.</p>
+            <p>{Astro.url.searchParams.has("cursor") ? "No more shared profiles." : "Nothing shared yet."}</p>
             <p class="muted">
               Run <code>baton profile share</code> in a terminal that is signed in as you. <a href="/docs/sharing">How sharing works</a>
             </p>
@@ -102,6 +110,12 @@ const day = (iso: string | null) => (iso ? iso.slice(0, 10) : "never");
           </div>
         )
       }
+      {(Astro.url.searchParams.has("cursor") || next_cursor) && (
+        <nav class="row" aria-label="Shared profile pages">
+          {Astro.url.searchParams.has("cursor") && <a class="btn btn-sm" href="/account">Newest profiles</a>}
+          {next_cursor && <a class="btn btn-sm" href={`/account?cursor=${encodeURIComponent(next_cursor)}`}>Older profiles</a>}
+        </nav>
+      )}
     </section>
 
     <section class="stack">
