@@ -23,8 +23,6 @@ const KILL_GRACE_MS = 5_000;
 /** Overall budget for a group to be verifiably dead, SIGTERM to last poll. */
 const KILL_DEADLINE_MS = 10_000;
 const KILL_POLL_MS = 100;
-/** Head of stdout kept beside the tail, so a first-line session id survives the cap. */
-const SESSION_HEAD_BYTES = 64 * 1024;
 const STDERR_IN_ERROR_CHARS = 500;
 /** How much of a terminal error event is quoted in the extraction error. */
 const ERROR_EVENT_CHARS = 500;
@@ -33,7 +31,10 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
   const started = Date.now();
   const cap = req.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const stdout = new Tail(cap);
-  const stdoutHead = new Head(SESSION_HEAD_BYTES);
+  const answer = req.spec.invoke.extract.kind === "jsonl"
+    ? new JsonlCapture(req.spec.invoke.extract) : undefined;
+  const session = req.spec.sessionRef?.kind === "jsonl"
+    ? new JsonlCapture(req.spec.sessionRef) : undefined;
   const stderr = new Tail(cap);
   const json = req.spec.invoke.extract.kind === "json" || req.spec.sessionRef?.kind === "json"
     ? new Head(MAX_JSON_OUTPUT_BYTES) : undefined;
@@ -117,8 +118,8 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
           buildResult({
             req,
             stdout: stdout.text(),
-            stdoutHead: stdoutHead.text(),
-            stdoutTruncated: stdout.truncated,
+            answer: answer?.finish(),
+            session: session?.finish(),
             json: json?.text(),
             jsonTruncated: json?.truncated ?? false,
             workStarted: stdoutWork.matched || stderrWork.matched,
@@ -137,7 +138,8 @@ export async function executeAdapter(req: ExecRequest): Promise<ExecResult> {
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout.push(chunk);
-      stdoutHead.push(chunk);
+      answer?.push(chunk);
+      session?.push(chunk);
       json?.push(chunk);
       stdoutWork.push(chunk);
     });
@@ -210,9 +212,8 @@ function buildArgv(req: ExecRequest, flags: string[]): string[] {
 interface Outcome {
   req: ExecRequest;
   stdout: string;
-  /** First SESSION_HEAD_BYTES of stdout, kept for sessionRef extraction. */
-  stdoutHead: string;
-  stdoutTruncated: boolean;
+  answer?: Extracted;
+  session?: Extracted;
   json?: string;
   jsonTruncated: boolean;
   workStarted: boolean;
@@ -227,14 +228,8 @@ interface Outcome {
 
 function buildResult(o: Outcome): ExecResult {
   const rawTail = o.stderr ? `${o.stdout}\n--- stderr ---\n${o.stderr}` : o.stdout;
-  // Best-effort and outcome-independent: a session id is most valuable on the
-  // runs that did not finish, which are exactly the ones we may want to resume.
-  // Verbose runs push the session line (typically the first) out of the tail,
-  // so search head+tail — the answer still comes from the tail alone.
-  const sessionSource = o.req.spec.sessionRef?.kind === "json"
-    ? (o.jsonTruncated ? "" : o.json ?? o.stdout)
-    : o.stdoutTruncated ? `${o.stdoutHead}\n${o.stdout}` : o.stdout;
-  const session = o.req.spec.sessionRef && extract(o.req.spec.sessionRef, sessionSource);
+  const session = o.session ?? (o.req.spec.sessionRef && extract(o.req.spec.sessionRef,
+    o.req.spec.sessionRef.kind === "json" ? (o.jsonTruncated ? "" : o.json ?? o.stdout) : o.stdout));
   const base = {
     // A spawn error means the process never ran; anything else got that far.
     started: !o.spawnError,
@@ -264,7 +259,7 @@ function buildResult(o: Outcome): ExecResult {
   if (o.req.spec.invoke.extract.kind === "json" && o.jsonTruncated) {
     return { ...base, ok: false, error: `JSON output exceeded ${MAX_JSON_OUTPUT_BYTES} bytes; ask the callee to save large results to a file.` };
   }
-  const extracted = extract(o.req.spec.invoke.extract,
+  const extracted = o.answer ?? extract(o.req.spec.invoke.extract,
     o.req.spec.invoke.extract.kind === "json" ? o.json ?? o.stdout : o.stdout);
   if (!extracted.ok) {
     return { ...base, ok: false, error: `extraction failed: ${extracted.why}` };
@@ -290,53 +285,78 @@ function extract(spec: ExtractSpec, stdout: string): Extracted {
       return finalize(stringify(value));
     }
     case "jsonl": {
-      const records = parseJsonl(stdout);
-      if (records.length === 0) return { ok: false, why: "no parseable JSON lines in stdout" };
-      if (spec.errorWhen) {
-        // Checked before the answer is picked: apps that stream text and then
-        // fail upstream exit 0 with a usable-looking last text part.
-        const { path, equals } = spec.errorWhen;
-        const failed = records.find((r) => {
-          const v = dotPath(r, path);
-          return v !== undefined && String(v) === equals;
-        });
-        if (failed !== undefined) {
-          return { ok: false, why: `error event: ${clip(stringify(failed), ERROR_EVENT_CHARS)}` };
-        }
-      }
-      let matches = records;
-      if (spec.where) {
-        const { path, equals } = spec.where;
-        matches = records.filter((r) => {
-          const v = dotPath(r, path);
-          return v !== undefined && String(v) === equals;
-        });
-        if (matches.length === 0) {
-          return { ok: false, why: `no JSONL record where ${path} == ${equals}` };
-        }
-      }
-      const record = spec.take === "first" ? matches[0] : matches[matches.length - 1];
-      const value = dotPath(record, spec.path);
-      if (value === undefined) {
-        return { ok: false, why: `path "${spec.path}" missing in ${spec.take} matching JSONL record` };
-      }
-      return finalize(stringify(value));
+      const capture = new JsonlCapture(spec);
+      capture.push(Buffer.from(stdout));
+      return capture.finish();
     }
   }
 }
 
-function parseJsonl(stdout: string): unknown[] {
-  const out: unknown[] = [];
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      out.push(JSON.parse(trimmed));
-    } catch {
-      // Agent CLIs interleave banners with their JSONL; skip unparseable lines.
+/** Keeps the selected value and any error independently of the diagnostic tail. */
+class JsonlCapture {
+  private readonly decoder = new StringDecoder("utf8");
+  private line = "";
+  private bytes = 0;
+  private dropping = false;
+  private sawRecord = false;
+  private selected?: Extracted;
+  private failure?: string;
+
+  constructor(private readonly spec: Extract<ExtractSpec, { kind: "jsonl" }>) {}
+
+  push(chunk: Buffer): void {
+    this.consume(this.decoder.write(chunk));
+  }
+
+  finish(): Extracted {
+    this.consume(this.decoder.end());
+    if (this.line) this.record(this.line);
+    this.line = "";
+    if (this.failure) return { ok: false, why: this.failure };
+    if (!this.sawRecord) return { ok: false, why: "no parseable JSON lines in stdout" };
+    if (this.selected) return this.selected;
+    const where = this.spec.where;
+    return { ok: false, why: where
+      ? `no JSONL record where ${where.path} == ${where.equals}`
+      : "no matching JSONL record" };
+  }
+
+  private consume(text: string): void {
+    for (const [index, fragment] of text.split("\n").entries()) {
+      if (index > 0) {
+        if (!this.dropping) this.record(this.line);
+        this.line = "";
+        this.bytes = 0;
+        this.dropping = false;
+      }
+      if (this.dropping) continue;
+      this.bytes += Buffer.byteLength(fragment);
+      if (this.bytes > MAX_JSON_OUTPUT_BYTES) {
+        this.failure ??= `JSONL record exceeded ${MAX_JSON_OUTPUT_BYTES} bytes; ask the callee to save large results to a file.`;
+        this.line = "";
+        this.dropping = true;
+      } else this.line += fragment;
     }
   }
-  return out;
+
+  private record(line: string): void {
+    let record: unknown;
+    try { record = JSON.parse(line); } catch { return; }
+    this.sawRecord = true;
+    const matches = (condition: { path: string; equals: string }): boolean => {
+      const value = dotPath(record, condition.path);
+      return value !== undefined && String(value) === condition.equals;
+    };
+    if (this.spec.errorWhen && matches(this.spec.errorWhen)) {
+      this.failure ??= `error event: ${clip(stringify(record), ERROR_EVENT_CHARS)}`;
+    }
+    if (this.spec.where && !matches(this.spec.where)) return;
+    if (this.spec.take === "first" && this.selected) return;
+    const value = dotPath(record, this.spec.path);
+    this.selected = value === undefined
+      ? { ok: false, why: `path "${this.spec.path}" missing in ${this.spec.take} matching JSONL record` }
+      : finalize(stringify(value));
+  }
 }
 
 /** Dot-path over nested objects; numeric segments index arrays. */
@@ -418,7 +438,7 @@ async function waitForDeath(pid: number, until: number, pollMs: number): Promise
 }
 
 /** ESRCH is the only answer that proves the group is gone; EPERM means alive. */
-function groupAlive(pid: number): boolean {
+export function groupAlive(pid: number): boolean {
   try {
     process.kill(-pid, 0);
     return true;

@@ -703,3 +703,56 @@ describe("errorWhen", () => {
     expect(res.output).toBe("last message");
   });
 });
+
+describe("streaming JSONL retention", () => {
+  async function streamed(lines: unknown[], take: "first" | "last" = "last") {
+    const req = request({
+      mode: "unused",
+      maxOutputBytes: 256,
+      extract: {
+        kind: "jsonl", where: { path: "type", equals: "text" }, path: "text", take,
+        errorWhen: { path: "type", equals: "error" },
+      },
+      sessionRef: { kind: "jsonl", where: { path: "type", equals: "session" }, path: "id", take: "first" },
+    });
+    req.spec.invoke.argv = ["-e", `
+      for (const line of ${JSON.stringify(lines)}) {
+        await Bun.write(Bun.stdout, JSON.stringify(line) + '\\n');
+      }
+      for (let i = 0; i < 300; i++) await Bun.write(Bun.stdout, JSON.stringify({noise:'x'.repeat(8192)}) + '\\n');
+    `];
+    return executeAdapter(req);
+  }
+
+  test("retains an early terminal error after megabytes of diagnostics", async () => {
+    const res = await streamed([{ type: "error", message: "upstream rejected" }, { type: "text", text: "partial" }]);
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("upstream rejected");
+    expect(res.rawTail).not.toContain("upstream rejected");
+  });
+
+  test("retains selected answers and session ids after they leave both head and tail", async () => {
+    const noise = { type: "noise", text: "x".repeat(70_000) };
+    const lines = [noise, { type: "session", id: "session-middle" }, { type: "text", text: "first answer" }, { type: "text", text: "last answer" }];
+    const first = await streamed(lines, "first");
+    expect(first.output).toBe("first answer");
+    expect(first.sessionRef).toBe("session-middle");
+    const last = await streamed(lines);
+    expect(last.output).toBe("last answer");
+    expect(last.sessionRef).toBe("session-middle");
+  });
+
+  test("parses split UTF-8 and a final line without a newline", async () => {
+    const req = request({ mode: "unused", extract: { kind: "jsonl", path: "text", take: "last" } });
+    req.spec.invoke.argv = ["-e", `const bytes=Buffer.from(JSON.stringify({text:'☃ final'}));for(const byte of bytes){await Bun.write(Bun.stdout,Buffer.from([byte]));await Bun.sleep(1);}`];
+    expect((await executeAdapter(req)).output).toBe("☃ final");
+  });
+
+  test("oversized records fail explicitly instead of silently losing errors", async () => {
+    const req = request({ mode: "unused", extract: { kind: "jsonl", path: "text", take: "last" } });
+    req.spec.invoke.argv = ["-e", `await Bun.write(Bun.stdout,JSON.stringify({text:'x'.repeat(17*1024*1024)})+'\\n');await Bun.write(Bun.stdout,JSON.stringify({text:'partial'}));`];
+    const res = await executeAdapter(req);
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("JSONL record exceeded");
+  });
+});
