@@ -112,8 +112,8 @@ export function priorEntriesOf(doc: ProfileDocument): PriorEntry[] {
 
 /**
  * What `importProfileFile` would change, without writing. It resolves the same
- * entries, provenance and clock as the commit does, so the confirmation a user
- * approves against is the diff they actually get — a preview blind to `as_of`
+ * entries, provenance and clock as the commit does, so an optional preview
+ * matches the actual import — a preview blind to `as_of`
  * or source would call a restamped entry unchanged and then change it anyway.
  */
 export function diffProfileDocument(

@@ -143,8 +143,7 @@ const MIGRATIONS: string[] = [
   // which process owns an in-flight attempt before declaring it abandoned.
   `ALTER TABLE attempts ADD COLUMN owner_pid INTEGER;`,
   // v5 — blind duels + decayed Bradley-Terry edge map, and the
-  // quarantine store for agentically discovered adapters. Approval precedes
-  // execution.
+  // legacy registration store. The approval lifecycle is removed in v11.
   `
   CREATE TABLE duels (
     id          TEXT PRIMARY KEY,
@@ -256,6 +255,22 @@ const MIGRATIONS: string[] = [
     WHERE a.status IN ('queued','running') AND origin.session_ref IS NOT NULL
       AND origin.seq = (SELECT MAX(seq) FROM attempts WHERE run_id = origin.run_id);
   `,
+  // v11: registration is usable immediately; diagnostics are informational.
+  `CREATE TABLE discovered_adapters_next (
+    app TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled','disabled')),
+    submitted_at TEXT NOT NULL,
+    tested_at TEXT,
+    test_passed INTEGER CHECK (test_passed IN (0,1)),
+    binary_version TEXT,
+    notes TEXT
+  );
+  INSERT INTO discovered_adapters_next (app,spec,status,submitted_at,binary_version)
+    SELECT app,spec,CASE WHEN status='rejected' THEN 'disabled' ELSE 'enabled' END,submitted_at,binary_version
+    FROM discovered_adapters;
+  DROP TABLE discovered_adapters;
+  ALTER TABLE discovered_adapters_next RENAME TO discovered_adapters;`,
 ];
 
 /** Ring-buffer cap on retained runs: about 2,000. */

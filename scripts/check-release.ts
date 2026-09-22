@@ -37,10 +37,15 @@ function run(...args: string[]): string {
 try {
   if (run("--version").trim() !== pkg.version)
     throw new Error("Binary version differs from package.json");
-  for (const args of [["--help"], ["install", "--help"], ["update", "--help"], ["mcp", "--help"]]) {
+  for (const [args, expected] of [
+    [["--help"], "baton update"],
+    [["install", "--help"], "--user"],
+    [["update", "--help"], "baton update"],
+    [["mcp", "--help"], "baton mcp"],
+  ] as const) {
     const help = run(...args);
-    if (!help.includes("--user") || !help.includes("baton update"))
-      throw new Error("Missing documented commands");
+    if (!help.includes(expected))
+      throw new Error(`Missing command help for ${args.join(" ")}`);
   }
   run("install", "claude-code", "codex", "kimi", "opencode", "cursor-agent", "--user");
   const config = readFileSync(join(dir, ".codex/config.toml"), "utf8");

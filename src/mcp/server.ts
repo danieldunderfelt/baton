@@ -4,10 +4,10 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 
-import { executeAdapter, killProcessGroup } from "../adapters/executor.ts";
 import type { Autonomy } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
 import { discoveryBrief, listDiscovered, submitSpec } from "../discovery/discovery.ts";
+import { setAdapterEnabled, testAdapter } from "../discovery/diagnostics.ts";
 import { blindDuelOf, btRatings, reportDuel, startDuel } from "../eval/duels.ts";
 import {
   DEFAULT_PRIOR_WEIGHT,
@@ -15,11 +15,11 @@ import {
   recordGrade,
   seedPriors,
 } from "../eval/evalStore.ts";
-import { publishRatings, ratingsPath, repairProjection, snapshotRatings } from "../eval/publish.ts";
+import { snapshotRatings } from "../eval/publish.ts";
 import { PRIOR_WEIGHT_CAP } from "../eval/types.ts";
-import { detectApps, knownModels, listModels, routableAdapters } from "../registry/registry.ts";
+import { detectApps, knownModels, listModels } from "../registry/registry.ts";
 import { nowIso, openStore } from "../store/store.ts";
-import { createSupervisor, type AdapterExec, type Supervisor } from "../supervisor/supervisor.ts";
+import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
 import type { RunOptions, RunRequest, RunView } from "../supervisor/types.ts";
 
 /**
@@ -30,17 +30,7 @@ import type { RunOptions, RunRequest, RunView } from "../supervisor/types.ts";
  * and `get_run` polls it, which is what keeps this server stateless at its own
  * layer even while the SDK's session transport is not.
  *
- * The evaluation loop includes `report_result` (consumer grades after *using*
- * the answer), `seed_ratings` and `get_ratings`. Blind duels
- * (`run_duel`/`report_duel`), session continuation (`resume_run`) and agentic
- * discovery (`discover_app`/`register_app`) use the same domain layers. None of
- * these tools own
- * domain logic: they resolve arguments to what the eval store, the supervisor
- * or the quarantine store needs, commit, and republish the ratings projection.
- *
- * The one line discovery must never cross: **approval is CLI-only.** No tool
- * here can approve, canary or activate a discovered adapter — `register_app`
- * quarantines, and a human runs `baton adapters review <app>`.
+ * Tool handlers delegate to the registry, supervisor, discovery and evaluation stores.
  */
 
 const NAME = "baton";
@@ -50,24 +40,18 @@ const VERSION = pkg.version;
 
 /**
  * Ceiling on how long one blocking tool call may hold the host, whatever the
- * run is doing. It bounds the *call*, never the run: a run has no deadline
- * unless the caller set one, and a call that returns 'running' is re-waited
+ * run is doing. It bounds the *call*, independently of a caller or adapter
+ * deadline. A call that returns 'running' is re-waited
  * with get_run wait:true.
  */
 const MAX_WAIT_MS = 600_000;
 /** Slack so the wait outlives a caller-set timeout and reports the timeout status. */
 const WAIT_MARGIN_MS = 5_000;
 /**
- * Caller-side cache hint only — Baton caches nothing, every call re-reads PATH.
- * It says how long the answer is worth reusing, not how stale it may be served.
+ * Caller-side reuse hint. Each call reads scope state; the registry separately
+ * caches account catalogs and binary versions.
  */
 const LIST_MODELS_TTL_MS = 60_000;
-/**
- * Shutdown kill budget. Hosts give a stdio server a few seconds after EOF or
- * SIGTERM before SIGKILLing it, so the escalation has to fit inside that.
- */
-const SHUTDOWN_KILL = { graceMs: 1_500, deadlineMs: 4_000 };
-
 /** Object form so the enum stays exhaustive against Autonomy at compile time. */
 const AUTONOMY = {
   readonly: "readonly",
@@ -95,21 +79,10 @@ export interface McpRuntime {
 export function createMcpRuntime(): McpRuntime {
   const paths = ensurePaths(resolvePaths(process.env));
   const db = openStore(paths.dbPath);
-  // Startup repair handles a stale projection: a
-  // publisher that died mid-flight, or a config dir restored from elsewhere,
-  // leaves ratings.yaml disagreeing with SQLite. Never fatal — routing reads
-  // SQLite, so a broken projection must not stop the server from serving.
-  try {
-    repairProjection(db, paths.configDir);
-  } catch (err) {
-    console.error(`baton: could not repair ${ratingsPath(paths.configDir)}: ${message(err)}`);
-  }
-  const livePids = new Set<number>();
   const supervisor = createSupervisor({
     db,
     env: process.env,
     hostCwd: process.cwd(),
-    exec: trackingExec(livePids),
   });
 
   // A concurrent second shutdown awaits the first rather than racing past it:
@@ -123,12 +96,7 @@ export function createMcpRuntime(): McpRuntime {
   };
 
   async function disposeOnce(closeTransport?: () => Promise<void>): Promise<void> {
-    // Mark the runs cancelled, then confirm the callees are actually gone:
-    // supervisor.cancelRun only sends SIGTERM and schedules an unref'd SIGKILL,
-    // which a process on its way out never fires (sol#1). Exiting here without
-    // waiting is how "shutdown" leaves agent CLIs running unsupervised.
-    supervisor.shutdown();
-    await Promise.all([...livePids].map((pid) => killProcessGroup(pid, SHUTDOWN_KILL)));
+    await supervisor.shutdown();
     try {
       await closeTransport?.();
     } catch {
@@ -160,23 +128,6 @@ export async function serveMcp(): Promise<void> {
   // stdin keeps the loop alive; shutdown() is the only exit.
 }
 
-/** The executor, with each spawned process group recorded so shutdown can end it. */
-function trackingExec(livePids: Set<number>): AdapterExec {
-  return (req, hooks) => {
-    let pid: number | undefined;
-    return executeAdapter({
-      ...req,
-      onSpawn: (spawned) => {
-        pid = spawned;
-        livePids.add(spawned);
-        hooks?.onSpawn?.(spawned);
-      },
-    }).finally(() => {
-      if (pid !== undefined) livePids.delete(pid);
-    });
-  };
-}
-
 function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): McpServer {
   const server = new McpServer({ name: NAME, version: VERSION }, { capabilities: { tools: {} } });
 
@@ -185,39 +136,22 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
     {
       title: "List delegatable models",
       description:
-        "Models this Baton scope can delegate to, with the app that would run each one and whether that app's binary is on PATH right now (unavailable entries are listed so you can see what is missing). " +
-        "A model that cannot be used right now carries degradedReason (its app's binary is not on PATH, this scope's authority ceiling is one the adapter cannot express, or the user has blocked that route — a standing 'never spend this' decision, liftable only by them in their terminal, never by a tool call). " +
-        "Also reports the scope: Baton's world is partitioned by BATON_CONFIG_DIR, so a scope only knows the instances, settings and evidence its own config dir defines. " +
-        "scores keeps provenance visible instead of merging it: observed (your own graded runs, decayed, worth nEff observations), prior (the active profile's seeded or imported opinion), and blended — what selection ranks on. rating is 'unrated' until either exists; grade runs with report_result to make it move. " +
-        "pool, where an app has one, is the per-instance quota view selection spreads across: headroom 1 = untouched, and coolingUntil marks an instance parked after an admission failure. maxAutonomy is this scope's user-owned ceiling for that app. " +
-        "A discovered app the user approved and canaried lists its routes exactly like a built-in; one that is still quarantined, awaiting a canary or stale appears too, but unavailable, with the command that would fix it in degradedReason. quarantined_apps is the same set summarised: Baton has executed nothing from those specs, and only the user can change that — 'baton adapters review <app>' in their terminal, never a tool call. " +
-        "Order is deterministic (model, then app). Nothing is cached server-side — every call re-reads PATH — so ttlMs is only a hint for how long you may reuse this answer yourself; call again after installing an app.",
+        "List models, availability, supported permissions, account pools and ratings in this Baton scope. " +
+        "Catalogs use each account's environment and a short-lived cache. Registered adapters are ready immediately; diagnostics are optional. " +
+        "degradedReason explains unavailable routes. observed and prior scores stay separate; blended is the routing score. Headroom estimates only usage Baton observed.",
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    () =>
-      json({
-        ttlMs: LIST_MODELS_TTL_MS,
-        scope: { scoped: paths.scoped, configDir: paths.configDir },
-        apps: detectApps({ probeVersion: false, db }).map((a) => ({
-          app: a.app,
-          available: a.binaryPath !== null,
-          binaryPath: a.binaryPath,
-        })),
-        models: listModels(db),
-        // Active ones are routes; a rejected one is a decision the user already
-        // made, not something still waiting on them.
-        quarantined_apps: listDiscovered(db)
-          .filter((d) => d.status !== "active" && d.status !== "rejected")
-          .map((d) => ({
-            app: d.app,
-            status: d.status,
-            nextStep:
-              d.status === "quarantined"
-                ? `baton adapters review ${d.app}`
-                : `baton adapters canary ${d.app}`,
-            ...(d.notes === undefined ? {} : { notes: d.notes }),
-          })),
-      }),
+    async () => json({
+      ttlMs: LIST_MODELS_TTL_MS,
+      scope: { scoped: paths.scoped, configDir: paths.configDir },
+      apps: (await detectApps({ probeVersion: false, db })).map(app => ({
+        app: app.app, available: app.binaryPath !== null, binaryPath: app.binaryPath,
+      })),
+      models: await listModels(db),
+      registered_apps: listDiscovered(db).map(record => ({
+        app: record.app, status: record.status, diagnostic: record.diagnostic,
+      })),
+    }),
   );
 
   server.registerTool(
@@ -226,12 +160,12 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       title: "Delegate a task to another model",
       description:
         "Hand a prompt to a model running in another agent CLI on this machine, using that app's own subscription. Always returns a run_id handle. " +
-        "A run has no time limit: the callee works until it finishes, however long that takes. " +
+        "Built-in adapters have no default time limit. A caller or registered adapter may set a deadline. " +
         "wait (default true) blocks until the run finishes and inlines output. One call blocks for at most ten minutes; a status of 'running' means only that this call's wait is over, not that anything timed out — call get_run with wait:true to keep waiting. " +
         "wait:false returns as soon as the run is launched — that plus get_run is the polling path for long tasks, and the polite way to keep several delegations in flight without holding a call open. " +
         "idempotency_key is retry-safe and payload-bound: the same key with the same request returns the existing run (deduplicated:true) instead of launching a second one, so a transport retry cannot double-spend quota; the same key with a changed prompt, cwd or options is an error, so use a NEW key for anything you actually changed. " +
         "cwd defaults to this host's working directory; pointing the delegated agent at another checkout is allowed and deliberate — note that concurrent delegates mutating the same checkout can conflict. " +
-        "options.autonomy narrows what the callee may do (readonly | edits | full); it can only narrow the user's per-app ceiling, never raise it. options.timeoutMs is the only deadline a run can have, and only if you set it. " +
+        "options.autonomy selects what the callee may do (readonly | edits | full), within the user's per-app ceiling. options.timeoutMs overrides an adapter's optional default deadline. Resolved options are returned with the run. " +
         "Errors (unknown model, no installed app for it, a route the user has blocked, delegation-depth refusal) come back as tool errors, not as a failed run; a block names itself in the message and is not something to route around — pick another model.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       inputSchema: z.object({
@@ -299,7 +233,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       settled.catch(() => {}); // outcomes are recorded in SQLite; nothing to handle here
       if (!args.wait) return json(summary(view));
 
-      const settledView = await supervisor.waitForRun(view.runId, waitBudget(db, view, req.options));
+      const settledView = await supervisor.waitForRun(view.runId, waitBudget(view));
       return json(summary({ ...settledView, deduplicated: view.deduplicated }));
     },
   );
@@ -312,7 +246,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Full state of a run started by run_model: status (queued | running | succeeded | failed | timeout | cancelled | orphaned), the extracted output once it succeeded, the error otherwise, and the per-attempt detail. " +
         "attempts is the failover chain: an instance that refuses admission (rate limit or auth, before the callee started work) hands the run to the next instance in its pool under the same run_id, so several attempts can appear and the last one is the answer. " +
         "A side of an unjudged duel answers with blind:true and its duel_id instead: status, output and timing only, because model, app, instance and the attempt targets are exactly what report_duel is withholding. Report the duel and the full detail is there. " +
-        "This is the polling half of wait:false, and the way to keep waiting on a long run: wait:true blocks for up to ten minutes more and returns as soon as the run settles. A run has no time limit, so a 'running' answer just means call again. " +
+        "This is the polling half of wait:false, and the way to keep waiting on a long run: wait:true blocks for up to ten minutes more and returns as soon as the run settles. A 'running' answer means call again; it does not mean the run timed out. " +
         "Handles are scope-local: a run_id only resolves in the scope that minted it.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: z.object({
@@ -345,7 +279,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         "Affinity is not optional: the resumed turn goes back to the exact app, model and instance that answered the first time, because the session lives in that instance's config dir. It cannot fail over to another account or another route; if that instance is unusable right now, the resume fails rather than continuing someone else's session. " +
         "Only a settled run can be resumed (a still-running one still owns its session), only an app whose adapter declares a non-interactive resume, and only a run whose attempt actually reported a session handle — otherwise you get a tool error saying which of those it was. Start a fresh run_model with the context it needs when resume is refused. " +
         "A side of an unjudged duel cannot be resumed either: you are its judge, and a follow-up turn would show you which app answered. Report the duel first. " +
-        "options may narrow what the original run resolved (autonomy, timeoutMs); the scope's ceiling still clamps it. cwd and category are inherited from the original run and cannot be changed.",
+        "options may change autonomy or timeoutMs for this turn; the scope's current ceiling still clamps autonomy. Omitted options inherit the previous turn. cwd and category are inherited.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       inputSchema: z.object({
         run_id: z
@@ -370,7 +304,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
               .positive()
               .optional()
               .describe(
-                "Kill the callee after this long. Never longer than the original run's bound; unbounded, like the original, when unset.",
+                "Kill the callee after this long. Omit to inherit the previous turn's bound.",
               ),
           })
           .optional(),
@@ -392,7 +326,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       });
       settled.catch(() => {}); // outcomes are recorded in SQLite; nothing to handle here
       if (!wait) return json(summary(view));
-      return json(summary(await supervisor.waitForRun(view.runId, waitBudget(db, view, options))));
+      return json(summary(await supervisor.waitForRun(view.runId, waitBudget(view))));
     },
   );
 
@@ -440,7 +374,6 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         model: graded.model,
         runAt: graded.runAt,
       });
-      publishQuietly(db, paths.configDir);
       return json({
         run_id,
         grade,
@@ -448,7 +381,6 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         category: graded.category,
         target: graded.target,
         revision,
-        ratingsFile: ratingsPath(paths.configDir),
       });
     },
   );
@@ -531,8 +463,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
     },
     ({ duel_id, winner }) => {
       const view = reportDuel(db, duel_id, winner);
-      publishQuietly(db, paths.configDir);
-      return json({ ...view, ratingsFile: ratingsPath(paths.configDir) });
+      return json(view);
     },
   );
 
@@ -542,7 +473,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       title: "Seed rating priors from what the user already believes",
       description:
         "Record the user's own ranking of these models as a prior profile, so routing starts from their opinion instead of from nothing. " +
-        "You propose, the user approves: ask first, then send what they agreed to — the normalized entries come back exactly as committed, so you can show them what landed. " +
+        "Seeding is optional. Record preferences the user has provided; no separate confirmation or interview is required. " +
         "category defaults to '' (any work); seed per-category entries when the user distinguishes them ('kimi-k3 is a 4 for implementation, a 2 for review'). Speed and cost are NOT quality — do not fold them into mean. " +
         `weight is in pseudo-observations, defaults to ${DEFAULT_PRIOR_WEIGHT} and is capped at ${PRIOR_WEIGHT_CAP}, so a wrong seed cannot steer routing for months; observed grades outweigh it as they accumulate. ` +
         "Only canonical model ids from list_models are accepted, and re-seeding a (profile, model, category) replaces that entry. The first seeded profile becomes the active one.",
@@ -569,11 +500,11 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
             }),
           )
           .min(1)
-          .describe("The proposed priors, as confirmed by the user."),
+          .describe("Model quality preferences to record."),
       }),
     },
-    ({ profile_name, entries }) => {
-      const known = knownModels(db);
+    async ({ profile_name, entries }) => {
+      const known = await knownModels(db);
       const unknown = entries.map((e) => e.model).filter((m) => !known.includes(m));
       if (unknown.length > 0) {
         throw new Error(
@@ -581,16 +512,11 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         );
       }
       const seeded = seedPriors(db, profile_name, entries);
-      publishQuietly(db, paths.configDir);
       return json({
         profile: profile_name,
         activeProfile: activeProfile(db),
         revision: seeded.revision,
-        // The store's own answer, defaults and cap applied — this is the
-        // confirmation the user approves against, so it
-        // must not be a second derivation of the same rules.
         entries: seeded.entries,
-        ratingsFile: ratingsPath(paths.configDir),
       });
     },
   );
@@ -601,7 +527,7 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
       title: "Current ratings in this scope",
       description:
         "What this scope currently believes about each model, per category, with provenance kept separate: observed (your graded runs, decayed, worth n_eff observations), prior (the active profile's seed or import, and its source), and blended — the number selection ranks on. " +
-        "revision is monotonic and bumps on every grade, seed or duel verdict; ratings.yaml in this scope's config dir carries the same number as source_revision, and is a generated view only — Baton never reads it back. Order is deterministic (model, then category). " +
+        "revision changes on each grade, seed or duel verdict. Export a snapshot with 'baton ratings export'. Order is deterministic (model, then category). " +
         "bt is a SECOND, independent signal: the regularized Bradley-Terry fit over report_duel verdicts, shrunk toward the active profile's priors. theta is relative log-strength within a category (0 is the middle of the field, +0.5 is roughly a 62% chance of winning a duel), se is how sure that is, nEff is how much decayed comparison mass is behind it. " +
         "It is deliberately NOT merged into blended — grades say how useful an answer was, duels say which of two answers was better, and mixing them would double-count the same runs. A model with a prior but no duels still appears, sitting on its prior with a wide se; an empty bt just means nobody has run a duel in this scope yet.",
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -614,7 +540,6 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         profileWeight: snapshot.profileWeight,
         ratings: snapshot.rows,
         bt: btRatings(db),
-        ratingsFile: ratingsPath(paths.configDir),
       });
     },
   );
@@ -641,18 +566,17 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
   server.registerTool(
     "register_app",
     {
-      title: "Submit a discovered adapter spec for review",
+      title: "Register an agent CLI",
       description:
-        "Submit the adapter spec you wrote from discover_app's brief. It is validated structurally and stored QUARANTINED: Baton executes NOTHING from it — not the binary, not a canary, not a run. " +
-        "Approval is CLI-only and there is deliberately no tool for it: the user runs 'baton adapters review <app>' in their own terminal, reads the exact executable, argv and env names you submitted, and approves. Only then does Baton run its canary and activate the adapter. Tell the user that command; do not claim the app is ready, and do not look for another tool to approve it — that hole is exactly what quarantine closes. " +
-        "Validation errors come back as a tool error listing every problem at once, so fix them all and resubmit. Resubmitting a spec re-quarantines it even if it was already approved, because approval is consent to one reviewed spec. " +
-        "Once active, the app's routes appear in list_models with provenance 'discovered' and are delegatable like any built-in.",
+        "Validate and save an adapter spec. New registrations are enabled immediately. " +
+        "Identical registrations change nothing; updates preserve an explicit disabled setting. " +
+        "Baton runs argument arrays directly, without a shell. Use test_app for an optional diagnostic.",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
       inputSchema: z.object({
         spec: z
           .record(z.string(), z.unknown())
           .describe(
-            "The adapter spec object, exactly per the JSON Schema in discover_app's brief: absolute binary, argv arrays, declarative extraction.",
+            "The adapter spec object, exactly per the JSON Schema in discover_app's brief: executable path or command name, argv arrays, declarative extraction.",
           ),
       }),
     },
@@ -670,13 +594,39 @@ function buildServer(paths: BatonPaths, db: Database, supervisor: Supervisor): M
         submittedAt: record.submittedAt,
         models: record.spec.models,
         binary: record.spec.binary,
-        nextStep: `baton adapters review ${record.app}`,
-        note:
-          `Quarantined: Baton has executed nothing from this spec. Ask the user to run 'baton adapters review ${record.app}' ` +
-          `and approve it there — approval is CLI-only, no tool can do it. After approval Baton runs its canary and activates the adapter.`,
+        changed: stored.changed,
       });
     },
   );
+
+  server.registerTool("test_app", {
+    title: "Test an adapter",
+    description: "Optional diagnostic run using the adapter's least permissive supported mode within this scope's ceiling. Uses the selected app's subscription. Failure leaves registration enabled.",
+    inputSchema: z.object({ app: z.string().min(1), instance: z.string().optional() }),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async ({ app, instance }) => json(await testAdapter(db, app, { instance })));
+
+  server.registerTool("set_app_enabled", {
+    title: "Enable or disable an adapter",
+    description: "Enable or disable a built-in or registered adapter in this scope.",
+    inputSchema: z.object({ app: z.string().min(1), enabled: z.boolean() }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, ({ app, enabled }) => {
+    setAdapterEnabled(db, app, enabled);
+    return json({ app, enabled });
+  });
+
+  server.registerTool("cancel_run", {
+    title: "Cancel a run",
+    description: "Request cancellation of a run, including one owned by another Baton process in this scope. Returns its current state; cancellation is terminal only after the child process has exited.",
+    inputSchema: z.object({ run_id: z.string().min(1) }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ run_id }) => {
+    supervisor.cancelRun(run_id);
+    const view = await supervisor.waitForRun(run_id, 10_000);
+    const duelId = blindDuelOf(db, run_id);
+    return json(duelId === undefined ? summary(view) : blindView(view, duelId));
+  });
 
   return server;
 }
@@ -735,32 +685,15 @@ function gradedAttempt(db: Database, runId: string, configDir: string): GradedAt
   };
 }
 
-/**
- * ratings.yaml is a derived projection: a failed publish must never fail the
- * commit it would have shown. The state is already in SQLite, and the next
- * publish — or the startup repair — catches the file up.
- */
-function publishQuietly(db: Database, configDir: string): void {
-  try {
-    publishRatings(db, configDir);
-  } catch (err) {
-    console.error(`baton: could not publish ${ratingsPath(configDir)}: ${message(err)}`);
-  }
-}
+
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * Never block longer than the callee can run, and never longer than the call
- * ceiling. The adapter is looked up through the registry, not the built-in
- * table: a discovered app's own timeout is as real as a pinned one's. With no
- * deadline anywhere (the default) the ceiling alone applies.
- */
-function waitBudget(db: Database, view: RunView, options: RunOptions | undefined): number {
-  const spec = routableAdapters(db).find((s) => s.app === view.app);
-  const deadline = options?.timeoutMs ?? spec?.defaultTimeoutMs ?? MAX_WAIT_MS;
+/** Bound the tool call using the run's actual resolved options. */
+function waitBudget(view: RunView): number {
+  const deadline = view.options?.timeoutMs ?? MAX_WAIT_MS;
   return Math.min(deadline, MAX_WAIT_MS) + WAIT_MARGIN_MS;
 }
 
@@ -801,12 +734,14 @@ function summary(view: RunView): Record<string, unknown> {
     model: view.model,
     app: view.app,
     instance: view.instance,
+    options: view.options,
+    ...(view.cancellationRequested ? { cancellationRequested: true } : {}),
     ...(view.deduplicated ? { deduplicated: true } : {}),
     // Said in the payload, not just the tool description: a caller reading
     // 'running' after a long wait must not report it as a time limit.
     ...(IN_FLIGHT.has(view.status)
       ? {
-          note: "Still running. The run has no time limit; only this call's wait ended. Call get_run with wait:true to keep waiting.",
+          note: "Still running; only this call's wait ended. Call get_run with wait:true to keep waiting.",
         }
       : {}),
     ...(view.output === undefined ? {} : { output: view.output }),

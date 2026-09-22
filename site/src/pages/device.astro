@@ -1,6 +1,6 @@
 ---
 import Base from "../layouts/Base.astro";
-import { crossSite, currentUser, isSameOrigin } from "../lib/auth.ts";
+import { currentUser, isSameOrigin } from "../lib/auth.ts";
 import { normalizeUserCode } from "../lib/codes.ts";
 import { approveDevice, pendingDevice } from "../lib/db.ts";
 import { appEnv } from "../lib/env.ts";

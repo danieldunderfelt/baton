@@ -50,6 +50,7 @@ describe("serveHttp", () => {
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
+        "cancel_run",
         "discover_app",
         "get_ratings",
         "get_run",
@@ -61,6 +62,8 @@ describe("serveHttp", () => {
         "run_duel",
         "run_model",
         "seed_ratings",
+        "set_app_enabled",
+        "test_app",
       ]);
     } finally {
       await client.close();

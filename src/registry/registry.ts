@@ -1,5 +1,4 @@
 import type { Database } from "bun:sqlite";
-import { statSync } from "node:fs";
 
 import {
   AUTONOMY_ORDER,
@@ -9,8 +8,7 @@ import {
   type RouteSpec,
 } from "../adapters/types.ts";
 import { builtinAdapters } from "../adapters/builtin/index.ts";
-import { activeDiscoveredSpecs, listDiscovered } from "../discovery/discovery.ts";
-import type { DiscoveredAdapter } from "../discovery/types.ts";
+import { activeDiscoveredSpecs } from "../discovery/discovery.ts";
 import { blend } from "../eval/decay.ts";
 import { effectiveRatings, targetRatings } from "../eval/evalStore.ts";
 import { candidatesFor, getPool } from "../quota/pools.ts";
@@ -27,6 +25,7 @@ import {
   type RouteBlock,
 } from "./blocks.ts";
 import { catalogOf, type Catalog } from "./catalog.ts";
+import { probeVersion, type ProbeEnv } from "./probes.ts";
 
 /**
  * Registry: canonical model → routes → execution target.
@@ -51,6 +50,8 @@ export interface DetectedApp {
 export interface Route {
   spec: AdapterSpec;
   slug: string;
+  /** Account restriction for models reported by only some instances. */
+  instances?: string[];
 }
 
 export interface Target extends Route {
@@ -94,6 +95,8 @@ export interface Considered {
 }
 
 export interface SelectOptions {
+  /** Restrict diagnostics or explicitly targeted work to this app. */
+  app?: string;
   /** Explicit instance argument: outranks pool balancing. */
   instance?: string;
   /** Selection time; injectable so quota windows are testable. */
@@ -139,6 +142,8 @@ export interface ModelListing {
   /** Per-instance quota view; present only where this app has a pool. */
   pool?: InstanceQuota[];
   maxAutonomy: Autonomy;
+  supportedAutonomies: Autonomy[];
+  catalogError?: string;
 }
 
 /**
@@ -157,105 +162,35 @@ function resolveBinary(binary: string): string | null {
  * included — otherwise `detect`/`list_models` would report an app roster that
  * contradicts the routes right beside it.
  */
-export function detectApps(opts: { probeVersion?: boolean; db?: Database } = {}): DetectedApp[] {
-  const probe = opts.probeVersion ?? true;
-  return routableAdapters(opts.db)
-    .map((spec) => {
+export async function detectApps(
+  opts: { probeVersion?: boolean; db?: Database } = {},
+): Promise<DetectedApp[]> {
+  const env = { ...process.env };
+  const apps = await Promise.all(
+    routableAdapters(opts.db).map(async (spec) => {
       const binaryPath = resolveBinary(spec.binary);
-      const version = binaryPath && probe ? probeVersion(binaryPath) : undefined;
-      return version ? { app: spec.app, binaryPath, version } : { app: spec.app, binaryPath };
-    })
-    .sort((a, b) => a.app.localeCompare(b.app));
+      const version =
+        binaryPath && opts.probeVersion !== false ? await probeVersion(binaryPath, env) : undefined;
+      return { app: spec.app, binaryPath, ...(version ? { version } : {}) };
+    }),
+  );
+  return apps.sort((a, b) => a.app.localeCompare(b.app));
 }
 
-const VERSION_PROBE_MS = 5_000;
-/** How long a probe survives when the binary cannot be stat'ed to revalidate it. */
-const VERSION_TTL_MS = 60_000;
-
-interface VersionEntry {
-  /** mtime+size of the file that was probed, or null when stat failed. */
-  stamp: string | null;
-  at: number;
-  version: string | undefined;
-}
-
-const versionCache = new Map<string, VersionEntry>();
-
-/** The identity of the file at this path right now, or null if it cannot be read. */
-function binaryStamp(binaryPath: string): string | null {
-  try {
-    const s = statSync(binaryPath);
-    return `${s.mtimeMs}:${s.size}`;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * `<binary> --version`, memoized per binary path — but revalidated against the
- * file's mtime and size, because Baton also runs as a long-lived daemon: an
- * upgrade replaces the binary under a live process, and a fingerprint carrying
- * the old version would file new evidence against a build that is gone
- * Where the stat fails the memo is time
- * bound instead (VERSION_TTL_MS) rather than kept forever.
- * Never throws: an app that will not answer is "unknown", not an error.
- */
-function probeVersion(binaryPath: string): string | undefined {
-  const stamp = binaryStamp(binaryPath);
-  const cached = versionCache.get(binaryPath);
-  if (
-    cached &&
-    (stamp === null ? Date.now() - cached.at < VERSION_TTL_MS : cached.stamp === stamp)
-  ) {
-    return cached.version;
-  }
-  let version: string | undefined;
-  try {
-    const res = Bun.spawnSync({
-      cmd: [binaryPath, "--version"],
-      stdout: "pipe",
-      stderr: "pipe",
-      timeout: VERSION_PROBE_MS,
-    });
-    version =
-      res.exitCode === 0 ? res.stdout.toString().trim().split("\n")[0]?.trim() || undefined : undefined;
-  } catch {
-    version = undefined;
-  }
-  versionCache.set(binaryPath, { stamp, at: Date.now(), version });
-  return version;
-}
-
-/** Unknown when unprobeable, and always one fingerprint segment: no `+`, no spaces. */
-const UNKNOWN_VERSION = "unknown";
-
-function appVersion(binaryPath: string): string {
-  const raw = probeVersion(binaryPath);
-  return raw ? raw.replace(/[^A-Za-z0-9._-]+/g, "-") : UNKNOWN_VERSION;
-}
-
-/**
- * The full execution-target identity a rating attaches to, minus the autonomy
- * the supervisor appends once authority is resolved. The app version is in it
- * because the same adapter against
- * a different build of the app is not interchangeable evidence.
- */
-export function targetFingerprint(
+export async function targetFingerprint(
   app: string,
   instance: string,
   slug: string,
   adapterVersion: number,
   binaryPath: string,
-): string {
-  return `${app}:${instance}/${slug}@a${adapterVersion}+v${appVersion(binaryPath)}`;
+  env: ProbeEnv = process.env,
+): Promise<string> {
+  const raw = await probeVersion(binaryPath, env);
+  const version = raw?.replace(/[^A-Za-z0-9._-]+/g, "-") ?? "unknown";
+  return `${app}:${instance}/${slug}@a${adapterVersion}+v${version}`;
 }
 
-/**
- * Adapter specs routable in this scope: the pinned built-ins plus the
- * discovered adapters a human approved and a canary activated. Everything else
- * a discovery submitted is inert here — that is the whole quarantine gate.
- * Without a db only built-ins are knowable.
- */
+/** Built-in adapters plus enabled registrations. */
 export function routableAdapters(db?: Database): AdapterSpec[] {
   return db ? [...builtinAdapters, ...activeDiscoveredSpecs(db)] : [...builtinAdapters];
 }
@@ -266,12 +201,15 @@ export function routableAdapters(db?: Database): AdapterSpec[] {
  * on its own models, so a model released after the adapter was written routes
  * without a Baton change. `listingError` says why that half is missing.
  */
-export function catalogFor(spec: AdapterSpec): Catalog {
-  return catalogOf(spec, resolveBinary(spec.binary));
+export async function catalogFor(
+  spec: AdapterSpec,
+  env: ProbeEnv = { ...process.env },
+): Promise<Catalog> {
+  return catalogOf(spec, resolveBinary(spec.binary), env);
 }
 
-export function routesOf(spec: AdapterSpec): RouteSpec[] {
-  return catalogFor(spec).routes;
+export async function routesOf(spec: AdapterSpec, env?: ProbeEnv): Promise<RouteSpec[]> {
+  return (await catalogFor(spec, env)).routes;
 }
 
 /**
@@ -281,10 +219,10 @@ export function routesOf(spec: AdapterSpec): RouteSpec[] {
  * quota, ratings and pool balancing have no say. Throws with the reason when
  * the route no longer exists in this scope, which is the honest answer.
  */
-export function targetFor(
+export async function targetFor(
   ref: { app: string; slug: string; instance: string },
   db?: Database,
-): Target {
+): Promise<Target> {
   const spec = routableAdapters(db).find((s) => s.app === ref.app);
   if (!spec) {
     throw new Error(
@@ -311,12 +249,13 @@ export function targetFor(
     slug: ref.slug,
     instance: ref.instance,
     binaryPath,
-    targetFingerprint: targetFingerprint(
+    targetFingerprint: await targetFingerprint(
       ref.app,
       ref.instance,
       ref.slug,
       spec.adapterVersion,
       binaryPath,
+      instanceEnvironment(db, spec.app, ref.instance),
     ),
   };
 }
@@ -332,25 +271,99 @@ export function targetFor(
  * `acceptsSlugs`: a matching name is passed through as the slug, and the app
  * decides whether it exists.
  */
-export function resolveTargets(model: string, db?: Database): Route[] {
-  const specs = routableAdapters(db);
+export async function resolveTargets(
+  model: string,
+  db?: Database,
+  opts: Pick<SelectOptions, "instance" | "app"> = {},
+): Promise<Route[]> {
+  const specs = routableAdapters(db).filter((spec) => !opts.app || spec.app === opts.app);
   const named = (routes: RouteSpec[]): RouteSpec[] =>
     routes.filter((r) => r.model === model || r.slug === model);
-  const routes: Route[] = [];
-  for (const spec of specs) {
-    for (const route of named(spec.models)) routes.push({ spec, slug: route.slug });
-  }
-  if (routes.length === 0) {
-    for (const spec of specs) {
-      const listed = named(routesOf(spec));
-      for (const route of listed) routes.push({ spec, slug: route.slug });
-      if (listed.length === 0 && spec.acceptsSlugs?.some((glob) => globRegex(glob).test(model))) {
-        routes.push({ spec, slug: model });
+  const pinned = specs.flatMap((spec) =>
+    named(spec.models).map((route) => ({ spec, slug: route.slug })),
+  );
+  if (pinned.length) return pinned.sort(routeOrder);
+  const routes = (
+    await Promise.all(
+      specs.map(async (spec) => {
+        const found = new Map<string, string[]>();
+        for (const { instance, catalog } of await accountCatalogs(db, spec, opts.instance)) {
+          for (const route of named(catalog.routes))
+            found.set(route.slug, [...(found.get(route.slug) ?? []), instance]);
+        }
+        if (found.size === 0 && spec.acceptsSlugs?.some((glob) => globRegex(glob).test(model))) {
+          return [{ spec, slug: model }];
+        }
+        return [...found].map(([slug, instances]) => ({ spec, slug, instances }));
+      }),
+    )
+  ).flat();
+  if (!routes.length) throw await unknownModel(model, db);
+  return routes.sort(routeOrder);
+}
+function routeOrder(a: Route, b: Route): number {
+  return a.spec.app.localeCompare(b.spec.app) || a.slug.localeCompare(b.slug);
+}
+
+/** The same inherited environment and named overlay used by delegated execution. */
+export function instanceEnvironment(
+  db: Database | undefined,
+  app: string,
+  instance: string,
+  inherited: ProbeEnv = process.env,
+): ProbeEnv {
+  if (instance === DEFAULT_INSTANCE || !db) return { ...inherited };
+  const row = db
+    .query<{ env: string }, [string, string]>("SELECT env FROM instances WHERE app=? AND name=?")
+    .get(app, instance);
+  if (!row) throw new Error(`Unknown instance '${app}:${instance}'`);
+  const parsed: unknown = JSON.parse(row.env);
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.values(parsed).some((value) => typeof value !== "string")
+  )
+    throw new Error(`Invalid environment for '${app}:${instance}'`);
+  const overlay: ProbeEnv = {};
+  for (const [key, value] of Object.entries(parsed))
+    if (typeof value === "string") overlay[key] = value;
+  return { ...inherited, ...overlay };
+}
+function catalogInstances(
+  db: Database | undefined,
+  spec: AdapterSpec,
+  explicit?: string,
+): string[] {
+  if (explicit) return [explicit];
+  return (
+    (db && spec.identityEnv ? getPool(db, spec.app)?.members : undefined) ?? [DEFAULT_INSTANCE]
+  );
+}
+async function accountCatalogs(
+  db: Database | undefined,
+  spec: AdapterSpec,
+  explicit?: string,
+): Promise<Array<{ instance: string; catalog: Catalog }>> {
+  const inherited = { ...process.env };
+  return Promise.all(
+    catalogInstances(db, spec, explicit).map(async (instance) => {
+      try {
+        return {
+          instance,
+          catalog: await catalogFor(spec, instanceEnvironment(db, spec.app, instance, inherited)),
+        };
+      } catch (error) {
+        return {
+          instance,
+          catalog: {
+            routes: spec.models,
+            listingError: error instanceof Error ? error.message : String(error),
+          },
+        };
       }
-    }
-  }
-  if (routes.length === 0) throw unknownModel(model, db);
-  return routes.sort((a, b) => a.spec.app.localeCompare(b.spec.app) || a.slug.localeCompare(b.slug));
+    }),
+  );
 }
 
 interface Candidate extends Considered {
@@ -388,7 +401,11 @@ export const RANKING_GRID = 0.01;
  * run already attempted is never re-admitted — that is what caps a failover
  * chain.
  */
-export function selectTarget(db: Database, model: string, opts: SelectOptions = {}): Target {
+export async function selectTarget(
+  db: Database,
+  model: string,
+  opts: SelectOptions = {},
+): Promise<Target> {
   const now = opts.nowIso ?? nowIso();
   const tried = new Set(opts.exclude ?? []);
   const rating = ratingLens(db, model, opts.category ?? "", now);
@@ -396,7 +413,7 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
   const candidates: Candidate[] = [];
   const blockedRoutes: string[] = [];
 
-  for (const route of resolveTargets(model, db)) {
+  for (const route of await resolveTargets(model, db, opts)) {
     const app = route.spec.app;
     const binaryPath = resolveBinary(route.spec.binary);
     if (binaryPath === null) {
@@ -406,7 +423,8 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     // A ceiling the adapter cannot express is an exclusion, not a broken route:
     // running anyway would hand the callee an authority Baton cannot constrain.
     const ceiling = ceilingFor(db, app);
-    const unsupported = unsupportedCeiling(route.spec, ceiling);
+    const autonomy = clampAutonomy(opts.autonomy, ceiling, route.spec.defaultAutonomy);
+    const unsupported = unsupportedCeiling(route.spec, autonomy);
     if (unsupported) {
       blockedRoutes.push(`${app}: ${unsupported}`);
       continue;
@@ -418,9 +436,15 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
     }
     // The authority this candidate would run at, resolved here so the rating
     // lens can ask for evidence produced at that same level.
-    const autonomy = clampAutonomy(opts.autonomy, ceiling, route.spec.defaultAutonomy);
-    candidatesFor(db, app, poolInstance(route.spec, opts.instance), now,
-      cooldownScopeFor(route.spec, route.slug)).forEach((c, memberIndex) => {
+    const accountCandidates = candidatesFor(
+      db,
+      app,
+      poolInstance(route.spec, opts.instance),
+      now,
+      cooldownScopeFor(route.spec, route.slug),
+    );
+    for (const [memberIndex, c] of accountCandidates.entries()) {
+      if (route.instances && !route.instances.includes(c.instance)) continue;
       // A deny-listed route is reported as its own exclusion rather than
       // folded into another: it is the user's standing decision, and it is the
       // one reason that survives every relaxation below.
@@ -436,12 +460,13 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
               : c.excludedUnlessLastResort
                 ? "emergency"
                 : undefined;
-      const fingerprint = targetFingerprint(
+      const fingerprint = await targetFingerprint(
         app,
         c.instance,
         route.slug,
         route.spec.adapterVersion,
         binaryPath,
+        c.defined ? instanceEnvironment(db, app, c.instance) : process.env,
       );
       candidates.push({
         route,
@@ -457,10 +482,13 @@ export function selectTarget(db: Database, model: string, opts: SelectOptions = 
         preciousness: c.preciousness,
         ...(c.coolingUntil ? { coolingUntil: c.coolingUntil } : {}),
         ...(block
-          ? { block, excluded: denied ? routeBlockReason(denied) : blockReason(block, c.coolingUntil) }
+          ? {
+              block,
+              excluded: denied ? routeBlockReason(denied) : blockReason(block, c.coolingUntil),
+            }
           : {}),
       });
-    });
+    }
   }
   candidates.sort(
     (a, b) =>
@@ -676,7 +704,7 @@ const MISSING_BINARY = "binary not found";
 function unsupportedCeiling(spec: AdapterSpec, ceiling: Autonomy): string {
   if (spec.autonomyFlags[ceiling] !== undefined) return "";
   const supported = Object.keys(spec.autonomyFlags).join(", ") || "none";
-  return `ceiling '${ceiling}' unsupported (supports: ${supported})`;
+  return `autonomy '${ceiling}' unsupported (supports: ${supported})`;
 }
 
 /**
@@ -719,112 +747,111 @@ export function clampAutonomy(
   return AUTONOMY_ORDER.indexOf(want) <= AUTONOMY_ORDER.indexOf(ceiling) ? want : ceiling;
 }
 
-export function listModels(db: Database, at = nowIso()): ModelListing[] {
+export async function listModels(db: Database, at = nowIso()): Promise<ModelListing[]> {
   const scores = new Map(
     effectiveRatings(db, at)
       .filter((r) => r.category === "")
-      .map(
-        (r) =>
-          [r.model, { observed: r.observed, nEff: r.nEff, prior: r.prior, blended: r.blended }] as const,
-      ),
+      .map((r) => [
+        r.model,
+        { observed: r.observed, nEff: r.nEff, prior: r.prior, blended: r.blended },
+      ]),
   );
-  const rows: ModelListing[] = [];
   const blocks = listBlocks(db);
-  for (const spec of routableAdapters(db)) {
-    rows.push(...routeRows(db, spec, routesOf(spec), scores, at, blocks));
-  }
-  // A quarantined adapter routes nowhere, but hiding it would hide the thing
-  // the user is being asked to review — same for one waiting on a canary or
-  // gone stale after a version bump. A rejected one is a decision, not a hint.
-  // Only its pinned routes are shown: asking its binary for a listing would
-  // execute something from a spec nobody has approved.
-  for (const record of listDiscovered(db)) {
-    if (record.status === "active" || record.status === "rejected") continue;
-    if (!Array.isArray(record.spec?.models)) continue; // unvalidated row on disk
-    rows.push(
-      ...routeRows(db, record.spec, record.spec.models, scores, at, blocks, quarantineHint(record)),
-    );
-  }
-  // Code-unit order, not localeCompare: reported slugs carry mixed case, and
-  // the order must not depend on the ICU data of whichever runtime lists them.
+  const rows = (
+    await Promise.all(
+      routableAdapters(db).map(async (spec) => {
+        const catalogs = await accountCatalogs(db, spec);
+        const routes = new Map<string, { route: RouteSpec; instances: string[]; error?: string }>();
+        for (const { instance, catalog } of catalogs) {
+          for (const route of catalog.routes) {
+            const key = JSON.stringify([route.model, route.slug]);
+            const entry = routes.get(key) ?? {
+              route,
+              instances: [],
+              ...(catalog.listingError ? { error: catalog.listingError } : {}),
+            };
+            entry.instances.push(instance);
+            routes.set(key, entry);
+          }
+        }
+        const ceiling = ceilingFor(db, spec.app);
+        const supportedAutonomies = AUTONOMY_ORDER.filter(
+          (level) =>
+            spec.autonomyFlags[level] !== undefined &&
+            AUTONOMY_ORDER.indexOf(level) <= AUTONOMY_ORDER.indexOf(ceiling),
+        );
+        const defaultAutonomy = clampAutonomy(undefined, ceiling, spec.defaultAutonomy);
+        const appReason =
+          resolveBinary(spec.binary) === null
+            ? MISSING_BINARY
+            : unsupportedCeiling(spec, defaultAutonomy);
+        return [...routes.values()].map(({ route, instances, error }): ModelListing => {
+          const denied = instances.map((instance) =>
+            blockFor(blocks, spec.app, instance, route.slug),
+          );
+          const degradedReason =
+            denied[0] && denied.every(Boolean) ? routeBlockReason(denied[0]) : appReason;
+          const pool =
+            spec.identityEnv && getPool(db, spec.app)
+              ? instances.map((instance) => {
+                  const observed = snapshot(db, spec.app, instance, at);
+                  const until = coolingUntil(
+                    db,
+                    spec.app,
+                    instance,
+                    at,
+                    cooldownScopeFor(spec, route.slug),
+                  );
+                  return {
+                    instance,
+                    headroom: observed.headroom,
+                    ...(until ? { coolingUntil: until } : {}),
+                  };
+                })
+              : undefined;
+          const score = scores.get(route.model);
+          return {
+            model: route.model,
+            app: spec.app,
+            slug: route.slug,
+            available: !degradedReason,
+            ...(degradedReason ? { degradedReason } : {}),
+            instance: instances[0] ?? DEFAULT_INSTANCE,
+            rating: score?.blended == null ? "unrated" : "rated",
+            scores: score ?? { observed: null, nEff: 0, prior: null, blended: null },
+            ...(pool ? { pool } : {}),
+            maxAutonomy: ceiling,
+            supportedAutonomies,
+            ...(error ? { catalogError: error } : {}),
+          };
+        });
+      }),
+    )
+  ).flat();
   return rows.sort((a, b) => byCodeUnits(a.model, b.model) || byCodeUnits(a.app, b.app));
 }
-
 function byCodeUnits(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function routeRows(
-  db: Database,
-  spec: AdapterSpec,
-  routes: RouteSpec[],
-  scores: Map<string, ModelScores>,
-  at: string,
-  blocks: RouteBlock[],
-  forcedReason?: string,
-): ModelListing[] {
-  const ceiling = ceilingFor(db, spec.app);
-  const appReason =
-    resolveBinary(spec.binary) === null ? MISSING_BINARY : unsupportedCeiling(spec, ceiling);
-  // Only a pool makes per-instance headroom meaningful: without one there is
-  // nothing to spread across, and 'default' is the whole story.
-  const members = spec.identityEnv ? getPool(db, spec.app)?.members : undefined;
-  const instances = members && members.length > 0 ? members : [DEFAULT_INSTANCE];
-  const headroom = members?.map((instance) => snapshot(db, spec.app, instance, at));
-  return routes.map((route) => {
-    const score = scores.get(route.model);
-    const pool = headroom?.map((observed) => {
-      const until = coolingUntil(db, spec.app, observed.instance, at, cooldownScopeFor(spec, route.slug));
-      return { instance: observed.instance, headroom: observed.headroom,
-        ...(until ? { coolingUntil: until } : {}) };
-    });
-    // A block only makes the route unusable when it covers every instance the
-    // route could run on; a partial block just steers selection, and saying
-    // "unavailable" would be a lie the pool view right beside it contradicts.
-    const denied = instances.map((i) => blockFor(blocks, spec.app, i, route.slug));
-    const degradedReason =
-      forcedReason ??
-      (denied[0] && denied.every(Boolean) ? routeBlockReason(denied[0]) : appReason);
-    return {
-      model: route.model,
-      app: spec.app,
-      slug: route.slug,
-      available: degradedReason === "",
-      ...(degradedReason === "" ? {} : { degradedReason }),
-      instance: instances[0] ?? DEFAULT_INSTANCE,
-      rating: score?.blended === undefined || score.blended === null ? "unrated" : "rated",
-      scores: score ?? { observed: null, nEff: 0, prior: null, blended: null },
-      ...(pool ? { pool } : {}),
-      maxAutonomy: ceiling,
-    };
-  });
-}
-
-/** Why a discovered adapter is not routable, and the command that fixes it. */
-function quarantineHint(record: DiscoveredAdapter): string {
-  switch (record.status) {
-    case "approved":
-      return `approved — awaiting canary ('baton adapters canary ${record.app}')`;
-    case "stale":
-      return `stale — binary version changed ('baton adapters canary ${record.app}')`;
-    default:
-      return `quarantined — awaiting review ('baton adapters review ${record.app}')`;
-  }
-}
-
-export function knownModels(db?: Database): string[] {
+export async function knownModels(db?: Database): Promise<string[]> {
   const models = new Set<string>();
-  for (const spec of routableAdapters(db)) for (const r of routesOf(spec)) models.add(r.model);
+  for (const spec of routableAdapters(db))
+    for (const { catalog } of await accountCatalogs(db, spec))
+      for (const r of catalog.routes) models.add(r.model);
   return [...models].sort();
 }
 
 /** An app can report hundreds of models; the error names the pinned ones and counts the rest. */
-function unknownModel(model: string, db?: Database): Error {
+async function unknownModel(model: string, db?: Database): Promise<Error> {
   const pinned = new Set<string>();
   for (const spec of routableAdapters(db)) for (const r of spec.models) pinned.add(r.model);
-  const more = knownModels(db).length - pinned.size;
-  const rest = more > 0 ? `, and ${more} more reported by the installed apps (see list_models)` : "";
-  return new Error(`Unknown model '${model}'. Known models: ${[...pinned].sort().join(", ")}${rest}.`);
+  const more = (await knownModels(db)).length - pinned.size;
+  const rest =
+    more > 0 ? `, and ${more} more reported by the installed apps (see list_models)` : "";
+  return new Error(
+    `Unknown model '${model}'. Known models: ${[...pinned].sort().join(", ")}${rest}.`,
+  );
 }
 
 function isAutonomy(value: unknown): value is Autonomy {

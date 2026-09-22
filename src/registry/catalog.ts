@@ -1,6 +1,8 @@
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { probe, binaryStamp, environmentKey, type ProbeEnv } from "./probes.ts";
 
 import { dotPath } from "../adapters/executor.ts";
 import type { AdapterSpec, ModelsExtractSpec, RouteSpec } from "../adapters/types.ts";
@@ -68,14 +70,18 @@ export function forgetCatalogMemory(): void {
 }
 
 /** Every route this spec serves right now, given where its binary resolved to. */
-export function catalogOf(spec: AdapterSpec, binaryPath: string | null): Catalog {
+export async function catalogOf(
+  spec: AdapterSpec,
+  binaryPath: string | null,
+  env: ProbeEnv = { ...process.env },
+): Promise<Catalog> {
   const routes = [...spec.models];
   if (!spec.listModels || binaryPath === null) return { routes };
-  const identity = spec.identityEnv ? (process.env[spec.identityEnv] ?? "") : "";
-  const listed = cachedListing(
-    [binaryPath, identity, ...spec.listModels.argv].join("\0"),
+
+  const listed = await cachedListing(
+    [binaryPath, environmentKey(env), JSON.stringify(spec.listModels)].join("\0"),
     binaryPath,
-    () => listSlugs(binaryPath, spec.listModels!.argv, spec.listModels!.extract),
+    () => listSlugs(binaryPath, spec.listModels!.argv, spec.listModels!.extract, env),
   );
   // A reported slug that is already pinned keeps the pinned canonical id —
   // that is the id ratings and seeds attach to. One that collides with a pinned
@@ -89,30 +95,37 @@ export function catalogOf(spec: AdapterSpec, binaryPath: string | null): Catalog
   return listed.error === undefined ? { routes } : { routes, listingError: listed.error };
 }
 
-function cachedListing(key: string, binaryPath: string, list: () => Listing): Listing {
+const pending = new Map<string, Promise<Listing>>();
+async function cachedListing(
+  key: string,
+  binaryPath: string,
+  list: () => Promise<Listing>,
+): Promise<Listing> {
   memory ??= readCacheFile();
   const stamp = binaryStamp(binaryPath);
   const cached = memory.get(key);
-  if (cached && (stamp === null || cached.stamp === stamp) && Date.now() - cached.at < ttlOf(cached)) {
+  if (
+    cached &&
+    (stamp === null || cached.stamp === stamp) &&
+    Date.now() - cached.at < ttlOf(cached)
+  ) {
     return cached;
   }
-  const fresh = list();
-  memory.set(key, { stamp, at: Date.now(), ...fresh });
-  writeCacheFile(memory);
-  return fresh;
+  const inFlight = pending.get(key);
+  if (inFlight) return inFlight;
+  const result = list()
+    .then((fresh) => {
+      memory!.set(key, { stamp, at: Date.now(), ...fresh });
+      writeCacheFile(memory!);
+      return fresh;
+    })
+    .finally(() => pending.delete(key));
+  pending.set(key, result);
+  return result;
 }
 
 function ttlOf(entry: Entry): number {
   return entry.error === undefined ? CATALOG_TTL_MS : CATALOG_FAILURE_TTL_MS;
-}
-
-function binaryStamp(binaryPath: string): string | null {
-  try {
-    const s = statSync(binaryPath);
-    return `${s.mtimeMs}:${s.size}`;
-  } catch {
-    return null;
-  }
 }
 
 /** `$XDG_CACHE_HOME/baton/catalog.json`, or `~/.cache/baton/catalog.json`. */
@@ -125,7 +138,27 @@ function readCacheFile(): Map<string, Entry> {
   try {
     const parsed: unknown = JSON.parse(readFileSync(catalogCachePath(), "utf8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return new Map(Object.entries(parsed as Record<string, Entry>));
+      const entries = new Map<string, Entry>();
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (
+          !entry ||
+          typeof entry !== "object" ||
+          !("at" in entry) ||
+          typeof entry.at !== "number" ||
+          !("stamp" in entry) ||
+          (entry.stamp !== null && typeof entry.stamp !== "string")
+        )
+          continue;
+        if (
+          "slugs" in entry &&
+          Array.isArray(entry.slugs) &&
+          entry.slugs.every((slug: unknown) => typeof slug === "string")
+        )
+          entries.set(key, { at: entry.at, stamp: entry.stamp, slugs: entry.slugs });
+        else if ("error" in entry && typeof entry.error === "string")
+          entries.set(key, { at: entry.at, stamp: entry.stamp, error: entry.error });
+      }
+      return entries;
     }
   } catch {
     // Missing or unreadable: the cache is a convenience, the listing is the truth.
@@ -150,26 +183,19 @@ function writeCacheFile(entries: Map<string, Entry>): void {
   }
 }
 
-function listSlugs(binaryPath: string, argv: string[], extract: ModelsExtractSpec): Listing {
-  let res: ReturnType<typeof Bun.spawnSync>;
-  try {
-    res = Bun.spawnSync({
-      cmd: [binaryPath, ...argv],
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      timeout: LIST_PROBE_MS,
-    });
-  } catch (err) {
-    const why = err instanceof Error ? err.message : String(err);
-    return { error: `could not run '${argv.join(" ")}': ${why}` };
-  }
-  if (res.exitCode !== 0) {
-    const tail = (res.stderr?.toString() ?? "").trim().slice(-STDERR_TAIL_CHARS);
-    const why = res.exitCode === null ? `timed out after ${LIST_PROBE_MS} ms` : `exit ${res.exitCode}`;
+async function listSlugs(
+  binaryPath: string,
+  argv: string[],
+  extract: ModelsExtractSpec,
+  env: ProbeEnv,
+): Promise<Listing> {
+  const res = await probe(binaryPath, argv, env, LIST_PROBE_MS);
+  if (res.exitCode !== 0 || res.timedOut) {
+    const tail = res.stderr.trim().slice(-STDERR_TAIL_CHARS);
+    const why = res.timedOut ? `timed out after ${LIST_PROBE_MS} ms` : `exit ${res.exitCode}`;
     return { error: `'${argv.join(" ")}' ${why}${tail ? `: ${tail}` : ""}` };
   }
-  return parseSlugs(extract, res.stdout?.toString() ?? "");
+  return parseSlugs(extract, res.stdout);
 }
 
 /** Lifts the slugs out of a listing command's stdout. Exported for tests. */
@@ -201,7 +227,8 @@ export function parseSlugs(extract: ModelsExtractSpec, stdout: string): Listing 
   }
   const catalog = dotPath(doc, extract.path);
   const wanted = (entry: unknown): boolean =>
-    extract.where === undefined || String(dotPath(entry, extract.where.path)) === extract.where.equals;
+    extract.where === undefined ||
+    String(dotPath(entry, extract.where.path)) === extract.where.equals;
   if (Array.isArray(catalog)) {
     for (const entry of catalog) {
       if (wanted(entry)) keep(extract.slug === undefined ? entry : dotPath(entry, extract.slug));

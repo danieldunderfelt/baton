@@ -104,7 +104,7 @@ describe("openStore — schema and migrations", () => {
     expect(upgraded.query("SELECT * FROM cooldowns").all()).toEqual([
       { app: "codex", instance: "default", scope: "", until: "2099-01-01T00:00:00.000Z", strikes: 2, reason: "limited" },
     ]);
-    expect(upgraded.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()!.version).toBe(10);
+    expect(upgraded.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()!.version).toBe(11);
     expect(upgraded.query("PRAGMA foreign_key_check").all()).toEqual([]);
     upgraded.close();
   });

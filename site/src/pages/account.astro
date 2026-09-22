@@ -1,6 +1,6 @@
 ---
 import Base from "../layouts/Base.astro";
-import { crossSite, currentUser, isSameOrigin } from "../lib/auth.ts";
+import { currentUser, isSameOrigin } from "../lib/auth.ts";
 import { normalizeShareCode } from "../lib/codes.ts";
 import { deleteProfile, deleteTokenForUser, InvalidProfilePageError, listProfiles, listTokens } from "../lib/db.ts";
 import { appEnv, siteOrigin } from "../lib/env.ts";

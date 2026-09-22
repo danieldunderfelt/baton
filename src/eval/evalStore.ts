@@ -175,7 +175,7 @@ export interface SeedResult {
 /**
  * Onboarding seeds. Weight is capped at write time so a wrong seed cannot steer
  * routing for months; the profile becomes active only if no profile is. The
- * stored entries come back so the confirmation the user approves against is the
+ * stored entries come back so the reported result is the
  * store's own answer, not a caller's re-derivation of the same rules.
  */
 export function seedPriors(
@@ -415,7 +415,7 @@ export interface RatingSettingOptions {
 /**
  * Writes a setting that changes what the ratings projection says (half-life,
  * profile weight) and bumps the revision in the same transaction. Without the
- * bump the publisher would discard the refreshed render as stale, because no
+ * bump clients could mistake changed rating settings for the same snapshot, because no
  * eval table changed.
  *
  * `half_life_days` is special: the accumulator stores decayed sums, not the

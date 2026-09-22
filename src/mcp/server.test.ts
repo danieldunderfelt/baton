@@ -358,7 +358,7 @@ describe("get_run", () => {
       expect(started.status).toBe("running");
       // The payload itself says this is not a time limit, so a caller cannot
       // read 'running' as one.
-      expect(String(started.note)).toContain("no time limit");
+      expect(String(started.note)).toContain("only this call's wait ended");
 
       const view = await callJson(host.client, "get_run", { run_id: started.run_id, wait: true });
       expect(view.status).toBe("succeeded");
@@ -585,7 +585,7 @@ describe("report_result", () => {
     expect(row.observed).toBeCloseTo(1, 6);
     expect(gradeRow(db, "run_graded")).toMatchObject({ grade: 1, notes: null });
     expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM grades").get()?.n).toBe(1);
-    expect(revisionOf(db)).toBe(first.revision);
+    expect(revisionOf(db)).toBe(Number(first.revision));
     expect(existsSync(join(evalSession.dir, "ratings.yaml"))).toBe(false);
   });
 

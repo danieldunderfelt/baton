@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { getAdapter } from "../adapters/builtin/index.ts";
+import { getDiscovered } from "../discovery/discovery.ts";
 import { DEFAULT_INSTANCE } from "../registry/registry.ts";
 import { nowIso } from "../store/store.ts";
 import { snapshot } from "./quota.ts";
@@ -50,7 +51,7 @@ export function setPool(db: Database, app: string, members: string[]): Pool {
       `Pool for app '${app}' needs at least one member. Use '${DEFAULT_INSTANCE}' for the inherited environment.`,
     );
   }
-  requireIdentityEnv(app, `Pool for app '${app}'`);
+  requireIdentityEnv(app, `Pool for app '${app}'`, db);
   const unknown = deduped.filter((m) => m !== DEFAULT_INSTANCE && !instanceExists(db, app, m));
   if (unknown.length > 0) {
     throw new Error(
@@ -71,8 +72,8 @@ export function setPool(db: Database, app: string, members: string[]): Pool {
  * pretending to balance.
  * Unknown apps are not this check's business; the CLI rejects them by name.
  */
-export function requireIdentityEnv(app: string, subject: string): void {
-  const spec = getAdapter(app);
+export function requireIdentityEnv(app: string, subject: string, db?: Database): void {
+  const spec = getAdapter(app) ?? (db ? getDiscovered(db, app)?.spec : undefined);
   if (!spec || spec.identityEnv) return;
   throw new Error(
     `${subject} is not possible: '${app}' has no identity env var, so every instance of it is the same account. Its only instance is '${DEFAULT_INSTANCE}' (the inherited environment).`,

@@ -4,29 +4,14 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { builtinAdapters, getAdapter } from "../adapters/builtin/index.ts";
-import { executeAdapter } from "../adapters/executor.ts";
 import {
   AUTONOMY_ORDER,
   DEFAULT_INSTANCE,
-  type AdapterSpec,
   type Autonomy,
 } from "../adapters/types.ts";
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
-import {
-  approveDiscovered,
-  canaryDiscovered,
-  CANARY_PROMPT,
-  CANARY_TIMEOUT_MS,
-  DIGEST_SHORT_LENGTH,
-  formatReview,
-  listDiscovered,
-  rejectDiscovered,
-  detectDiscovered,
-  reviewDiscovered,
-  shortDigest,
-  validateSpec,
-} from "../discovery/discovery.ts";
-import { CANARY_TOKEN, type DiscoveredStatus } from "../discovery/types.ts";
+import { listDiscovered } from "../discovery/discovery.ts";
+import { runAdapters } from "./adapters.ts";
 import {
   blindDuelOf,
   blindRuns,
@@ -74,8 +59,6 @@ import { activeCooldowns } from "../quota/quota.ts";
 import {
   addBlock,
   blockFor,
-  blockReason as routeBlockReason,
-  canarySlug,
   listBlocks,
   normalizePattern,
   removeBlock,
@@ -85,9 +68,9 @@ import {
 import {
   catalogFor,
   detectApps,
+  instanceEnvironment,
   listModels,
   routableAdapters,
-  routesOf,
 } from "../registry/registry.ts";
 import { inTransaction, nowIso, openStore, withBusyRetry } from "../store/store.ts";
 import { createSupervisor, type Supervisor } from "../supervisor/supervisor.ts";
@@ -243,20 +226,19 @@ async function status(args: string[]): Promise<number> {
 
 async function detect(): Promise<number> {
   const { db } = openScope();
-  // A version bump means the canary's evidence is stale, so detect is also
-  // where an active discovered adapter drops out of the registry until it is
-  // re-canaried.
-  const changes = detectDiscovered(db);
   const specs = new Map(routableAdapters(db).map((spec) => [spec.app, spec]));
+  const [apps, models] = await Promise.all([detectApps({ db }), listModels(db)]);
   const rows: string[][] = [["APP", "BINARY", "VERSION", "MODELS"]];
   const listingErrors: string[] = [];
-  for (const app of await detectApps({ db })) {
+  for (const app of apps) {
     const spec = specs.get(app.app)!;
-    const catalog = await catalogFor(spec);
-    if (catalog.listingError) listingErrors.push(`${app.app}: ${catalog.listingError}`);
+    const catalog = models.filter((model) => model.app === app.app);
+    for (const error of new Set(catalog.flatMap((model) => model.catalogError ? [model.catalogError] : []))) {
+      listingErrors.push(`${app.app}: ${error}`);
+    }
     // The pinned ids by name; the rest as a count, since an app can report
     // hundreds and 'baton models' is the place for the full list.
-    const reported = catalog.routes.length - spec.models.length;
+    const reported = catalog.length - spec.models.length;
     const pinned = spec.models.map((m) => m.model).join(", ");
     rows.push([
       app.app,
@@ -269,9 +251,7 @@ async function detect(): Promise<number> {
   for (const error of listingErrors) {
     console.log(`\n${error} — only its pinned models route until the listing works.`);
   }
-  for (const change of changes) {
-    console.log(`\n${change.app}: ${change.from} → ${change.to} — ${change.note}`);
-  }
+
   return 0;
 }
 
@@ -286,13 +266,14 @@ async function models(args: string[]): Promise<number> {
   }
   // "no" on its own sends the user hunting: the reason is the actionable half,
   // and for a blocked route it is the user's own words coming back to them.
-  const rows: string[][] = [["MODEL", "ROUTE", "AVAILABLE", "MAX AUTONOMY", "WHY NOT"]];
+  const rows: string[][] = [["MODEL", "ROUTE", "AVAILABLE", "MAX AUTONOMY", "SUPPORTED", "WHY NOT"]];
   for (const m of listing) {
     rows.push([
       m.model,
       `${m.app}/${m.slug}`,
       m.available ? "yes" : "no",
       m.maxAutonomy,
+      m.supportedAutonomies.join(",") || "-",
       m.degradedReason ?? "-",
     ]);
   }
@@ -428,10 +409,7 @@ function runs(args: string[]): number {
     const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
     const view = supervisor.getRun(runId);
     const duelId = blindDuelOf(db, runId);
-    console.log(JSON.stringify(duelId === undefined ? view : {
-      runId, status: view?.status, model: blindLabel(duelId), output: view?.output,
-      createdAt: view?.createdAt,
-    }));
+    console.log(JSON.stringify(view && publicRunView(view, duelId)));
     return 0;
   }
 
@@ -513,7 +491,8 @@ async function cancelRun(args: string[]): Promise<number> {
   const { flags, rest } = parseFlags(args, { boolean: ["json"] });
   const [runId] = rest;
   if (!runId || rest.length !== 1) return usage("cancel needs one run id: baton cancel <run-id>");
-  const supervisor = createSupervisor({ db: openDb(), env: { ...process.env }, hostCwd: process.cwd() });
+  const db = openDb();
+  const supervisor = createSupervisor({ db, env: { ...process.env }, hostCwd: process.cwd() });
   let view = supervisor.getRun(runId);
   if (!view) throw new Error(`unknown run '${runId}'`);
   if (view.status === "running" || view.status === "queued") {
@@ -523,12 +502,19 @@ async function cancelRun(args: string[]): Promise<number> {
       view = await supervisor.waitForRun(runId, 1_000);
     } while (view.status === "running" || view.status === "queued");
   }
-  if (flags.json) console.log(JSON.stringify(view));
+  if (flags.json) console.log(JSON.stringify(publicRunView(view, blindDuelOf(db, runId))));
   else console.log(`Run ${runId} ${view.status}.`);
   return 0;
 }
 
 /** How an unjudged duel's side names itself everywhere a model would appear. */
+function publicRunView(view: RunView, duelId: string | undefined): RunView | Record<string, unknown> {
+  return duelId === undefined ? view : {
+    runId: view.runId, status: view.status, model: blindLabel(duelId), output: view.output,
+    createdAt: view.createdAt,
+  };
+}
+
 function blindLabel(duelId: string): string {
   return `duel ${duelId} (blind)`;
 }
@@ -674,400 +660,8 @@ function duelList(): number {
   return 0;
 }
 
-/**
- * The adapter surface: built-ins are pinned, discovered specs are quarantined
- * until a human approves the exact binary and argv here. Approval precedes
- * execution, and only the trusted CLI can give it.
- */
 async function adapters(args: string[]): Promise<number> {
-  switch (args[0]) {
-    case "list":
-      return adaptersList();
-    case "review":
-      return adaptersReview(args[1]);
-    case "approve":
-      return await adaptersApprove(args.slice(1));
-    case "reject":
-      return adaptersReject(args.slice(1));
-    case "canary":
-      return await adaptersCanary(args.slice(1));
-    default:
-      return usage(
-        "adapters takes: list | review <app> | approve <app> --digest <digest> [--no-canary] | reject <app> [reason...] (a built-in too: it blocks every route it has) | canary <app|--all> [--structural]",
-      );
-  }
-}
-
-function adaptersList(): number {
-  const db = openDb();
-  const detected = detectedBinaries();
-  const blocks = listBlocks(db);
-  const rows: string[][] = [["APP", "PROVENANCE", "STATUS", "BINARY"]];
-  // A built-in is pinned in the binary and cannot be un-pinned; what "rejected"
-  // means for one is that the user has blocked every route it has, so the app
-  // is out of service in this scope. The status column says so rather than
-  // reporting a pinned adapter as though it were routable.
-  const rejected: { app: string; block: RouteBlock }[] = [];
-  for (const spec of builtinAdapters) {
-    const block = appBlock(db, spec, blocks);
-    if (block) rejected.push({ app: spec.app, block });
-    rows.push([
-      spec.app,
-      "builtin",
-      block ? "rejected" : "pinned",
-      detected.get(spec.app) ?? "not on PATH in this scope",
-    ]);
-  }
-  const discovered = listDiscovered(db);
-  for (const record of discovered) {
-    rows.push([record.app, "discovered", record.status, record.spec.binary]);
-  }
-  console.log(table(rows));
-
-  for (const { app, block } of rejected) {
-    console.log(
-      `\n${app}: ${routeBlockReason(block)}. Nothing routes to it here. Restore it with: baton block remove '${block.pattern}'`,
-    );
-  }
-
-  const pending = discovered.filter((r) => r.status === "quarantined").map((r) => r.app);
-  if (pending.length > 0) {
-    console.log(
-      `\nNothing from ${pending.join(", ")} has been executed. Review before approving: baton adapters review ${pending[0]}`,
-    );
-  }
-  return 0;
-}
-
-function adaptersReview(app: string | undefined): number {
-  if (!app) return usage("adapters review needs: <app>");
-  const db = openDb();
-  const review = reviewDiscovered(db, app);
-  if (!review) {
-    console.error(
-      `baton: no discovered adapter '${app}' in this scope. 'baton adapters list' shows what there is.`,
-    );
-    return 1;
-  }
-  console.log(formatReview(review));
-  const digest = shortDigest(review.digest);
-  console.log(
-    review.needsApproval
-      ? `\nApprove running this exact binary with this exact argv as '${app}'?
-  approve, canary, activate:  baton adapters approve ${app} --digest ${digest}
-  approve, execute nothing:   baton adapters approve ${app} --digest ${digest} --no-canary
-  discard it:                 baton adapters reject ${app} [reason...]
-
-The digest is required so that approval names the spec above and not just the app:
-if the agent resubmits a different spec before you approve, the digest changes and
-the approval is refused. Approval also refuses to run unless it is typed at a
-terminal — which stops a stray tool call or a pasted command, not an agent that
-already holds full shell access on this machine. That agent could fake a terminal;
-what it cannot do is make you read a spec you never read.`
-      : `\nAlready approved (${review.record.status}); 'baton adapters reject ${app}' withdraws that approval.`,
-  );
-  return 0;
-}
-
-/** Injected so the granting path is testable without a pty; never overridable at runtime. */
-export interface ApprovalGate {
-  isInteractive: () => boolean;
-}
-
-const realApprovalGate: ApprovalGate = { isInteractive: () => process.stdin.isTTY === true };
-
-/**
- * Approval is the one place where a human, not a program, grants execution
- * rights. Two conditions: the approval quotes the
- * digest of the spec stored right now — so it is a statement about content and
- * not about an app name an agent chose — and it is typed at a terminal. The
- * terminal check is not a security boundary against an agent that already has
- * full shell access here (it could fake one); it stops the accidental path, and
- * `adapters review` says so in as many words rather than implying more.
- */
-export async function adaptersApprove(
-  args: string[],
-  gate: ApprovalGate = realApprovalGate,
-): Promise<number> {
-  const { flags, rest } = parseFlags(args, {
-    boolean: ["canary", "no-canary"],
-    value: ["digest"],
-  });
-  const app = rest[0];
-  if (!app) return usage("adapters approve needs: <app> --digest <digest> [--no-canary]");
-  const digest = typeof flags.digest === "string" ? flags.digest : undefined;
-  if (!digest) {
-    return usage(
-      `adapters approve needs --digest <first ${DIGEST_SHORT_LENGTH} hex characters of the spec digest>. 'baton adapters review ${app}' prints it, and prints the spec you are approving.`,
-    );
-  }
-  const db = openDb();
-  const review = reviewDiscovered(db, app);
-  if (!review) {
-    console.error(
-      `baton: no discovered adapter '${app}' in this scope. 'baton adapters list' shows what there is.`,
-    );
-    return 1;
-  }
-  if (!gate.isInteractive()) {
-    console.error(
-      `baton: refusing to approve '${app}': stdin is not a terminal, so nobody is here to have read the spec.`,
-    );
-    console.error(
-      "baton: run this command yourself in a terminal. There is no override flag — approval is the only step a program is not allowed to take for you.",
-    );
-    return 1;
-  }
-  const approved = approveDiscovered(db, app, { digest });
-  if (!approved.ok) {
-    console.error(`baton: ${approved.errors.join("; ")}`);
-    return 1;
-  }
-  console.log(`Approved ${app}: ${approved.record.spec.binary}`);
-  // Canary by default — an approved adapter that was never executed is not yet
-  // known to work, and activation is what the canary is evidence for.
-  if (flags["no-canary"] === true) {
-    console.log(
-      `Not active yet: nothing has been executed. 'baton adapters canary ${app}' runs the canary and activates it.`,
-    );
-    return 0;
-  }
-  const canary = await canaryDiscovered(db, app);
-  if (!canary.ok) {
-    console.error(`baton: ${canary.errors.join("; ")}`);
-    console.error(
-      `baton: '${app}' stays approved but inactive — fix the spec and resubmit, or re-run 'baton adapters canary ${app}'.`,
-    );
-    return 1;
-  }
-  console.log(
-    `Canary passed (${CANARY_TOKEN} extracted through the declared path) — ${app} is active.`,
-  );
-  return 0;
-}
-
-/**
- * Two provenances, two meanings. Rejecting a DISCOVERED adapter is a verdict on
- * a submitted spec: the quarantine store keeps it, and nothing from it ever
- * runs. A BUILT-IN has no such row — it is pinned in this binary and cannot be
- * un-pinned — so rejecting one is the user taking the whole app out of service
- * in this scope, which is precisely a route block over every route it has. Same
- * word, one mechanism each, and `adapters list` reports both as `rejected`.
- */
-function adaptersReject(args: string[]): number {
-  const [app, ...reason] = args;
-  if (!app) return usage("adapters reject needs: <app> [reason...]");
-  const db = openDb();
-  const notes = reason.length > 0 ? reason.join(" ") : undefined;
-  const builtin = getAdapter(app);
-  if (builtin && !listDiscovered(db).some((r) => r.app === app)) {
-    return rejectBuiltin(db, builtin, notes);
-  }
-  const rejected = rejectDiscovered(db, app, notes);
-  if (!rejected.ok) {
-    console.error(`baton: ${rejected.errors.join("; ")}`);
-    return 1;
-  }
-  console.log(`Rejected ${app}. It is out of the registry and nothing from its spec runs.`);
-  return 0;
-}
-
-function rejectBuiltin(db: Database, spec: AdapterSpec, reason?: string): number {
-  const saved = addBlock(db, `${spec.app}:*/*`, reason);
-  const routes = spec.models.map((m) => m.model).join(", ");
-  console.log(
-    `Rejected ${spec.app}${saved.reason ? ` (${saved.reason})` : ""}. Nothing routes to it in this scope: ${routes}, nor anything the app reports.`,
-  );
-  console.log(
-    `A built-in stays pinned in the binary — the block '${saved.pattern}' is what refuses it, including on resume and in the canary. Undo with: baton block remove '${saved.pattern}'`,
-  );
-  return 0;
-}
-
-/**
- * The block that takes an entire app out of service: every route of it, on
- * every instance this scope defines. A partial block steers selection and is
- * not a rejection, so it is deliberately not reported as one.
- */
-function appBlock(db: Database, spec: AdapterSpec, blocks: RouteBlock[]): RouteBlock | undefined {
-  const instances = [DEFAULT_INSTANCE, ...(spec.identityEnv ? instanceNames(db, spec.app) : [])];
-  let first: RouteBlock | undefined;
-  for (const instance of instances) {
-    for (const route of routesOf(spec)) {
-      const block = blockFor(blocks, spec.app, instance, route.slug);
-      if (!block) return undefined;
-      first ??= block;
-    }
-  }
-  return first;
-}
-
-/**
- * The adapter conformance suite. Two checks per adapter: the same structural
- * validation the quarantine gate applies, and a live canary that asks the real
- * binary for CANARY_TOKEN and reads the answer back through the declared
- * extraction. `--all` covers the built-ins too — they are pinned, not exempt —
- * and `--structural` is the offline half, which executes nothing.
- */
-async function adaptersCanary(args: string[]): Promise<number> {
-  const { flags, rest } = parseFlags(args, { boolean: ["all", "structural"] });
-  const app = rest[0];
-  if (!app && flags.all !== true) return usage("adapters canary needs: <app> | --all [--structural]");
-  const db = openDb();
-  const targets = flags.all === true ? allTargets(db) : [namedTarget(db, app ?? "")];
-  const live = flags.structural !== true;
-
-  const rows: string[][] = [["APP", "PROVENANCE", "STRUCTURE", "CANARY"]];
-  const details: string[] = [];
-  let failed = 0;
-  for (const target of targets) {
-    const errors = conformanceErrors(target);
-    let canary = live ? "" : "not run (--structural)";
-    if (errors.length > 0) {
-      failed++;
-      canary = "not attempted";
-      for (const error of errors) details.push(`${target.app}: ${error}`);
-    } else if (live) {
-      const result = await liveCanary(db, target);
-      canary = result.failed ? "failed" : result.detail;
-      if (result.failed) {
-        failed++;
-        details.push(`${target.app}: ${result.detail}`);
-      }
-    }
-    rows.push([
-      target.app,
-      target.builtin ? "builtin" : target.status,
-      errors.length === 0 ? "ok" : `${errors.length} error(s)`,
-      canary,
-    ]);
-  }
-  console.log(table(rows));
-  for (const detail of details) console.error(`baton: ${detail}`);
-  return failed === 0 ? 0 : 1;
-}
-
-interface ConformanceTarget {
-  app: string;
-  spec: AdapterSpec;
-  builtin: boolean;
-  /** Absolute path: detect-resolved for a built-in, the spec's own otherwise. */
-  binaryPath: string | undefined;
-  status: DiscoveredStatus | "pinned";
-}
-
-function allTargets(db: Database): ConformanceTarget[] {
-  const detected = detectedBinaries();
-  return [
-    ...builtinAdapters.map((spec) => builtinTarget(spec, detected.get(spec.app))),
-    ...listDiscovered(db).map(
-      (record): ConformanceTarget => ({
-        app: record.app,
-        spec: record.spec,
-        builtin: false,
-        binaryPath: record.spec.binary,
-        status: record.status,
-      }),
-    ),
-  ];
-}
-
-function namedTarget(db: Database, app: string): ConformanceTarget {
-  const record = listDiscovered(db).find((r) => r.app === app);
-  if (record) {
-    return {
-      app,
-      spec: record.spec,
-      builtin: false,
-      binaryPath: record.spec.binary,
-      status: record.status,
-    };
-  }
-  const spec = getAdapter(app);
-  if (!spec) {
-    throw new UsageError(
-      `unknown adapter '${app}'. 'baton adapters list' shows the built-in and discovered ones.`,
-    );
-  }
-  return builtinTarget(spec, detectedBinaries().get(app));
-}
-
-function builtinTarget(
-  spec: AdapterSpec,
-  binaryPath: string | null | undefined,
-): ConformanceTarget {
-  return {
-    app: spec.app,
-    spec,
-    builtin: true,
-    binaryPath: binaryPath ?? undefined,
-    status: "pinned",
-  };
-}
-
-/** Built-in binaries only: a discovered spec carries its own absolute path. */
-function detectedBinaries(): Map<string, string | null | undefined> {
-  return new Map(detectApps({ probeVersion: false }).map((a) => [a.app, a.binaryPath]));
-}
-
-/**
- * The same structural rules the quarantine gate applies. A built-in is checked
- * for shape only: the validator's other two rules are about provenance, and a
- * pinned adapter necessarily trips both (its app id "collides" with itself, its
- * `binary` is the PATH name detect resolves at run time).
- */
-function conformanceErrors(target: ConformanceTarget): string[] {
-  const result = validateSpec(target.spec, { builtin: target.builtin });
-  return result.ok ? [] : result.errors;
-}
-
-/** Live half of the suite: burns real quota, so it is opt-in per invocation. */
-async function liveCanary(
-  db: Database,
-  target: ConformanceTarget,
-): Promise<{ failed: boolean; detail: string }> {
-  if (!target.builtin) {
-    const result = await canaryDiscovered(db, target.app);
-    return result.ok
-      ? { failed: false, detail: "passed" }
-      : { failed: true, detail: result.errors.join("; ") };
-  }
-  // Not installed is not a conformance failure: this scope simply cannot reach
-  // that app, which `detect` already reports.
-  if (!target.binaryPath) return { failed: false, detail: "skipped (not on PATH)" };
-  // The canary is a real call on a real subscription, so it obeys the deny
-  // list: it canaries the first route the user has not blocked, and refuses
-  // rather than spending one they have. Pinned routes only: the canary proves
-  // the declared spec, and asking the app for its models is itself a spawn
-  // that --structural promises not to make.
-  const route = canarySlug(listBlocks(db), target.app, target.spec.models, DEFAULT_INSTANCE);
-  if (route && "blocked" in route) {
-    return { failed: false, detail: `skipped (${routeBlockReason(route.blocked)})` };
-  }
-  const slug = route?.slug;
-  const autonomy = AUTONOMY_ORDER.find((level) => target.spec.autonomyFlags[level]);
-  if (!slug || !autonomy) return { failed: true, detail: "declares no runnable route" };
-
-  const result = await executeAdapter({
-    spec: target.spec,
-    binaryPath: target.binaryPath,
-    slug,
-    prompt: CANARY_PROMPT,
-    cwd: process.cwd(),
-    env: process.env,
-    autonomy,
-    timeoutMs: CANARY_TIMEOUT_MS,
-  });
-  const output = result.output ?? "";
-  // Exact, like the discovered-adapter canary: extraction that returns the
-  // token wrapped in a transcript has not been verified, it has been guessed at.
-  if (result.ok && output.trim() === CANARY_TOKEN) return { failed: false, detail: "passed" };
-  return {
-    failed: true,
-    detail: result.ok
-      ? `answered ${preview(output)} instead of ${CANARY_TOKEN}`
-      : (result.error ?? "failed"),
-  };
+  return runAdapters(openDb(), args);
 }
 
 /**
@@ -1364,8 +958,8 @@ async function matchingRoutes(db: Database, pattern: string): Promise<string[]> 
       DEFAULT_INSTANCE,
       ...(spec.identityEnv ? instanceNames(db, spec.app) : []),
     ];
-    for (const route of await routesOf(spec)) {
-      for (const instance of instances) {
+    for (const instance of instances) {
+      for (const route of (await catalogFor(spec, instanceEnvironment(db, spec.app, instance))).routes) {
         if (blockFor(one, spec.app, instance, route.slug)) {
           keys.push(routeKey(spec.app, instance, route.slug));
         }
@@ -2006,7 +1600,7 @@ function validKeys(): string {
 
 /**
  * Apps this scope can address in a setting. Built-ins always; active discovered
- * adapters too, once a human approved them and the canary activated them — they
+ * adapters too, once they are enabled — they
  * are routable, so a ceiling or a preciousness for them is exactly as meaningful
  * (the registry reads both kinds of setting generically). A `db` is only passed
  * where one is already open; the bare listing never opens a store to print help.
@@ -2014,7 +1608,7 @@ function validKeys(): string {
 function knownApps(db?: Database): string[] {
   const discovered = db
     ? listDiscovered(db)
-        .filter((record) => record.status === "active")
+        .filter((record) => record.status === "enabled")
         .map((record) => record.app)
     : [];
   return [...new Set([...builtinAdapters.map((spec) => spec.app), ...discovered])].sort();

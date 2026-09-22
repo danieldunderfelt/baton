@@ -1,6 +1,5 @@
 import type { Database } from "bun:sqlite";
 
-import type { RouteSpec } from "../adapters/types.ts";
 import { nowIso, withBusyRetry } from "../store/store.ts";
 
 /**
@@ -82,27 +81,6 @@ export function blockFor(
 /** How a refusal reads, wherever one surfaces. */
 export function blockReason(block: RouteBlock): string {
   return `blocked by '${block.pattern}'${block.reason ? ` (${block.reason})` : ""}`;
-}
-
-/**
- * The first route a canary may spend, on the inherited-environment instance it
- * runs in. Conformance is a real call on a real subscription, so it takes the
- * user's deny list as seriously as selection does: an adapter whose routes are
- * all blocked is not canaried, it is reported as blocked.
- */
-export function canarySlug(
-  blocks: RouteBlock[],
-  app: string,
-  models: RouteSpec[],
-  instance: string,
-): { slug: string } | { blocked: RouteBlock } | undefined {
-  let denied: RouteBlock | undefined;
-  for (const route of models) {
-    const block = blockFor(blocks, app, instance, route.slug);
-    if (!block) return { slug: route.slug };
-    denied ??= block;
-  }
-  return denied ? { blocked: denied } : undefined;
 }
 
 const regexCache = new Map<string, RegExp>();
