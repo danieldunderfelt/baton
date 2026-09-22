@@ -1,3 +1,6 @@
+// Historical baseline harness for commit 730c61d. Its imports intentionally
+// target the pre-fix API. Current regression coverage lives in src/discovery,
+// src/registry, src/supervisor/runtime-regression.test.ts and src/adapters.
 import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { openStore } from '../../src/store/store.ts';
