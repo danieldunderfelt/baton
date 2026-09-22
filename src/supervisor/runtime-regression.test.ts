@@ -250,4 +250,23 @@ describe("runtime regressions", () => {
     db.close();
   });
 
+
+  test("shutdown shortens an existing cancellation before the host can kill the supervisor", async () => {
+    const { db, dir } = scope();
+    const ready = join(dir, "ready-to-stop");
+    const adapter = spec();
+    adapter.invoke.argv = ["-e", `process.on('SIGTERM',()=>{});await Bun.write(${JSON.stringify(ready)},String(process.pid));await Bun.sleep(60000)`];
+    const sup = supervisor(db, adapter);
+    const run = await sup.startRun({ model: "test-model", prompt: "wait" });
+    await until(() => existsSync(ready));
+    const pid = Number(readFileSync(ready, "utf8"));
+    sup.cancelRun(run.view.runId);
+    const started = Date.now();
+    await sup.shutdown();
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(groupAlive(pid)).toBe(false);
+    expect(sup.getRun(run.view.runId)!.status).toBe("cancelled");
+    db.close();
+  });
+
 });

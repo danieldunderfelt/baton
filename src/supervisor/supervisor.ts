@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { builtinAdapters } from "../adapters/builtin/index.ts";
-import { classifyFailure, executeAdapter, groupAlive, killProcessGroup, type KillOutcome } from "../adapters/executor.ts";
+import { classifyFailure, executeAdapter, groupAlive, killProcessGroup, type KillOutcome, type KillOptions } from "../adapters/executor.ts";
 import {
   AUTONOMY_ORDER,
   type AdapterSpec,
@@ -58,6 +58,8 @@ import {
 const POLL_MS = 250;
 /** Between SIGTERM and SIGKILL of a cancelled attempt's process group. */
 const KILL_ESCALATION_MS = 3_000;
+/** Host SDKs may forcibly close the server after two seconds on disconnect. */
+const SHUTDOWN_KILL: KillOptions = { graceMs: 250, deadlineMs: 1500, pollMs: 25 };
 const MAX_OUTPUT_CHARS = 200_000;
 const MAX_RAW_TAIL_CHARS = 32_000;
 /**
@@ -410,10 +412,12 @@ export class Supervisor {
     this.recoverOrphans();
   }
 
-  private stop(live: Live): void {
+  private stop(live: Live, shutdown = false): void {
     live.cancelled = true;
-    if (live.pid === null || live.termination) return;
-    live.termination = killProcessGroup(live.pid, { graceMs: KILL_ESCALATION_MS });
+    if (live.pid === null || (live.termination && !shutdown)) return;
+    // Disconnect shortens an existing cancellation too: its normal grace can
+    // exceed the host's deadline for killing this supervisor.
+    live.termination = killProcessGroup(live.pid, shutdown ? SHUTDOWN_KILL : { graceMs: KILL_ESCALATION_MS });
   }
 
   private checkCancellation(live: Live): void {
@@ -430,6 +434,7 @@ export class Supervisor {
    */
   async shutdown(): Promise<void> {
     clearTimeout(this.recoveryTimer);
+    for (const live of this.live.values()) this.stop(live, true);
     for (const runId of this.tasks.keys()) this.cancelRun(runId);
     await Promise.allSettled(this.tasks.values());
     clearTimeout(this.recoveryTimer);
