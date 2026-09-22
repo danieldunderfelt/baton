@@ -1584,3 +1584,24 @@ describe("runs (a side of an unjudged duel)", () => {
     expect((await baton(scope, "runs")).stdout).not.toContain("(blind)");
   }, 30_000);
 });
+
+test("cancel --json preserves duel anonymity until the verdict", async () => {
+  const scope = tmp("cancel-blind");
+  const bin = fakeCallees({ kimi: "ANSWER FROM ALPHA", codex: "ANSWER FROM BRAVO" });
+  const duel = await batonOnPath(scope, bin, "duel", "kimi-k3", "gpt-5.6-sol", "compare");
+  expect(duel.code, duel.stderr).toBe(0);
+  const duelId = /baton duel report (\S+)/.exec(duel.stdout)?.[1] ?? "";
+  const listed = await baton(scope, "runs");
+  const runId = /run_\S+/.exec(listed.stdout)?.[0] ?? "";
+  expect(runId).toStartWith("run_");
+  const hidden = await baton(scope, "cancel", runId, "--json");
+  expect(hidden.code, hidden.stderr).toBe(0);
+  expect(JSON.parse(hidden.stdout)).toMatchObject({ runId, status: "succeeded", output: expect.stringContaining("ANSWER FROM") });
+  for (const name of ["kimi", "codex", "gpt-5.6", "@a"]) expect(hidden.stdout).not.toContain(name);
+  expect(hidden.stdout).toContain(`duel ${duelId} (blind)`);
+  expect((await baton(scope, "duel", "report", duelId, "A")).code).toBe(0);
+  const revealed = await baton(scope, "cancel", runId, "--json");
+  expect(revealed.code, revealed.stderr).toBe(0);
+  expect(revealed.stdout).toMatch(/kimi-k3|gpt-5\.6-sol/);
+  expect(revealed.stdout).not.toContain("(blind)");
+}, 30000);
