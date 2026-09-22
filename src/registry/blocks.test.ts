@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -11,13 +11,28 @@ import {
   addBlock,
   blockFor,
   blockReason,
-  canarySlug,
   listBlocks,
   normalizePattern,
   removeBlock,
   routeKey,
 } from "./blocks.ts";
 import { listModels, selectTarget, targetFor } from "./registry.ts";
+import { clearCatalogCache } from "./catalog.ts";
+
+let previousCacheHome: string | undefined;
+let cacheHome: string;
+beforeEach(() => {
+  previousCacheHome = process.env.XDG_CACHE_HOME;
+  cacheHome = mkdtempSync(join(tmpdir(), "baton-blocks-cache-"));
+  process.env.XDG_CACHE_HOME = cacheHome;
+  clearCatalogCache();
+});
+afterEach(() => {
+  clearCatalogCache();
+  if (previousCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+  else process.env.XDG_CACHE_HOME = previousCacheHome;
+  rmSync(cacheHome, { recursive: true, force: true });
+});
 
 function scopeStore(name: string): Database {
   const root = mkdtempSync(join(tmpdir(), `baton-${name}-`));
@@ -46,11 +61,11 @@ function fakeBinary(name: string): string {
   return join(dir, name);
 }
 
-function withFakeBinary<T>(name: string, fn: () => T): T {
+async function withFakeBinary<T>(name: string, fn: () => T | Promise<T>): Promise<T> {
   const prev = process.env.PATH;
   process.env.PATH = dirname(fakeBinary(name));
   try {
-    return fn();
+    return await fn();
   } finally {
     process.env.PATH = prev;
   }
@@ -148,20 +163,20 @@ describe("the block store", () => {
 });
 
 describe("selection", () => {
-  test("a blocked route is excluded, and never relaxed onto", () => {
+  test("a blocked route is excluded, and never relaxed onto", async () => {
     const db = scopeStore("blocks-select");
     addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
-    expect(() => withFakeBinary("opencode", () => selectTarget(db, REPORTED))).toThrow(
+    await expect(withFakeBinary("opencode", () => selectTarget(db, REPORTED))).rejects.toThrow(
       /client enterprise subscription/,
     );
   });
 
-  test("the refusal does not advise waiting for quota that would never free it", () => {
+  test("the refusal does not advise waiting for quota that would never free it", async () => {
     const db = scopeStore("blocks-select-hint");
     addBlock(db, "opencode");
     let error = "";
     try {
-      withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
+      await withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
     } catch (err) {
       error = (err as Error).message;
     }
@@ -169,14 +184,14 @@ describe("selection", () => {
     expect(error).not.toMatch(/wait for a cooldown/);
   });
 
-  test("the app's unblocked routes still route", () => {
+  test("the app's unblocked routes still route", async () => {
     const db = scopeStore("blocks-select-sibling");
     addBlock(db, "opencode/fake-provider/*");
-    const target = withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
+    const target = await withFakeBinary("opencode", () => selectTarget(db, "muse-spark-1.3"));
     expect(target.slug).toBe("opencode/muse-spark-1.3-contributor-free");
   });
 
-  test("blocking one instance leaves the pool's others selectable", () => {
+  test("blocking one instance leaves the pool's others selectable", async () => {
     const db = scopeStore("blocks-select-pool");
     for (const name of ["work", "personal"]) {
       db.query("INSERT INTO instances (app, name, env, created_at) VALUES (?, ?, '{}', ?)").run(
@@ -188,7 +203,7 @@ describe("selection", () => {
     setPool(db, "kimi", ["work", "personal"]);
     addBlock(db, "kimi:work/*", "client machine");
 
-    const target = withFakeBinary("kimi", () => selectTarget(db, "kimi-k3"));
+    const target = await withFakeBinary("kimi", () => selectTarget(db, "kimi-k3"));
     expect(target.instance).toBe("personal");
     expect(target.considered?.find((c) => c.instance === "work")?.excluded).toMatch(
       /client machine/,
@@ -197,45 +212,45 @@ describe("selection", () => {
 });
 
 describe("resume", () => {
-  test("session affinity does not outrank a block added since", () => {
+  test("session affinity does not outrank a block added since", async () => {
     const db = scopeStore("blocks-resume");
     addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
     const ref = { app: "opencode", slug: REPORTED, instance: "default" };
-    expect(() => withFakeBinary("opencode", () => targetFor(ref, db))).toThrow(
+    await expect(withFakeBinary("opencode", () => targetFor(ref, db))).rejects.toThrow(
       /Cannot resume this run.*client enterprise subscription/s,
     );
   });
 
-  test("an unblocked route of the same app still resumes", () => {
+  test("an unblocked route of the same app still resumes", async () => {
     const db = scopeStore("blocks-resume-sibling");
     addBlock(db, "opencode/fake-provider/*");
     const ref = { app: "opencode", slug: "opencode/muse-spark-1.3-contributor-free", instance: "default" };
-    expect(withFakeBinary("opencode", () => targetFor(ref, db)).slug).toBe(
+    expect((await withFakeBinary("opencode", () => targetFor(ref, db))).slug).toBe(
       "opencode/muse-spark-1.3-contributor-free",
     );
   });
 });
 
 describe("list_models", () => {
-  test("a fully blocked route is unavailable, with the pattern and reason", () => {
+  test("a fully blocked route is unavailable, with the pattern and reason", async () => {
     const db = scopeStore("blocks-list");
     addBlock(db, "opencode/fake-provider/*", "client enterprise subscription");
-    const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === REPORTED)!;
+    const row = (await withFakeBinary("opencode", () => listModels(db))).find((m) => m.model === REPORTED)!;
     expect(row.available).toBe(false);
     expect(row.degradedReason).toBe(
       "blocked by 'opencode:*/fake-provider/*' (client enterprise subscription)",
     );
   });
 
-  test("the app's other routes are unaffected", () => {
+  test("the app's other routes are unaffected", async () => {
     const db = scopeStore("blocks-list-sibling");
     addBlock(db, "opencode/fake-provider/*");
-    const row = withFakeBinary("opencode", () => listModels(db)).find((m) => m.model === "muse-spark-1.3")!;
+    const row = (await withFakeBinary("opencode", () => listModels(db))).find((m) => m.model === "muse-spark-1.3")!;
     expect(row.available).toBe(true);
     expect(row.degradedReason).toBeUndefined();
   });
 
-  test("a partial block does not claim the route is unavailable", () => {
+  test("a partial block does not claim the route is unavailable", async () => {
     const db = scopeStore("blocks-list-partial");
     for (const name of ["work", "personal"]) {
       db.query("INSERT INTO instances (app, name, env, created_at) VALUES (?, ?, '{}', ?)").run(
@@ -246,29 +261,7 @@ describe("list_models", () => {
     }
     setPool(db, "kimi", ["work", "personal"]);
     addBlock(db, "kimi:work/*");
-    const row = withFakeBinary("kimi", () => listModels(db)).find((m) => m.model === "kimi-k3")!;
+    const row = (await withFakeBinary("kimi", () => listModels(db))).find((m) => m.model === "kimi-k3")!;
     expect(row.available).toBe(true);
-  });
-});
-
-describe("canarySlug", () => {
-  const models = [
-    { model: "muse-spark-1.3", slug: "opencode/muse-spark-1.3-contributor-free" },
-    { model: REPORTED, slug: REPORTED },
-  ];
-
-  test("picks the first route the user has not blocked", () => {
-    const blocks = [{ pattern: normalizePattern("opencode/opencode/*"), createdAt: nowIso() }];
-    expect(canarySlug(blocks, "opencode", models, "default")).toEqual({ slug: REPORTED });
-  });
-
-  test("refuses when every route is blocked", () => {
-    const blocks = [{ pattern: "opencode:*/*", reason: "client", createdAt: nowIso() }];
-    const result = canarySlug(blocks, "opencode", models, "default");
-    expect(result && "blocked" in result && result.blocked.reason).toBe("client");
-  });
-
-  test("no routes at all is not a block", () => {
-    expect(canarySlug([], "opencode", [], "default")).toBeUndefined();
   });
 });

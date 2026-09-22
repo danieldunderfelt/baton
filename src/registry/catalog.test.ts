@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,7 @@ import {
   forgetCatalogMemory,
   parseSlugs,
 } from "./catalog.ts";
+import { probeVersion } from "./probes.ts";
 
 /**
  * The cache file is machine-wide, so every test points XDG_CACHE_HOME at its
@@ -18,6 +19,7 @@ import {
  */
 let cacheHome: string;
 let previousCacheHome: string | undefined;
+let fixtureDirs: string[] = [];
 
 beforeEach(() => {
   previousCacheHome = process.env.XDG_CACHE_HOME;
@@ -28,6 +30,8 @@ beforeEach(() => {
 
 afterEach(() => {
   clearCatalogCache();
+  for (const dir of [cacheHome, ...fixtureDirs]) rmSync(dir, { recursive: true, force: true });
+  fixtureDirs = [];
   if (previousCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
   else process.env.XDG_CACHE_HOME = previousCacheHome;
 });
@@ -38,6 +42,7 @@ afterEach(() => {
  */
 function fakeLister(stdout: string, code = 0): { binary: string; calls: () => number } {
   const dir = mkdtempSync(join(tmpdir(), "baton-catalog-bin-"));
+  fixtureDirs.push(dir);
   const counter = join(dir, "calls");
   const binary = join(dir, "fake");
   writeFileSync(
@@ -132,18 +137,18 @@ describe("parseSlugs", () => {
 });
 
 describe("catalogOf", () => {
-  test("no listing command, or no binary: the pinned routes are the catalog", () => {
-    expect(catalogOf(spec(undefined), "/bin/whatever")).toEqual({
+  test("no listing command, or no binary: the pinned routes are the catalog", async () => {
+    expect(await catalogOf(spec(undefined), "/bin/whatever")).toEqual({
       routes: [{ model: "pinned-id", slug: "fake/pinned" }],
     });
-    expect(catalogOf(spec(LINES), null)).toEqual({
+    expect(await catalogOf(spec(LINES), null)).toEqual({
       routes: [{ model: "pinned-id", slug: "fake/pinned" }],
     });
   });
 
-  test("reported slugs become routes under their own name, after the pinned ones", () => {
+  test("reported slugs become routes under their own name, after the pinned ones", async () => {
     const { binary } = fakeLister("fake/new\nfake/pinned\nfake/other");
-    expect(catalogOf(spec(LINES), binary)).toEqual({
+    expect(await catalogOf(spec(LINES), binary)).toEqual({
       routes: [
         { model: "pinned-id", slug: "fake/pinned" },
         { model: "fake/new", slug: "fake/new" },
@@ -152,51 +157,91 @@ describe("catalogOf", () => {
     });
   });
 
-  test("a reported slug never shadows a pinned canonical id", () => {
+  test("a reported slug never shadows a pinned canonical id", async () => {
     const { binary } = fakeLister("pinned-id\nfake/new");
-    expect(catalogOf(spec(LINES), binary).routes.map((r) => r.model)).toEqual([
+    expect((await catalogOf(spec(LINES), binary)).routes.map((r) => r.model)).toEqual([
       "pinned-id",
       "fake/new",
     ]);
   });
 
-  test("a failed listing keeps the pinned routes and says why", () => {
+  test("a failed listing keeps the pinned routes and says why", async () => {
     const { binary } = fakeLister("boom", 3);
-    const catalog = catalogOf(spec(LINES), binary);
+    const catalog = await catalogOf(spec(LINES), binary);
     expect(catalog.routes).toEqual([{ model: "pinned-id", slug: "fake/pinned" }]);
     expect(catalog.listingError).toBe("'models' exit 3");
   });
 
-  test("the listing is memoized in memory and on disk", () => {
+  test("the listing is memoized in memory and on disk", async () => {
     const lister = fakeLister("fake/new");
-    catalogOf(spec(LINES), lister.binary);
-    catalogOf(spec(LINES), lister.binary);
+    await catalogOf(spec(LINES), lister.binary);
+    await catalogOf(spec(LINES), lister.binary);
     expect(lister.calls()).toBe(1);
     expect(existsSync(catalogCachePath())).toBe(true);
     expect(catalogCachePath()).toStartWith(cacheHome);
     // A fresh process reads the file instead of listing again.
     forgetCatalogMemory();
-    expect(catalogOf(spec(LINES), lister.binary).routes.map((r) => r.slug)).toContain("fake/new");
+    expect((await catalogOf(spec(LINES), lister.binary)).routes.map((r) => r.slug)).toContain("fake/new");
     expect(lister.calls()).toBe(1);
   });
 
-  test("a binary replaced under a live process is asked again", () => {
+  test("a binary replaced under a live process is asked again", async () => {
     const lister = fakeLister("fake/new");
-    catalogOf(spec(LINES), lister.binary);
+    await catalogOf(spec(LINES), lister.binary);
     const later = new Date(Date.now() + 5_000);
     utimesSync(lister.binary, later, later);
-    catalogOf(spec(LINES), lister.binary);
+    await catalogOf(spec(LINES), lister.binary);
     expect(lister.calls()).toBe(2);
   });
 
-  test("the cache is per identity: another config dir is another catalog", () => {
+  test("the cache is per identity: another config dir is another catalog", async () => {
     const lister = fakeLister("fake/new");
     const withIdentity = spec(LINES, "FAKE_HOME");
-    process.env.FAKE_HOME = "/tmp/one";
-    catalogOf(withIdentity, lister.binary);
-    process.env.FAKE_HOME = "/tmp/two";
-    catalogOf(withIdentity, lister.binary);
-    delete process.env.FAKE_HOME;
+    await catalogOf(withIdentity, lister.binary, { ...process.env, FAKE_HOME: "/tmp/one" });
+    await catalogOf(withIdentity, lister.binary, { ...process.env, FAKE_HOME: "/tmp/two" });
     expect(lister.calls()).toBe(2);
   });
+
+  test("simultaneous cache misses share a single listing process", async () => {
+    const lister = fakeLister("fake/new");
+    const catalogs = await Promise.all(Array.from({ length: 12 }, () => catalogOf(spec(LINES), lister.binary)));
+    expect(catalogs.every(catalog => catalog.routes.some(route => route.slug === "fake/new"))).toBe(true);
+    expect(lister.calls()).toBe(1);
+  });
+
+  test("effective account environments select and cache different model rosters", async () => {
+    const lister = fakeLister("");
+    writeFileSync(lister.binary, '#!/bin/sh\necho "$ACCOUNT_MODEL"\n');
+    const inherited = { ...process.env, FAKE_HOME: "/tmp/shared", ACCOUNT_SECRET: "private-credential-do-not-persist" };
+    const free = { ...inherited, ACCOUNT_MODEL: "free-model" };
+    const paid = { ...inherited, ACCOUNT_MODEL: "paid-model" };
+    const adapter = spec(LINES, "FAKE_HOME");
+    expect((await catalogOf(adapter, lister.binary, free)).routes.at(-1)?.model).toBe("free-model");
+    expect((await catalogOf(adapter, lister.binary, paid)).routes.at(-1)?.model).toBe("paid-model");
+    forgetCatalogMemory();
+    expect((await catalogOf(adapter, lister.binary, free)).routes.at(-1)?.model).toBe("free-model");
+    expect((await catalogOf(adapter, lister.binary, paid)).routes.at(-1)?.model).toBe("paid-model");
+    expect(readFileSync(catalogCachePath(), "utf8")).not.toContain(inherited.ACCOUNT_SECRET);
+  });
+
+  test("a slow listing observes a timer that ran while the child was active", async () => {
+    const lister = fakeLister("");
+    const marker = join(cacheHome, "timer-fired");
+    writeFileSync(lister.binary, `#!/bin/sh\n/bin/sleep 0.15\nif [ -f '${marker}' ]; then echo timer-ran; else echo timer-blocked; fi\n`);
+    const timer = setTimeout(() => writeFileSync(marker, "done"), 20);
+    try {
+      expect((await catalogOf(spec(LINES), lister.binary)).routes.at(-1)?.slug).toBe("timer-ran");
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  test("a version probe that times out cannot cache partial stdout as a version", async () => {
+    const lister = fakeLister("");
+    // Some CLIs catch termination and exit zero after printing a partial result.
+    writeFileSync(lister.binary, "#!/bin/sh\ntrap 'exit 0' TERM\necho partial-version\nwhile :; do /bin/sleep 0.1; done\n");
+    expect(await probeVersion(lister.binary)).toBeUndefined();
+    // A cached result must retain the failure, too.
+    expect(await probeVersion(lister.binary)).toBeUndefined();
+  }, 10_000);
 });

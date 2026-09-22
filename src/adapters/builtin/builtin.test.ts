@@ -525,8 +525,8 @@ describe.skipIf(!LIVE)("live listing", () => {
   // quota, so it needs no cheapest-route dance.
   test.each(builtinAdapters.filter((s) => s.listModels).map((s) => [s.app, s] as const))(
     "%s reports its models through the declared command",
-    (_app, spec: AdapterSpec) => {
-      const catalog = catalogOf(spec, Bun.which(spec.binary));
+    async (_app, spec: AdapterSpec) => {
+      const catalog = await catalogOf(spec, Bun.which(spec.binary));
       expect(catalog.listingError).toBeUndefined();
       expect(catalog.routes.length).toBeGreaterThan(spec.models.length);
     },
