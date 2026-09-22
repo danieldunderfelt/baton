@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   statSync,
@@ -267,26 +269,31 @@ export function skillText(withEval: boolean): string {
   return withEval ? `${body}\n\n${EVAL_TEMPLATE.trimEnd()}\n\n${marker}\n` : `${body}\n\n${marker}\n`;
 }
 
-function manifestPath(env: Env): string {
-  return join(resolvePaths(env).configDir, "installed-skills.json");
+function skillRecordsDir(env: Env): string {
+  return join(resolvePaths(env).configDir, "installed-skills");
 }
 
 function rememberedSkills(env: Env): string[] {
-  const path = manifestPath(env);
-  if (!existsSync(path)) return [];
-  const paths: unknown = JSON.parse(readFileSync(path, "utf8"));
-  if (!Array.isArray(paths) || !paths.every((value): value is string => typeof value === "string")) {
-    throw new Error(`Invalid installed skill manifest: ${path}`);
-  }
-  return paths;
+  const dir = skillRecordsDir(env);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .map((name) => {
+      const record = join(dir, name);
+      const path: unknown = JSON.parse(readFileSync(record, "utf8"));
+      if (typeof path !== "string") throw new Error(`Invalid installed skill record: ${record}`);
+      return path;
+    });
 }
 
+/** Separate records let concurrent project installations publish without losing one another. */
 function rememberSkill(path: string, env: Env): void {
-  const paths = rememberedSkills(env);
-  if (paths.includes(path)) return;
-  const manifest = manifestPath(env);
-  mkdirSync(dirname(manifest), { recursive: true });
-  atomicWrite(manifest, `${JSON.stringify([...paths, path], null, 2)}\n`);
+  const absolute = resolve(path);
+  const dir = skillRecordsDir(env);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const key = createHash("sha256").update(absolute).digest("hex");
+  atomicWrite(join(dir, `${key}.json`), `${JSON.stringify(absolute)}\n`);
 }
 
 /** Refresh recorded and legacy installations without touching host configuration. */

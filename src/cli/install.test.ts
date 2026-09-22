@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -27,6 +28,48 @@ function installHost(host: Parameters<typeof install>[0], opts: Parameters<typeo
 }
 
 describe("refresh installed skills", () => {
+  test("concurrent project installs all remain discoverable for later updates", async () => {
+    const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
+    const barrier = temp();
+    const go = join(barrier, "go");
+    const projects = Array.from({ length: 24 }, () => temp());
+    const children = projects.map((dir, index) => {
+      const code = `
+        import { installHost } from ${JSON.stringify(join(import.meta.dir, "install.ts"))};
+        import { existsSync, writeFileSync } from "node:fs";
+        writeFileSync(${JSON.stringify(join(barrier, String(index)))}, "ready");
+        while (!existsSync(${JSON.stringify(go)})) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+        installHost("codex", { dir: ${JSON.stringify(dir)}, env: ${JSON.stringify(env)}, withEval: false });
+      `;
+      return Bun.spawn([process.execPath, "-e", code], { stdout: "ignore", stderr: "pipe", stdin: "ignore" });
+    });
+    try {
+      const deadline = Date.now() + 10_000;
+      const allReady = () => projects.every((_, index) => existsSync(join(barrier, String(index))));
+      while (!allReady() && Date.now() < deadline) await Bun.sleep(10);
+      expect(allReady()).toBe(true);
+      writeFileSync(go, "start");
+      await Promise.all(children.map(async (child) => {
+        const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+        expect(code, error).toBe(0);
+      }));
+      const skills = projects.map((dir) => join(dir, ".agents/skills/baton/SKILL.md"));
+      for (const path of skills) {
+        writeFileSync(path, skillText(false).replace("Delegate a task", "Old instructions"));
+      }
+      expect(refreshInstalledSkills({ dir: temp(), env }).sort()).toEqual(skills.sort());
+      for (const path of skills) expect(readFileSync(path, "utf8")).toBe(skillText(false));
+      expect(refreshInstalledSkills({ dir: temp(), env })).toEqual([]);
+      const records = join(env.BATON_CONFIG_DIR, "installed-skills");
+      expect(readdirSync(records)).toHaveLength(projects.length);
+    } finally {
+      for (const child of children) child.kill();
+      await Promise.all(children.map((child) => child.exited));
+    }
+  }, 20_000);
+
   test("the update entry point refreshes recorded skills from the running executable", async () => {
     const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
     const installation = install("codex", { dir: temp(), env });
@@ -73,7 +116,8 @@ describe("refresh installed skills", () => {
     expect(readFileSync(unrelated, "utf8")).toBe("My own baton skill.\n");
     expect(existsSync(join(dir, ".claude/skills/baton/SKILL.md"))).toBe(false);
     expect(existsSync(join(env.HOME, ".agents/skills/baton/SKILL.md"))).toBe(false);
-    expect(JSON.parse(readFileSync(join(env.BATON_CONFIG_DIR, "installed-skills.json"), "utf8"))).toEqual([legacy]);
+    const records = join(env.BATON_CONFIG_DIR, "installed-skills");
+    expect(readdirSync(records).map((name) => JSON.parse(readFileSync(join(records, name), "utf8")))).toEqual([legacy]);
   });
 });
 
