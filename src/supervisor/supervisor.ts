@@ -9,7 +9,7 @@ import {
   type ExecRequest,
   type ExecResult,
 } from "../adapters/types.ts";
-import { specDigest } from "../discovery/discovery.ts";
+import { getDiscovered, specDigest } from "../discovery/discovery.ts";
 import { recordReliability } from "../eval/evalStore.ts";
 import {
   clearCooldown,
@@ -30,6 +30,7 @@ import {
   type Target,
 } from "../registry/registry.ts";
 import { newId, nowIso, pruneRuns, withBusyRetry } from "../store/store.ts";
+import { blockFor, blockReason, listBlocks, routeKey } from "../registry/blocks.ts";
 import {
   ADAPTER_DIGEST,
   ADAPTER_VERSION,
@@ -509,6 +510,7 @@ export class Supervisor {
     try {
       this.checkCancellation(live);
       if (live.cancelled) return { ok: false, started: false, exitCode: null, timedOut: false, rawTail: "", error: "cancelled before execution", durationMs: 0 };
+      this.assertAdmissionAllowed(ctx);
       const result = await this.exec(
         {
           spec:
@@ -556,6 +558,24 @@ export class Supervisor {
       };
     } finally {
       clearInterval(poll);
+    }
+  }
+
+  /** Async discovery may have outlived a block, registration edit or permission change. */
+  private assertAdmissionAllowed(ctx: AttemptCtx): void {
+    const { spec, instance, slug } = ctx.target;
+    const blocked = blockFor(listBlocks(this.db), spec.app, instance, slug);
+    if (blocked) throw new Error(`${routeKey(spec.app, instance, slug)} is ${blockReason(blocked)}.`);
+
+    const registered = getDiscovered(this.db, spec.app);
+    if (registered?.status === "disabled") throw new Error(`Adapter '${spec.app}' was disabled before execution.`);
+    if (registered && registered.digest !== specDigest(spec)) {
+      throw new Error(`Adapter '${spec.app}' changed before execution. Start the run again to use its current registration.`);
+    }
+
+    const ceiling = ceilingFor(this.db, spec.app);
+    if (AUTONOMY_ORDER.indexOf(ctx.autonomy) > AUTONOMY_ORDER.indexOf(ceiling)) {
+      throw new Error(`Autonomy '${ctx.autonomy}' exceeds the current '${ceiling}' ceiling for '${spec.app}'.`);
     }
   }
 
