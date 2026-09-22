@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { ensurePaths, resolvePaths, type BatonPaths } from "../config/paths.ts";
 import { recordGrade } from "../eval/evalStore.ts";
-import { newId, nowIso, openStore, pruneRuns, RUN_CAP, withBusyRetry } from "./store.ts";
+import { inTransaction, newId, nowIso, openStore, pruneRuns, RUN_CAP, withBusyRetry } from "./store.ts";
 
 /** A throwaway BATON_CONFIG_DIR scope. Never touches a real Baton dir. */
 function scopePaths(name: string): BatonPaths {
@@ -82,21 +82,29 @@ describe("openStore — connection pragmas", () => {
   });
 });
 
+function rewindRuntimeSchema(db: Database): void {
+  db.exec(`DROP TABLE session_reservations;
+    ALTER TABLE attempts DROP COLUMN execution;
+    ALTER TABLE runs DROP COLUMN cancel_requested_at;
+    ALTER TABLE runs DROP COLUMN persistence_error;`);
+}
+
 describe("openStore — schema and migrations", () => {
   test("v8 cooldowns migrate without parking unrelated OpenCode providers", () => {
     const { paths, db } = scopeStore("migrate-v8");
+    rewindRuntimeSchema(db);
     db.exec(`DROP TABLE cooldowns;
       CREATE TABLE cooldowns (app TEXT NOT NULL, instance TEXT NOT NULL, until TEXT NOT NULL,
         strikes INTEGER NOT NULL DEFAULT 1, reason TEXT, PRIMARY KEY (app, instance));
       INSERT INTO cooldowns VALUES ('codex', 'default', '2099-01-01T00:00:00.000Z', 2, 'limited');
       INSERT INTO cooldowns VALUES ('opencode', 'default', '2099-01-01T00:00:00.000Z', 3, 'limited');
-      DELETE FROM schema_migrations WHERE version = 9;`);
+      DELETE FROM schema_migrations WHERE version >= 9;`);
     db.close();
     const upgraded = openStore(paths.dbPath);
     expect(upgraded.query("SELECT * FROM cooldowns").all()).toEqual([
       { app: "codex", instance: "default", scope: "", until: "2099-01-01T00:00:00.000Z", strikes: 2, reason: "limited" },
     ]);
-    expect(upgraded.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()!.version).toBe(9);
+    expect(upgraded.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()!.version).toBe(10);
     expect(upgraded.query("PRAGMA foreign_key_check").all()).toEqual([]);
     upgraded.close();
   });
@@ -160,6 +168,7 @@ describe("openStore — schema and migrations", () => {
   test("v7 adds bt_edges.mass2, defaulting existing edges to no retained Σw²", () => {
     const paths = scopePaths("edge-mass2");
     const first = openStore(paths.dbPath);
+    rewindRuntimeSchema(first);
     // A v6-shaped edge: written before Σw² was kept.
     first.exec("ALTER TABLE bt_edges DROP COLUMN mass2");
     first.exec("DROP TABLE route_blocks");
@@ -186,6 +195,7 @@ describe("openStore — schema and migrations", () => {
     insertRun(first, { id: "run_pre_v2" });
     const versions =
       first.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM schema_migrations").get()!.n;
+    rewindRuntimeSchema(first);
     // Rewind to a genuine v1 database: undo the later migrations' columns/tables.
     first.exec("ALTER TABLE attempts DROP COLUMN owner_pid");
     first.exec("ALTER TABLE runs DROP COLUMN payload_hash");
@@ -657,4 +667,24 @@ describe("BATON_CONFIG_DIR partitioning smoke", () => {
     expect(existsSync(join(rootB, "state", "baton.db"))).toBe(true);
     expect(a.paths.dbPath).toBe(join(rootA, "state", "baton.db"));
   });
+});
+
+
+test("nested write transactions use savepoints and roll back with their parent", () => {
+  const { db } = scopeStore("nested-transactions");
+  expect(() => inTransaction(db, () => {
+    db.query("INSERT INTO settings VALUES ('outer', 'first')").run();
+    inTransaction(db, () => db.query("INSERT INTO settings VALUES ('inner', 'second')").run());
+    throw new Error("outer rollback");
+  })).toThrow("outer rollback");
+  expect(db.query("SELECT * FROM settings").all()).toEqual([]);
+  inTransaction(db, () => {
+    db.query("INSERT INTO settings VALUES ('outer', 'first')").run();
+    expect(() => inTransaction(db, () => {
+      db.query("INSERT INTO settings VALUES ('inner', 'second')").run();
+      throw new Error("inner rollback");
+    })).toThrow("inner rollback");
+  });
+  expect(db.query("SELECT * FROM settings").all()).toEqual([{ key: "outer", value: "first" }]);
+  db.close();
 });

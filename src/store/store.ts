@@ -240,21 +240,40 @@ const MIGRATIONS: string[] = [
   DROP TABLE cooldowns;
   ALTER TABLE cooldowns_v9 RENAME TO cooldowns;
   `,
+  // v10: outcomes belong to attempts; sessions and cancellation are shared across supervisors.
+  `
+  ALTER TABLE attempts ADD COLUMN execution TEXT;
+  ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT;
+  ALTER TABLE runs ADD COLUMN persistence_error TEXT;
+  CREATE TABLE session_reservations (
+    session_key TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id)
+  );
+  INSERT OR IGNORE INTO session_reservations (session_key, attempt_id)
+    SELECT json_array(r.app, r.instance, origin.session_ref), a.id
+    FROM attempts a JOIN runs r ON r.id = a.run_id
+    JOIN attempts origin ON origin.run_id = json_extract(CASE WHEN json_valid(r.options) THEN r.options ELSE '{}' END, '$.resumed_from')
+    WHERE a.status IN ('queued','running') AND origin.session_ref IS NOT NULL
+      AND origin.seq = (SELECT MAX(seq) FROM attempts WHERE run_id = origin.run_id);
+  `,
 ];
 
 /** Ring-buffer cap on retained runs: about 2,000. */
 export const RUN_CAP = 2000;
 
+const runCaps = new WeakMap<Database, number>();
+
 export function openStore(dbPath: string, cap = RUN_CAP): Database {
+  if (!Number.isInteger(cap) || cap < 1) throw new Error("Run retention cap must be a positive integer.");
   const db = new Database(dbPath, { create: true, strict: true });
   // Enabling WAL takes the write lock, so a fresh-open stampede can hit BUSY here too.
   withBusyRetry(() => db.exec("PRAGMA journal_mode = WAL;"), MIGRATION_TRIES);
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA foreign_keys = ON;");
   migrate(db);
-  // Every Baton process opens the store, so retention self-maintains without a
-  // background job: the run ring buffer and the quota observations no window
-  // can still see.
+  runCaps.set(db, cap);
+  // Completion also prunes with this connection's cap, so long-lived servers
+  // keep the same retention policy as newly opened stores.
   pruneRuns(db, cap);
   withBusyRetry(() => pruneQuotaEvents(db, nowIso()));
   return db;
@@ -293,19 +312,22 @@ function migrate(db: Database): void {
 /**
  * Trims the run ring buffer to `cap`, oldest first. Only terminal runs are
  * evictable — queued/running rows are live state and survive regardless of age.
- * Attempts go first so the runs FK never dangles. Returns the runs deleted.
+ * The just-finished run remains readable to its caller even when older active
+ * runs already fill the cap. Attempts go first so the runs FK never dangles.
  */
-export function pruneRuns(db: Database, cap = RUN_CAP): number {
+export function pruneRuns(db: Database, cap = runCaps.get(db) ?? RUN_CAP, keepRunId?: string): number {
   if (countRuns(db) <= cap) return 0;
   return withBusyRetry(() =>
     inImmediate(db, () => {
       const excess = countRuns(db) - cap;
       if (excess <= 0) return 0;
-      const victims = `SELECT id FROM runs WHERE status NOT IN ('queued','running')
+      const victims = `SELECT id FROM runs WHERE status NOT IN ('queued','running') AND persistence_error IS NULL
+                       AND id != COALESCE(?, '')
+                       AND NOT EXISTS (SELECT 1 FROM attempts a JOIN session_reservations s ON s.attempt_id = a.id WHERE a.run_id = runs.id)
                        ORDER BY created_at, rowid LIMIT ?`;
-      db.query(`DELETE FROM attempts WHERE run_id IN (${victims})`).run(excess);
-      db.query(`DELETE FROM grades WHERE run_id IN (${victims})`).run(excess);
-      return db.query(`DELETE FROM runs WHERE id IN (${victims})`).run(excess).changes;
+      db.query(`DELETE FROM attempts WHERE run_id IN (${victims})`).run(keepRunId ?? null, excess);
+      db.query(`DELETE FROM grades WHERE run_id IN (${victims})`).run(keepRunId ?? null, excess);
+      return db.query(`DELETE FROM runs WHERE id IN (${victims})`).run(keepRunId ?? null, excess).changes;
     }),
   );
 }
@@ -316,6 +338,7 @@ function countRuns(db: Database): number {
 
 /** One write transaction, with the same busy retry and rollback in every store. */
 export function inTransaction<T>(db: Database, fn: () => T): T {
+  if (db.inTransaction) return db.transaction(fn)();
   return withBusyRetry(() => inImmediate(db, fn));
 }
 

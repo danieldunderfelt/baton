@@ -775,7 +775,8 @@ describe("cancelRun", () => {
     expect(pid).not.toBeNull();
 
     sup.cancelRun(view.runId);
-    expect(sup.getRun(view.runId)!.status).toBe("cancelled");
+    expect(sup.getRun(view.runId)!.status).toBe("running");
+    expect(sup.getRun(view.runId)!.cancellationRequested).toBe(true);
 
     await settled;
     expect(await isDead(pid!)).toBe(true);
@@ -807,15 +808,8 @@ describe("cancelRun", () => {
     });
 
     const { view, settled } = await sup.startRun({ model: "fake-model", prompt: "hi" });
-    // Exactly the writes another process's cancelRun makes — this supervisor's
-    // live entry never sees them, so it is still about to commit 'succeeded'.
-    const now = nowIso();
-    db.query(
-      "UPDATE attempts SET status = 'cancelled', finished_at = ? WHERE run_id = ? AND status IN ('queued','running')",
-    ).run(now, view.runId);
-    db.query(
-      "UPDATE runs SET status = 'cancelled', updated_at = ? WHERE id = ? AND status IN ('queued','running')",
-    ).run(now, view.runId);
+    // The remote requester writes only a request; the owner records completion.
+    db.query("UPDATE runs SET cancel_requested_at = ? WHERE id = ?").run(nowIso(), view.runId);
     release();
     await settled;
 
@@ -844,8 +838,8 @@ describe("cancelRun", () => {
     const b = await sup.startRun({ model: "fake-model", prompt: "two" });
 
     sup.shutdown();
-    expect(sup.getRun(a.view.runId)!.status).toBe("cancelled");
-    expect(sup.getRun(b.view.runId)!.status).toBe("cancelled");
+    expect(sup.getRun(a.view.runId)!.cancellationRequested).toBe(true);
+    expect(sup.getRun(b.view.runId)!.cancellationRequested).toBe(true);
 
     await Promise.all([a.settled, b.settled]);
     for (const runId of [a.view.runId, b.view.runId]) {
@@ -1275,15 +1269,13 @@ describe("resumeRun", () => {
     expect(final.error).toContain("stays on the instance holding its session");
   }, 30_000);
 
-  test("a resume cannot raise the authority the session was created under", async () => {
+  test("a resume honors an explicit authority increase within the current ceiling", async () => {
     const db = newDb();
     db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run("max_autonomy:fake", "readonly");
     const { sup, runId } = await originRun(db, "default");
     expect(sup.getRun(runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
 
-    // The scope's ceiling is widened after the fact. The session is still the
-    // one a readonly turn created, so continuing it stays readonly: options may
-    // only narrow what the original run resolved.
+    // A readonly review can become an implementation turn once the scope permits it.
     db.query("UPDATE settings SET value = 'full' WHERE key = ?").run("max_autonomy:fake");
     const { view, settled } = await sup.resumeRun({
       runId,
@@ -1292,8 +1284,8 @@ describe("resumeRun", () => {
     });
     await settled;
 
-    expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
-    expect(optionsOf(db, view.runId).autonomy).toBe("readonly");
+    expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+full");
+    expect(sup.getRun(view.runId)!.options.autonomy).toBe("full");
   }, 30_000);
 
   test("a resume may still narrow the original authority", async () => {
@@ -1309,13 +1301,13 @@ describe("resumeRun", () => {
     expect(sup.getRun(view.runId)!.attempts[0]!.target).toBe("fake:default/fake/slug@a1+readonly");
   }, 30_000);
 
-  test("a resume cannot extend the original run's budget, only shorten it", async () => {
+  test("each resumed turn honors its explicitly requested budget", async () => {
     const db = newDb();
     const { sup, runId } = await originWith(db, { timeoutMs: 9_000 });
 
     const longer = await sup.resumeRun({ runId, prompt: "again", options: { timeoutMs: 600_000 } });
     await longer.settled;
-    expect(optionsOf(db, longer.view.runId).timeoutMs).toBe(9_000);
+    expect(optionsOf(db, longer.view.runId).timeoutMs).toBe(600_000);
 
     const shorter = await sup.resumeRun({ runId, prompt: "again", options: { timeoutMs: 5_000 } });
     await shorter.settled;

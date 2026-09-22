@@ -41,7 +41,7 @@ export interface RunRequest {
 export interface ResumeRequest {
   runId: string;
   prompt: string;
-  /** Narrows what the original run resolved; the scope ceiling still clamps. */
+  /** Omitted values are inherited; explicit values are resolved against the current app ceiling. */
   options?: RunOptions;
 }
 
@@ -74,6 +74,10 @@ export interface RunView {
   app: string;
   slug: string;
   instance: string;
+  /** Resolved execution settings for the current or final attempt. */
+  options: RunOptions;
+  /** A cancellation request is pending until the owning process has stopped the callee. */
+  cancellationRequested?: boolean;
   /** Extracted answer of the successful attempt. */
   output?: string;
   error?: string;

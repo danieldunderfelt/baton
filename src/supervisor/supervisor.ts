@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { builtinAdapters } from "../adapters/builtin/index.ts";
-import { classifyFailure, executeAdapter } from "../adapters/executor.ts";
+import { classifyFailure, executeAdapter, groupAlive, killProcessGroup, type KillOutcome } from "../adapters/executor.ts";
 import {
   AUTONOMY_ORDER,
   type AdapterSpec,
@@ -29,7 +29,7 @@ import {
   type SelectOptions,
   type Target,
 } from "../registry/registry.ts";
-import { newId, nowIso, withBusyRetry } from "../store/store.ts";
+import { newId, nowIso, pruneRuns, withBusyRetry } from "../store/store.ts";
 import {
   ADAPTER_DIGEST,
   ADAPTER_VERSION,
@@ -88,14 +88,14 @@ export interface ExecHooks {
 export type AdapterExec = (req: ExecRequest, hooks?: ExecHooks) => Promise<ExecResult>;
 
 export interface TargetResolver {
-  resolve(model: string, opts: SelectOptions): Target;
+  resolve(model: string, opts: SelectOptions): Target | Promise<Target>;
   /**
    * The exact target a resumed run must land on — a lookup, never a selection:
    * the session lives in one instance's config dir, so affinity outranks pool
    * balancing entirely. Optional so existing
    * resolvers keep working; the registry's `targetFor` lookup is the default.
    */
-  pinned?(ref: PinnedRef): Target;
+  pinned?(ref: PinnedRef): Target | Promise<Target>;
 }
 
 /** Everything the original run recorded about where it ran. */
@@ -120,6 +120,7 @@ interface Live {
   runId: string;
   pid: number | null;
   cancelled: boolean;
+  termination?: Promise<KillOutcome>;
   /** quota_events row claimed at admission; dropped again if it was refused. */
   quotaEventId: number | null;
 }
@@ -165,6 +166,10 @@ export class Supervisor {
   private readonly pollMs: number;
   /** Attempts this process launched and still owns, keyed by attempt id. */
   private readonly live = new Map<string, Live>();
+  private readonly tasks = new Map<string, Promise<void>>();
+  /** Results survive a failed write while this supervisor is alive. */
+  private readonly pending = new Map<string, { ctx: AttemptCtx; res: ExecResult; status: RunStatus; error: string | null }>();
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
 
   constructor(init: SupervisorInit) {
     this.db = init.db;
@@ -199,7 +204,7 @@ export class Supervisor {
       if (existing) return deduped(existing);
     }
 
-    const target = this.resolver.resolve(req.model, {
+    const target = await this.resolver.resolve(req.model, {
       instance: req.instance,
       exclude: [],
       // Ratings are per (target, category), so ranking is judged on the kind of
@@ -239,8 +244,7 @@ export class Supervisor {
       throw err;
     }
 
-    this.markRunning(runId, attemptId);
-    const settled = this.execute({
+    const settled = this.launch({
       runId,
       attemptId,
       seq: 1,
@@ -270,9 +274,14 @@ export class Supervisor {
    */
   async resumeRun(req: ResumeRequest): Promise<{ view: RunView; settled: Promise<void> }> {
     const depth = this.guardHops();
+    this.getRun(req.runId); // Retry a pending outcome before admitting another turn.
     const origin = this.db
       .query<OriginRow, [string]>(
-        "SELECT status, model, app, slug, instance, cwd, category, options FROM runs WHERE id = ?",
+        `SELECT r.status, r.model, r.app, r.slug, r.instance, r.cwd, r.category,
+          COALESCE(a.execution, r.options) AS options
+         FROM runs r LEFT JOIN attempts a ON a.run_id = r.id
+          AND a.seq = (SELECT MAX(seq) FROM attempts WHERE run_id = r.id)
+         WHERE r.id = ?`,
       )
       .get(req.runId);
     if (!origin) throw new Error(`Unknown run '${req.runId}'.`);
@@ -285,7 +294,7 @@ export class Supervisor {
     }
 
     const sessionRef = this.sessionRefOf(req.runId);
-    const target = this.pin({
+    const target = await this.pin({
       model: origin.model,
       app: origin.app,
       slug: origin.slug,
@@ -306,7 +315,7 @@ export class Supervisor {
     // without it would hand the session to whatever identity the bare
     // environment supplies — a different account than the one holding it.
     const overlay = this.overlay(origin.app, origin.instance, { strict: true });
-    const options = narrowed(req.options, inheritedOptions(origin.options), target.spec);
+    const options = { ...inheritedOptions(origin.options), ...req.options };
     const { autonomy, timeoutMs, fingerprint } = this.resolve(target, options);
     const runId = newId("run");
     const attemptId = newId("att");
@@ -325,6 +334,7 @@ export class Supervisor {
         ...(origin.category ? { category: origin.category } : {}),
         // A resume is a fresh request by definition; nothing may dedup onto it.
         payloadHash: null,
+        sessionRef,
         options: {
           autonomy,
           timeoutMs,
@@ -334,8 +344,7 @@ export class Supervisor {
       }),
     );
 
-    this.markRunning(runId, attemptId);
-    const settled = this.execute({
+    const settled = this.launch({
       runId,
       attemptId,
       seq: 1,
@@ -360,12 +369,14 @@ export class Supervisor {
   }
 
   getRun(runId: string): RunView | undefined {
+    this.retryPending(runId);
     const run = this.db
       .query<RunRow, [string]>(
-        "SELECT id, status, model, app, slug, instance, options, created_at, updated_at FROM runs WHERE id = ?",
+        "SELECT id, status, model, app, slug, instance, options, cancel_requested_at, persistence_error, created_at, updated_at FROM runs WHERE id = ?",
       )
       .get(runId);
     if (!run) return undefined;
+    if (run.persistence_error) throw new Error(run.persistence_error);
     const attempts = this.db
       .query<AttemptRow, [string]>(
         "SELECT id, seq, target, status, exit_code, output, error, session_ref, started_at, finished_at FROM attempts WHERE run_id = ? ORDER BY seq",
@@ -386,33 +397,30 @@ export class Supervisor {
     }
   }
 
-  /** Kills the live attempt's process group and marks the run cancelled. */
+  /** Request cancellation; only the supervisor that owns the child may signal it. */
   cancelRun(runId: string): void {
+    const exists = this.db.query<{ id: string }, [string]>("SELECT id FROM runs WHERE id = ?").get(runId);
+    if (!exists) throw new Error(`Unknown run '${runId}'.`);
+    withBusyRetry(() => this.db.query(
+      "UPDATE runs SET cancel_requested_at = COALESCE(cancel_requested_at, ?) WHERE id = ? AND status IN ('queued','running')",
+    ).run(nowIso(), runId));
     for (const live of this.live.values()) {
-      if (live.runId !== runId || live.cancelled) continue;
-      live.cancelled = true;
-      const pid = live.pid;
-      if (pid === null || pid <= 0) continue;
-      killGroup(pid, "SIGTERM");
-      const escalation = setTimeout(() => killGroup(pid, "SIGKILL"), KILL_ESCALATION_MS);
-      escalation.unref?.();
+      if (live.runId === runId) this.stop(live);
     }
+    this.recoverOrphans();
+  }
 
-    const now = nowIso();
-    withBusyRetry(() =>
-      this.db.transaction(() => {
-        this.db
-          .query(
-            "UPDATE attempts SET status = 'cancelled', finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('queued','running')",
-          )
-          .run(now, runId);
-        this.db
-          .query(
-            "UPDATE runs SET status = 'cancelled', updated_at = ? WHERE id = ? AND status IN ('queued','running')",
-          )
-          .run(now, runId);
-      })(),
-    );
+  private stop(live: Live): void {
+    live.cancelled = true;
+    if (live.pid === null || live.termination) return;
+    live.termination = killProcessGroup(live.pid, { graceMs: KILL_ESCALATION_MS });
+  }
+
+  private checkCancellation(live: Live): void {
+    const request = this.db.query<{ requested: string | null }, [string]>(
+      "SELECT cancel_requested_at AS requested FROM runs WHERE id = ?",
+    ).get(live.runId);
+    if (request?.requested) this.stop(live);
   }
 
   /**
@@ -420,10 +428,11 @@ export class Supervisor {
    * the server must not leave callee CLIs running unsupervised with nobody left
    * to record their outcome — each live run is cancelled and its group killed.
    */
-  shutdown(): void {
-    for (const runId of new Set([...this.live.values()].map((l) => l.runId))) {
-      this.cancelRun(runId);
-    }
+  async shutdown(): Promise<void> {
+    clearTimeout(this.recoveryTimer);
+    for (const runId of this.tasks.keys()) this.cancelRun(runId);
+    await Promise.allSettled(this.tasks.values());
+    clearTimeout(this.recoveryTimer);
   }
 
   /**
@@ -462,28 +471,40 @@ export class Supervisor {
               "UPDATE runs SET status = 'orphaned', updated_at = ? WHERE id = ? AND status IN ('queued','running')",
             )
             .run(now, row.run_id);
+          this.releaseSession(row.id);
         })(),
       );
     }
+  }
+
+  private launch(ctx: AttemptCtx): Promise<void> {
+    const settled = this.execute(ctx);
+    this.tasks.set(ctx.runId, settled);
+    void settled.then(() => this.tasks.delete(ctx.runId), () => this.tasks.delete(ctx.runId));
+    return settled;
   }
 
   /** Runs attempts until one settles the run — the failover chain lives here. */
   private async execute(first: AttemptCtx): Promise<void> {
     for (let ctx: AttemptCtx | undefined = first; ctx; ) {
       const res = await this.invoke(ctx);
-      ctx = this.settle(ctx, res);
+      ctx = await this.settle(ctx, res);
     }
   }
 
   private async invoke(ctx: AttemptCtx): Promise<ExecResult> {
-    this.live.set(ctx.attemptId, {
-      runId: ctx.runId,
-      pid: null,
-      cancelled: false,
-      quotaEventId: null,
-    });
+    const live: Live = { runId: ctx.runId, pid: null, cancelled: false, quotaEventId: null };
+    this.live.set(ctx.attemptId, live);
+    const poll = setInterval(() => {
+      try { this.checkCancellation(live); } catch (err) {
+        process.stderr.write(`Baton could not check cancellation for ${ctx.runId}: ${message(err)}\n`);
+      }
+    }, this.pollMs);
+    poll.unref?.();
     try {
-      return await this.exec(
+      this.checkCancellation(live);
+      if (live.cancelled) return { ok: false, started: false, exitCode: null, timedOut: false, rawTail: "", error: "cancelled before execution", durationMs: 0 };
+      const result = await this.exec(
         {
           spec:
             ctx.resumeRef === undefined
@@ -506,7 +527,18 @@ export class Supervisor {
           },
         },
       );
+      // A remote cancellation may arrive after the final polling tick.
+      this.checkCancellation(live);
+      if (live.termination) {
+        const outcome = await live.termination;
+        if (!outcome.dead) return { ...result, ok: false, error: outcome.why ?? "callee termination could not be confirmed" };
+      }
+      return result;
     } catch (err) {
+      if (live.pid !== null && groupAlive(live.pid)) {
+        this.stop(live);
+        await live.termination;
+      }
       return {
         ok: false,
         // The callee never ran: a Baton-side failure is not the target's.
@@ -517,6 +549,8 @@ export class Supervisor {
         error: `executor failed: ${message(err)}`,
         durationMs: 0,
       };
+    } finally {
+      clearInterval(poll);
     }
   }
 
@@ -543,11 +577,10 @@ export class Supervisor {
    * Records an attempt's outcome and its evidence, and returns the next attempt
    * when this one was refused admission and another candidate is left.
    */
-  private settle(ctx: AttemptCtx, res: ExecResult): AttemptCtx | undefined {
+  private async settle(ctx: AttemptCtx, res: ExecResult): Promise<AttemptCtx | undefined> {
     const live = this.live.get(ctx.attemptId);
     const cancelled = live?.cancelled ?? false;
     const quotaEventId = live?.quotaEventId ?? null;
-    this.live.delete(ctx.attemptId);
     const status: RunStatus = cancelled
       ? "cancelled"
       : res.timedOut
@@ -566,19 +599,95 @@ export class Supervisor {
       !res.timedOut &&
       classifyFailure(ctx.target.spec, res) === "admission";
     this.observe(ctx, res, { status, cancelled, refused, quotaEventId });
+    if (cancelled && live?.pid !== null && live?.pid !== undefined && groupAlive(live.pid)) {
+      this.pending.set(ctx.runId, { ctx, res, status, error: res.error ?? "cancellation not confirmed" });
+      this.scheduleRecovery();
+      this.live.delete(ctx.attemptId);
+      const detail = `Run ${ctx.runId} requested cancellation, but process group ${live.pid} is still alive. Its session remains reserved.`;
+      this.db.query("UPDATE runs SET persistence_error = ? WHERE id = ?").run(detail, ctx.runId);
+      throw new Error(detail);
+    }
 
-    const next = refused ? this.nextCandidate(ctx) : undefined;
+    const next = refused ? await this.nextCandidate(ctx) : undefined;
     const error = failureText(res, {
       refused,
       failedOver: next !== undefined,
       resumed: ctx.resumeRef !== undefined,
     });
     try {
-      return this.commit(ctx, res, { status, error, next });
-    } catch {
-      // A run whose outcome cannot be written is worse than useless to retry
-      // here; recoverOrphans() reconciles it on the next start.
-      return undefined;
+      // Keep the outcome until its transaction succeeds. A temporary write
+      // failure is retried without replaying the model invocation.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const successor = this.commit(ctx, res, { status, error, next });
+          this.maintain(ctx.runId);
+          return successor;
+        } catch (err) {
+          if (attempt < 2) { await sleep(25 * (attempt + 1)); continue; }
+          this.pending.set(ctx.runId, { ctx, res, status, error });
+          this.scheduleRecovery();
+          const detail = `Could not persist the outcome of run ${ctx.runId}: ${message(err)}. The model has stopped. Retry get_run to save its retained result; do not rerun the prompt.`;
+          process.stderr.write(`${detail}\n`);
+          try {
+            withBusyRetry(() => this.db.transaction(() => {
+              this.db.query("UPDATE runs SET status = 'failed', persistence_error = ?, updated_at = ? WHERE id = ?")
+                .run(detail, nowIso(), ctx.runId);
+              this.db.query("UPDATE attempts SET status = 'failed', error = ?, finished_at = ? WHERE id = ?")
+                .run(detail, nowIso(), ctx.attemptId);
+            })());
+          } catch (fallbackError) {
+            process.stderr.write(`Could not record persistence failure for ${ctx.runId}: ${message(fallbackError)}\n`);
+          }
+          throw new Error(detail, { cause: err });
+        }
+      }
+    } finally {
+      this.live.delete(ctx.attemptId);
+    }
+  }
+
+  private retryPending(runId: string): void {
+    const pending = this.pending.get(runId);
+    if (!pending) return;
+    const attempt = this.db.query<{ pid: number | null }, [string]>("SELECT pid FROM attempts WHERE id = ?").get(pending.ctx.attemptId);
+    if (pending.status === "cancelled" && attempt?.pid && groupAlive(attempt.pid)) {
+      throw new Error(`Run ${runId} is still stopping process group ${attempt.pid}; its session remains reserved.`);
+    }
+    try {
+      this.commit(pending.ctx, pending.res, { status: pending.status, error: pending.error, next: undefined });
+      this.pending.delete(runId);
+      if (this.pending.size === 0) {
+        clearTimeout(this.recoveryTimer);
+        this.recoveryTimer = undefined;
+      }
+      this.maintain(runId);
+    } catch (err) {
+      throw new Error(`Could not persist the outcome of run ${runId}: ${message(err)}. Retry get_run after storage is writable; the result is retained in this supervisor.`, { cause: err });
+    }
+  }
+
+  private scheduleRecovery(): void {
+    if (this.recoveryTimer) return;
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = undefined;
+      for (const runId of this.pending.keys()) {
+        try { this.retryPending(runId); } catch { /* The durable error remains visible to callers. */ }
+      }
+      if (this.pending.size) this.scheduleRecovery();
+    }, 1000);
+    this.recoveryTimer.unref?.();
+  }
+
+  private maintain(runId: string): void {
+    try {
+      const reservations = this.db.query<{ attempt_id: string }, []>(
+        `SELECT s.attempt_id FROM session_reservations s JOIN attempts a ON a.id = s.attempt_id
+         WHERE a.status NOT IN ('queued','running')`,
+      ).all();
+      for (const reservation of reservations) this.releaseSession(reservation.attempt_id);
+      pruneRuns(this.db, undefined, runId);
+    } catch (err) {
+      process.stderr.write(`Baton run retention failed: ${message(err)}\n`);
     }
   }
 
@@ -619,13 +728,13 @@ export class Supervisor {
   }
 
   /** The next pool candidate for a refused attempt, or undefined when spent. */
-  private nextCandidate(ctx: AttemptCtx): AttemptCtx | undefined {
+  private async nextCandidate(ctx: AttemptCtx): Promise<AttemptCtx | undefined> {
     // A resumed run has exactly one home: the session it continues lives in
     // that instance's config dir, so there is nowhere to fail over to.
     if (ctx.resumeRef !== undefined) return undefined;
     let target: Target;
     try {
-      target = this.resolver.resolve(ctx.model, {
+      target = await this.resolver.resolve(ctx.model, {
         // An explicitly requested instance is a pin, not a preference: it is
         // already in `tried`, so selection finds nothing and the run fails.
         ...(ctx.requestedInstance ? { instance: ctx.requestedInstance } : {}),
@@ -684,52 +793,32 @@ export class Supervisor {
     const now = nowIso();
     return withBusyRetry(() =>
       this.db.transaction(() => {
-        // The outcome is recorded either way, but a cancellation that landed
-        // while this attempt was finishing stands: the caller stopped the run,
-        // and 'succeeded' would overwrite that with a lie.
-        this.db
-          .query(
-            `UPDATE attempts SET
-               status = CASE WHEN status IN ('queued','running') THEN ? ELSE status END,
-               exit_code = ?, output = ?, raw_tail = ?, error = ?, session_ref = ?, finished_at = ?
-             WHERE id = ?`,
-          )
-          .run(
-            o.status,
-            res.exitCode ?? null,
-            res.output === undefined ? null : head(res.output, MAX_OUTPUT_CHARS),
-            res.rawTail ? tail(res.rawTail, MAX_RAW_TAIL_CHARS) : null,
-            o.error,
-            res.sessionRef ?? null,
-            now,
-            ctx.attemptId,
-          );
-        // Cancellation lands between the attempt finishing and this commit:
-        // failing over would resurrect a run the caller already stopped.
-        const live =
-          this.db
-            .query<{ status: RunStatus }, [string]>("SELECT status FROM runs WHERE id = ?")
-            .get(ctx.runId)?.status === "running";
-        if (!o.next || !live) {
-          this.db
-            .query(
-              "UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND status IN ('queued','running')",
-            )
-            .run(o.status, now, ctx.runId);
+        const run = this.db.query<{ status: RunStatus; cancel_requested_at: string | null }, [string]>(
+          "SELECT status, cancel_requested_at FROM runs WHERE id = ?",
+        ).get(ctx.runId);
+        const cancelled = Boolean(run?.cancel_requested_at) || run?.status === "cancelled";
+        const status = cancelled ? "cancelled" : o.status;
+        this.db.query(
+          `UPDATE attempts SET status = ?, exit_code = ?, output = ?, raw_tail = ?, error = ?,
+            session_ref = ?, finished_at = ? WHERE id = ?`,
+        ).run(status, res.exitCode ?? null, res.output === undefined ? null : head(res.output, MAX_OUTPUT_CHARS),
+          res.rawTail ? tail(res.rawTail, MAX_RAW_TAIL_CHARS) : null, o.error,
+          res.sessionRef ?? ctx.resumeRef ?? null, now, ctx.attemptId);
+        this.releaseSession(ctx.attemptId);
+        if (!o.next || cancelled || run?.status === "orphaned") {
+          this.db.query("UPDATE runs SET status = ?, persistence_error = NULL, updated_at = ? WHERE id = ?")
+            .run(status, now, ctx.runId);
           return undefined;
         }
-        this.db
-          .query(
-            "INSERT INTO attempts (id, run_id, seq, target, status, started_at, owner_pid) VALUES (?, ?, ?, ?, 'running', ?, ?)",
-          )
-          .run(o.next.attemptId, ctx.runId, o.next.seq, o.next.fingerprint, now, process.pid);
-        // The run now belongs to the instance actually carrying it — resumes
-        // and session affinity follow the attempt that answers.
-        this.db
-          .query("UPDATE runs SET app = ?, slug = ?, instance = ?, updated_at = ? WHERE id = ?")
-          .run(o.next.target.spec.app, o.next.target.slug, o.next.target.instance, now, ctx.runId);
+        const execution = JSON.stringify({ autonomy: o.next.autonomy, timeoutMs: o.next.timeoutMs,
+          ...adapterIdentity(o.next.target.spec) });
+        this.db.query(
+          "INSERT INTO attempts (id, run_id, seq, target, execution, status, started_at, owner_pid) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+        ).run(o.next.attemptId, ctx.runId, o.next.seq, o.next.fingerprint, execution, now, process.pid);
+        this.db.query("UPDATE runs SET app = ?, slug = ?, instance = ?, options = ?, persistence_error = NULL, updated_at = ? WHERE id = ?")
+          .run(o.next.target.spec.app, o.next.target.slug, o.next.target.instance, execution, now, ctx.runId);
         return o.next;
-      })(),
+      }).immediate(),
     );
   }
 
@@ -790,7 +879,7 @@ export class Supervisor {
     } catch {
       // The pid is a recovery hint, not run state; losing it must not fail the run.
     }
-    if (live?.cancelled) killGroup(pid, "SIGTERM"); // cancelled before we knew the pid
+    if (live?.cancelled) this.stop(live);
   }
 
   private insert(a: {
@@ -807,6 +896,7 @@ export class Supervisor {
     idempotencyKey?: string;
     /** Null for runs no key can dedup onto (a resume is never idempotent). */
     payloadHash: string | null;
+    sessionRef?: string;
     /** Resolved authority and budget, plus `resumed_from` on a resume. */
     options: Record<string, unknown>;
   }): void {
@@ -815,11 +905,12 @@ export class Supervisor {
     // across processes, so two resumes cannot claim the same session.
     this.db
       .transaction(() => {
-        this.guardSessionHolder(a.options[RESUMED_FROM]);
+        const sessionKey = a.sessionRef === undefined ? undefined : JSON.stringify([a.app, a.instance, a.sessionRef]);
+        if (sessionKey) this.guardSessionHolder(sessionKey, a.options[RESUMED_FROM]);
         this.db
           .query(
             `INSERT INTO runs (id, idempotency_key, payload_hash, model, app, slug, instance, prompt, cwd, category, options, status, policy_version, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
           )
           .run(
             a.runId,
@@ -839,50 +930,35 @@ export class Supervisor {
           );
         this.db
           .query(
-            "INSERT INTO attempts (id, run_id, seq, target, status, owner_pid) VALUES (?, ?, 1, ?, 'queued', ?)",
+            "INSERT INTO attempts (id, run_id, seq, target, execution, status, started_at, owner_pid) VALUES (?, ?, 1, ?, ?, 'running', ?, ?)",
           )
-          .run(a.attemptId, a.runId, a.fingerprint, process.pid);
+          .run(a.attemptId, a.runId, a.fingerprint, JSON.stringify(a.options), now, process.pid);
+        if (sessionKey) this.db.query("INSERT INTO session_reservations (session_key, attempt_id) VALUES (?, ?)")
+          .run(sessionKey, a.attemptId);
       })
       .immediate();
   }
 
-  /**
-   * One live turn per session. The origin's own terminal status is not enough:
-   * two resumes of the same finished run would both drive the app session it
-   * left behind, and the callee writing that config dir has no idea it is being
-   * raced. The rule is deliberately the narrow, exact one — a non-terminal run
-   * that already names this origin — because a lineage is a chain: resuming the
-   * *resumed* run continues it, and each link is guarded the same way. Runs
-   * launched by another process count, which is why this lives inside the
-   * insert's BEGIN IMMEDIATE.
-   */
-  private guardSessionHolder(resumedFrom: unknown): void {
-    if (typeof resumedFrom !== "string") return;
-    const holder = this.db
-      .query<{ id: string; status: RunStatus }, [string]>(
-        `SELECT id, status FROM runs
-         WHERE status IN ('queued','running') AND json_extract(options, '$.${RESUMED_FROM}') = ?
-         LIMIT 1`,
-      )
-      .get(resumedFrom);
+  /** Session identity spans ancestors and is reserved inside BEGIN IMMEDIATE. */
+  private guardSessionHolder(sessionKey: string, resumedFrom: unknown): void {
+    const holder = this.db.query<{ id: string; attempt_id: string; status: RunStatus; pid: number | null }, [string]>(
+      `SELECT r.id, a.id AS attempt_id, r.status, a.pid FROM session_reservations s
+       JOIN attempts a ON a.id = s.attempt_id JOIN runs r ON r.id = a.run_id
+       WHERE s.session_key = ?`,
+    ).get(sessionKey);
     if (!holder) return;
-    throw new Error(
-      `Cannot resume run '${resumedFrom}': run ${holder.id} is already continuing that session and is still ${holder.status}. Wait for it to finish (or cancel it), then resume ${holder.id} to carry the conversation on.`,
-    );
+    if (TERMINAL.has(holder.status) && (holder.pid === null || !groupAlive(holder.pid))) {
+      this.db.query("DELETE FROM session_reservations WHERE session_key = ?").run(sessionKey);
+      return;
+    }
+    throw new Error(`Cannot resume run '${String(resumedFrom)}': run ${holder.id} is already continuing that session and is still ${holder.status}. Wait for its process to stop before continuing.`);
   }
 
-  private markRunning(runId: string, attemptId: string): void {
-    const now = nowIso();
-    withBusyRetry(() =>
-      this.db.transaction(() => {
-        this.db
-          .query("UPDATE attempts SET status = 'running', started_at = ? WHERE id = ?")
-          .run(now, attemptId);
-        this.db
-          .query("UPDATE runs SET status = 'running', updated_at = ? WHERE id = ?")
-          .run(now, runId);
-      })(),
-    );
+  /** A closed pipe alone does not prove a surviving descendant has stopped. */
+  private releaseSession(attemptId: string): void {
+    const row = this.db.query<{ pid: number | null }, [string]>("SELECT pid FROM attempts WHERE id = ?").get(attemptId);
+    if (row?.pid !== null && row?.pid !== undefined && groupAlive(row.pid)) return;
+    this.db.query("DELETE FROM session_reservations WHERE attempt_id = ?").run(attemptId);
   }
 
   /**
@@ -907,7 +983,7 @@ export class Supervisor {
   }
 
   /** The exact target the original run used; never a fresh selection. */
-  private pin(ref: PinnedRef): Target {
+  private pin(ref: PinnedRef): Target | Promise<Target> {
     return this.resolver.pinned ? this.resolver.pinned(ref) : targetFor(ref, this.db);
   }
 
@@ -1034,38 +1110,6 @@ function inheritedOptions(optionsJson: string): RunOptions {
 }
 
 /**
- * What a resume may actually ask for. A resume continues a conversation the
- * callee has already been having under a given authority and budget, so its
- * options may only NARROW that resolution — never raise it. Clamping against
- * the scope ceiling alone is not enough: a run resolved to `readonly` under a
- * ceiling that has since been widened would come back as `full` on the same
- * session. The origin's *resolved* values are the second
- * ceiling; where a legacy row recorded none, the adapter's default stands in.
- */
-function narrowed(
-  requested: RunOptions | undefined,
-  origin: RunOptions,
-  spec: AdapterSpec,
-): RunOptions {
-  const originAutonomy = origin.autonomy ?? spec.defaultAutonomy;
-  const originTimeoutMs = origin.timeoutMs ?? spec.defaultTimeoutMs;
-  const requestedTimeoutMs = requested?.timeoutMs ?? originTimeoutMs;
-  return {
-    autonomy: narrower(requested?.autonomy ?? originAutonomy, originAutonomy),
-    // An unbounded origin may be bounded on resume; a bounded one is never widened.
-    timeoutMs:
-      originTimeoutMs === undefined || requestedTimeoutMs === undefined
-        ? requestedTimeoutMs
-        : Math.min(requestedTimeoutMs, originTimeoutMs),
-  };
-}
-
-/** The lower of two authority levels. */
-function narrower(a: Autonomy, b: Autonomy): Autonomy {
-  return AUTONOMY_ORDER.indexOf(a) <= AUTONOMY_ORDER.indexOf(b) ? a : b;
-}
-
-/**
  * The adapter revision a run executed under, recorded in its options so a later
  * resume can tell whether the app it is about to re-enter is still the same one
  * (see ADAPTER_VERSION). Built-ins are pinned in this binary, so their version
@@ -1134,6 +1178,8 @@ interface RunRow {
   slug: string;
   instance: string;
   options: string;
+  cancel_requested_at: string | null;
+  persistence_error: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1179,6 +1225,8 @@ function toView(run: RunRow, attempts: AttemptRow[]): RunView {
     app: run.app,
     slug: run.slug,
     instance: run.instance,
+    options: inheritedOptions(run.options),
+    ...(run.cancel_requested_at && !TERMINAL.has(run.status) ? { cancellationRequested: true } : {}),
     ...(last?.status === "succeeded" && last.output ? { output: last.output } : {}),
     ...(run.status !== "succeeded" && last?.error ? { error: last.error } : {}),
     createdAt: run.created_at,
@@ -1247,18 +1295,6 @@ function orphanReason(row: OrphanRow): string | null {
     return `orphaned: process group ${pid} was already gone at supervisor startup`;
   }
   return `orphaned: process group ${pid} may still be running, but the supervisor that launched it is gone, so its outcome can never be recorded. It was NOT killed — Baton does not kill what it does not own; stop it yourself if it should not be running.`;
-}
-
-function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(-pid, signal); // negative pid => the whole process group
-  } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Already gone.
-    }
-  }
 }
 
 /** ESRCH means gone; EPERM means alive but not ours, which must be left alone. */
