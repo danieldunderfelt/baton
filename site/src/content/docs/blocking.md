@@ -1,6 +1,6 @@
 ---
 title: "Blocking routes and scopes"
-description: "Keep routes you must not spend out of rotation, and keep separate worlds separate."
+description: "Exclude routes from delegation and separate Baton's configuration scopes."
 order: 6
 ---
 
@@ -14,17 +14,17 @@ baton block add cursor-agent                                       # a whole app
 
 A pattern addresses a route the way Baton names one internally — `<app>[:<instance>]/<slug>`, with `*` matching anything. Leave the instance off and it covers every account; name one (`codex:work/*`) and it covers only that account. `baton block add` prints the routes it matches right now, so a typo shows up immediately.
 
-To take a whole app out of service, reject it — this works on the built-in apps too, not just discovered ones:
+To disable a whole app, use the same commands for built-in and registered adapters:
 
 ```sh
-baton adapters reject opencode client machine   # blocks every route it has
-baton block remove 'opencode:*/*'               # and back again
+baton adapters disable opencode
+baton adapters enable opencode
 ```
 
-A blocked route is never selected: not when it is the only route for a model, not as a last resort when everything else is rate-limited, not when resuming a session that already ran on it, and not by the conformance canary. `list_models` reports it as unavailable with your reason attached, so a delegating agent sees the refusal before it tries. Blocks are written only from your terminal — `baton block list` shows them, `baton block remove <pattern>` lifts one — never through an MCP tool.
+A blocked route is excluded from normal runs, failover, resumes and optional adapter diagnostics. `list_models` reports it as unavailable with the reason attached. `baton block list` shows route patterns and `baton block remove <pattern>` lifts one. Agents can enable or disable a whole app with `set_app_enabled(app, enabled)` through MCP. Explicit disables survive repeated registration and spec updates.
 
-## Separate worlds
+## Separate scopes
 
-`BATON_CONFIG_DIR` relocates everything Baton knows: config, accounts, pools, quota history, ratings, the database. Set it per directory with [direnv](https://direnv.net) and a work checkout gets a Baton that only knows work accounts, while your personal projects get another that only knows personal ones. The two cannot leak into each other because neither knows the other exists. Each scope also has its own sharing login (see [Sharing profiles](/docs/sharing)).
+`BATON_CONFIG_DIR` separates Baton's configuration, named accounts, pools, history, ratings and sharing login. Set it per directory with [direnv](https://direnv.net) when those records should be independent. This does not isolate the underlying CLI's credentials: the default account still comes from the inherited environment, and two scopes can reach the same account. Each scope also has its own [sharing login](/docs/sharing).
 
-Baton never inspects or enforces identity. It runs each CLI with the environment it inherited, exactly as if you had typed the command in that shell. Whatever account the environment supplies is the account that runs.
+Baton does not verify account ownership. It runs each CLI with the inherited environment, plus the configured overlay when a named instance is selected. Set the CLI's identity environment deliberately and use explicit blocks for accounts or providers that must never be used. An `emergency` spending preference can still select that account as a fallback.

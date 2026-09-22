@@ -41,7 +41,7 @@ gh run watch <run-id> --exit-status
 gh release view v0.2.2
 ```
 
-After publication, verify `baton update` on an installed copy and check `baton --version`. Re-run `baton install --user` to refresh host registrations and skills, then restart agent sessions.
+After publication, verify `baton update` on an installed copy and check `baton --version`. The update refreshes tracked Baton skills automatically and preserves host registrations. Restart agent sessions to load the new server and instructions. Older installations in other projects need one `baton install` to enter the refresh manifest; see [Updating](/docs/installation#updating).
 
 ## Recover from a failure
 

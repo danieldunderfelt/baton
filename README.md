@@ -2,7 +2,7 @@
 
 Baton lets the coding agent you are talking to hand work to a model running in a *different* agent app on the same machine, on that app's own subscription. Claude Code can ask a Codex model to review a diff. Codex can push a migration to Kimi Code. It can also load-balance requests across multiple accounts of the same app (see "Load balancing" below).
 
-The alternative is a pile of per-agent instructions telling each one how to shell out to the others, which breaks silently when a CLI changes, or more relevantly, when a new model is released. Baton knows how to drive each CLI, and learns which model is best for each kind of task by recording every run and its graded result.
+Baton handles CLI arguments, model discovery, account selection and run history. Optional grades record how useful an answer was and help with future selection. You can delegate immediately without configuring ratings.
 
 The two roles work differently:
 
@@ -16,7 +16,7 @@ For all five built-in apps, `baton install` writes the same on-demand `SKILL.md`
 Baton is one binary with two faces:
 
 - `baton mcp` runs an MCP server over stdio. Agent apps call its tools (`run_model`, `get_run`, `list_models`, ...) to delegate work.
-- `baton <subcommand>` is the CLI for humans: one-off runs, configuration, ratings, and the approval steps that should never be automated.
+- `baton <subcommand>` provides shell commands for runs, inspection, configuration and optional ratings.
 
 When a run comes in, Baton picks a route for the requested model, spawns that app's CLI with the environment it inherited, captures the answer, and stores the whole run in SQLite. Nothing runs through an API proxy; the CLIs themselves execute the work, which is what makes the existing subscriptions usable.
 
@@ -39,28 +39,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Start a new agent session after installing or updating so it loads the new MCP server. A session that is already running keeps its old server.
 
-`baton --help` prints the command reference. `baton <command> --help` shows the same reference without running the command.
-
-### Recovering a v0.1.0 install
-
-The v0.1.0 release predates `install --user` and `update`. Those commands require v0.2.0 or later. Check the version and every matching executable before choosing a recovery path:
-
-```sh
-baton --version
-type -a baton
-```
-
-If the binary is v0.1.0, build the current source. If a different copy appears first in `PATH`, put `~/.local/bin` first. This path requires Bun:
-
-```sh
-git clone https://github.com/danieldunderfelt/baton.git
-cd baton
-./install.sh
-export PATH="$HOME/.local/bin:$PATH"
-"$HOME/.local/bin/baton" install --user
-```
-
-After a release that includes these commands is published, rerunning the curl installer also updates the binary. Restart agent sessions after the update.
+`baton --help` lists commands. `baton <command> --help` and `baton help <command>` show focused help without running the command. For old binaries, see [recovering a v0.1.0 installation](site/src/content/docs/installation.md#recovering-a-v010-install).
 
 To update:
 
@@ -68,9 +47,9 @@ To update:
 baton update
 ```
 
-That replaces the binary with the latest release (or rebuilds it, if you run from a checkout). Sessions already running keep the old server until they restart.
+That replaces the binary with the latest release, or rebuilds a checkout, and refreshes existing Baton-owned skills recorded by `baton install`. It preserves host configuration and unrelated instructions. Older installations in the current project and configured home locations are recognized too. Other projects installed before tracking was added need one `baton install` to enter the manifest. Sessions already running keep the old server until they restart.
 
-To keep an install inside one checkout instead of the whole machine, run `baton install` (optionally naming hosts, or `--dir <path>`) in that directory. It writes the selected hosts' MCP files and skills. `--no-eval` leaves out the grading appendix; the default includes it, because ratings do not improve without grades.
+To keep an install inside one checkout instead of the whole machine, run `baton install`, optionally naming hosts or passing `--dir <path>`, in that directory. It writes the selected hosts' MCP files and skills. `--no-eval` leaves out the optional ratings appendix. Neither installation nor delegation requires a rating interview.
 
 Codex, Kimi, OpenCode, and Cursor share one skill at `.agents/skills/baton/SKILL.md`. Project installs place it at the nearest Git root, or the target directory when there is no Git root. User installs place it at `~/.agents/skills/baton/SKILL.md`. Claude gets the same content in `.claude/skills/baton/SKILL.md` (project) or `~/.claude/skills/baton/SKILL.md` (user).
 
@@ -100,6 +79,7 @@ From an agent, through MCP:
 - `run_model(model, prompt, ...)` runs the prompt on another app and returns the answer. The prompt must be self-contained: the callee shares the filesystem but has none of the caller's conversation.
 - `get_run(run_id)` polls a long run started with `wait: false`.
 - `resume_run(run_id, prompt)` continues a finished run inside the callee's own session, on the same account it originally ran on.
+- `cancel_run(run_id)` requests cancellation, including work owned by another Baton process in the same scope. Poll `get_run` if cancellation is still pending.
 
 From the shell:
 
@@ -108,23 +88,27 @@ baton run kimi-k3 "Summarise the failure modes in src/quota/quota.ts"
 baton run gpt-5.6-luna --timeout 60000 "Reply with exactly: PONG"
 baton runs                 # recent runs
 baton resume run_abc123 "Now apply the fix you proposed"
+baton cancel run_abc123     # waits for the run's processes to stop
+baton runs run_abc123 --json
 ```
 
-> *Why run models from the shell through Baton instead of the CLI directly?* Partly because it was free to implement, but mostly because every run gets the same routing: load balancing across accounts, quota awareness, and a recorded, gradeable result.
+Shell runs print the answer to stdout and the run ID, resolved permissions and status to stderr. `run`, `resume`, `runs`, `cancel`, `models` and `status` accept `--json`. Run and resume records include the actual resolved `options`.
 
-Which models an app serves is the app's business, not Baton's. Each adapter knows how to ask its CLI (`codex debug models`, `kimi provider list --json`, `opencode models`, `cursor-agent models`), and every model reported is a route under the app's own slug: `baton run gpt-6-astra ...` works the day codex starts listing it, and `baton run github-copilot/claude-opus-5 ...` reaches whatever OpenCode's providers are logged into. The short canonical names above (`kimi-k3`, `muse-spark-1.3`, ...) are pinned aliases that ratings attach to. Claude Code has no listing command, so any full `claude-*` id is passed through as given. `baton detect` shows what each app reports right now, `baton models` the whole roster; listings are cached for five minutes in `~/.cache/baton/catalog.json`, and a CLI that will not list keeps its pinned routes. Block the reported routes you never want spent, e.g. `baton block add 'opencode/github-copilot/*'`.
+A resumed turn inherits omitted options. Explicit `--autonomy` and `--timeout` values apply to the new turn, subject to the current permission ceiling. A readonly review can therefore continue with an implementation turn. Baton prevents simultaneous turns from writing to the same session, including resumes from different ancestors.
+
+Each adapter asks its CLI for model names when it has a listing command. Reported models are available under the app's own slug; pinned names such as `kimi-k3` are aliases. Claude Code has no listing command, so full `claude-*` IDs pass through as given. `baton models` shows routes, availability and supported permission levels. Catalog probes use each account's effective environment and cache results separately for five minutes. A failed listing keeps pinned routes available and reports its error. Block routes you never want used, for example `baton block add 'opencode/github-copilot/*'`.
 
 OpenCode profiles use separate XDG data roots. `XDG_DATA_HOME` moves the
 credential store as well as sessions and logs. Profile configs belong in
 `~/.config/opencode`, selected with `OPENCODE_CONFIG`, not in a checkout — for
 example an `opencode-finnair.json` that enables only `github-copilot`.
 
-Safety rails that apply to every run:
+Execution rules:
 
 - Delegation depth is capped (two hops by default), so agents cannot recurse into each other forever.
 - A per-app autonomy ceiling (`baton set max_autonomy:codex readonly`) limits what delegated agents may do. Callers can request less autonomy than the ceiling, never more.
 - Retries are safe: `run_model` takes an `idempotency_key`, and the same key with the same request returns the existing run instead of paying for a second one.
-- Runs have no time limit. Baton never cuts a long run short; a caller who wants a deadline sets `--timeout` or `options.timeoutMs`, and only then does a timeout kill the callee's whole process tree, with Baton verifying the processes are actually dead before recording the result.
+- Built-in adapters have no default run deadline. Set `--timeout` or `options.timeoutMs` when a turn needs one; registered adapters can also specify a default. Timeouts and cancellation stop the callee's process group before Baton records the terminal result. An MCP wait returning `running` does not mean the run timed out.
 
 ## Ratings
 
@@ -134,7 +118,7 @@ Baton routes on evidence and keeps the kinds of evidence separate:
 - Seeded opinions. `baton profile import <file>` loads your starting opinion of each model before any evidence exists. Seeds are capped at the weight of a few observations, so a wrong guess cannot steer routing for months.
 - Duels. `baton duel <model-a> <model-b> "<prompt>"` runs both models on the identical prompt and shows the answers labelled A and B with the models hidden. Judge, then `baton duel report <id> A`. Verdicts feed a Bradley-Terry strength score, reported separately from grades.
 
-`baton ratings` prints the current table. `ratings.yaml` in the config directory is the same thing as a file, regenerated on every change; it is display-only and Baton never reads it back. `baton profile export` emits a shareable file containing only model opinions, never your prompts, accounts, or machine details.
+`baton ratings` prints the current table. `baton ratings export` writes a `ratings.yaml` snapshot on demand; grades and settings do not maintain that file. SQLite remains the source for routing. `baton profile export` emits a shareable file containing model priors, without local run history or account configuration.
 
 To hand a profile to someone without passing files around, share it through the Baton site:
 
@@ -145,7 +129,9 @@ baton profile share                    # signs in with GitHub the first time
 #   Import: baton profile import k7mq3-v2xrd
 ```
 
-`baton profile import <code-or-link>` on another machine shows the diff and writes nothing until `--yes`; the priors land in a local profile named `<login>/<name>` so they cannot collide with your own. Sharing the same profile again refreshes the same link. `baton profile shares` and `baton profile unshare <code>` manage them; `baton login` / `baton logout` manage the token, which lives in the scope's config dir. Nothing is browseable on the site: a share is reachable only by its code, and only the profile document itself (canonical model priors) is uploaded.
+`baton profile import <file-or-code-or-link>` applies immediately and prints the changes. Use `--dry-run` to preview. The first imported profile activates automatically; later imports switch profiles only with `--activate`. Replacing a profile saves its previous version under `profile-backups` and prints a restore command. Shared profiles default to the name `<login>/<name>`.
+
+Sharing the same profile again updates its link. `baton profile shares` and `baton profile unshare <code>` manage shares; `baton login` and `baton logout` manage the scope's sharing token. The service allows 100 profiles and 5 MiB of stored profile JSON per account. Listings are paginated and the CLI fetches every page. Anyone holding a share code can read that profile.
 
 ## Load balancing
 
@@ -165,7 +151,7 @@ From then on every delegation to an opus or sonnet model picks an account automa
 - Resumed runs skip the pool and go back to the account that holds the session.
 - `baton pool list` shows the live picture: headroom per account and who is cooling down.
 
-Per-account spending policy: `baton set preciousness:claude-code:personal-2 conserve` (levels: `burn`, `conserve`, `emergency`). An `emergency` account is only picked when every other account is unavailable, which is how "keep the work account out of my hobby projects" becomes one line of config.
+Per-account spending policy: `baton set preciousness:claude-code:personal-2 conserve`, with levels `burn`, `conserve` and `emergency`. An `emergency` account can still be selected as a fallback. Use an explicit block when an account must never be used in a scope.
 
 ## Blocking a route
 
@@ -179,18 +165,18 @@ baton block add cursor-agent                                       # a whole app
 
 A pattern addresses a route the way Baton names one internally — `<app>[:<instance>]/<slug>`, with `*` matching anything. Leave the instance off and it covers every account; name one (`codex:work/*`) and it covers only that account. `baton block add` prints the routes it matches right now, so a typo shows up immediately.
 
-To take a whole app out of service, reject it — this works on the built-in apps too, not just discovered ones:
+To disable a whole app, use the same commands for built-in and registered adapters:
 
 ```sh
-baton adapters reject opencode client machine   # blocks every route it has
-baton block remove 'opencode:*/*'               # and back again
+baton adapters disable opencode
+baton adapters enable opencode
 ```
 
-A blocked route is never selected: not when it is the only route for a model, not as a last resort when everything else is rate-limited, not when resuming a session that already ran on it, and not by the conformance canary. `list_models` reports it as unavailable with your reason attached, so a delegating agent sees the refusal before it tries. Blocks are written only from your terminal — `baton block list`, `baton block remove <pattern>` — never through an MCP tool.
+A blocked route is excluded from normal runs, failover, resumes and optional adapter diagnostics. `list_models` reports the reason. Use `baton block list` and `baton block remove <pattern>` to manage route patterns. Agents can enable or disable a whole app with `set_app_enabled(app, enabled)`.
 
 ## Separate worlds
 
-`BATON_CONFIG_DIR` relocates everything Baton knows: config, accounts, pools, quota history, ratings, the database. Set it per directory with direnv and a work checkout gets a Baton that only knows work accounts, while your personal projects get another that only knows personal ones. The two cannot leak into each other because neither knows the other exists.
+`BATON_CONFIG_DIR` separates Baton's configuration, named accounts, pools, history, ratings and sharing login. Set it per directory with direnv when those records should be independent. This does not isolate the underlying CLI's credentials: the default account still comes from the inherited environment, and two scopes can reach the same account.
 
 Baton never inspects or enforces identity. It runs each CLI with the environment it inherited, exactly as if you had typed the command in that shell. Whatever account the environment supplies is the account that runs.
 
@@ -200,17 +186,17 @@ Any agent can onboard an app Baton has never heard of:
 
 1. The agent calls `discover_app("someapp")` and gets a checklist: probe the CLI, find its non-interactive mode, its output format, its model names.
 2. It submits what it found with `register_app(spec)`. The spec is: an executable path, argument lists, and rules for extracting the answer.
-3. You review and approve in the terminal: `baton adapters review someapp`, then `baton adapters approve someapp --digest <shown-in-review>`. Approval requires a terminal and the digest of the exact spec you reviewed.
-4. Baton runs one canary prompt through the app to verify the answer comes back intact, then activates it. From then on it routes like any built-in app/provider.
+3. A valid registration is enabled immediately. Registering identical content is a no-op; an invalid replacement leaves the working spec alone. Explicit disables survive spec updates.
+4. Optionally call `test_app(app)` or run `baton adapters test <app>` to check execution and answer extraction. Tests use the selected account and obey blocks and permission ceilings. Registration itself makes no model call.
 
-If the app's binary is later upgraded, the adapter is marked stale and re-verified before it runs again.
+From the shell, `baton adapters add <spec.json>` registers an adapter and `baton adapters show <app>` prints its spec. `baton adapters test --all --structural` validates declarations without model calls. Upgrading the CLI does not disable its adapter; diagnostics remain optional. There is no adapter approval command, digest-copying step or mandatory diagnostic.
 
 ## What Baton does not do
 
 - It does not verify identity. Environment separation is your direnv setup's job; Baton just inherits what it is given. `baton block` is the escape hatch for routes you know must not be spent — a rule you state, not one Baton infers.
 - It does not sandbox callees beyond the autonomy flags each CLI itself offers. You choose what your agents may do.
-- It cannot stop a full-permission local agent from doing what you yourself could do in a terminal, including approving adapters. The approval step protects against accidents, not against an agent you have already given full access to your shell.
-- Raw prompts stay on your machine, in a capped ring buffer (about 2,000 runs). Only aggregate ratings are shareable.
+- It cannot restrict a full-permission local agent beyond the controls enforced by that agent's host.
+- Baton stores local run history, with a default retention cap of about 2,000 completed runs. Delegated prompts go to the selected CLI and may be sent to its model provider. The optional Baton sharing service receives profile priors and sharing-account information, not run prompts or transcripts. Profile names and categories are free text and are included when shared.
 
 ## Development
 

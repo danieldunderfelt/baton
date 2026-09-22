@@ -1,85 +1,33 @@
 ---
 name: baton
-description: Delegate a self-contained task to another model running in a local agent CLI (codex, kimi, claude-code, opencode, cursor-agent) through the Baton MCP server. Use when the user says "baton", names a model to hand work to ("ask kimi-k3", "have sol review this", "get grok's take"), wants a second opinion, a cross-model review or a blind A/B comparison, or when bulk, mechanical or long-running work would otherwise burn this session's context.
+description: Delegate a self-contained task to another model through the Baton MCP server. Use for an explicitly requested model handoff, independent implementation, a second opinion, or a blind model comparison.
 ---
 
 ## Delegating with Baton
 
-Use the Baton MCP tools when this skill applies. If the tools are unavailable, tell the user to enable the registered Baton server and start a new session. Do not substitute direct calls to the agent CLIs.
+Use the Baton MCP tools for delegation. If they are unavailable, report that the registered server needs to be enabled in a new session. Do not substitute direct calls to agent CLIs.
 
-Baton hands a self-contained task to a model running in another agent CLI on this machine, on that app's own subscription, with its own tools and a fresh context, and returns its final answer. The tools come from the MCP server `baton`: `list_models`, `run_model`, `get_run`, `report_result`, `run_duel`, `report_duel`.
+Baton runs a self-contained task in another agent CLI on this machine, using that app's account and tools. The callee shares the filesystem but starts with a fresh conversation.
 
-### When to reach for it
+### Delegate a task
 
-- "baton" is a trigger word. If the user says it, or names a model ("ask kimi-k3", "have sol review this", "second opinion from opus"), the work goes through these tools. Not into your own context, and not through an ad-hoc shell call to the CLI.
-- Bulk and mechanical work goes to a fast cheap model: clear-spec implementation, migrations, mass edits, data munging.
-- Reviews, plans and hard debugging go to a strong model, preferably not the one that wrote the code.
-- Skip delegation when the briefing would be longer than the work. Baton buys capacity, not thinking.
+1. Use `list_models` to find available models, supported permissions and account availability. Choose a model suited to the task. Delegation is useful for independent implementation, a second opinion or work that needs another model. Keep small tasks local when a briefing would take more work than the task.
+2. Call `run_model` with the model, prompt and working directory. Include the objective, paths, constraints and expected result. The callee cannot see your conversation. For concurrent work, use separate checkouts for writers and `options.autonomy: "readonly"` for reviews.
+3. Use `wait: false` for long work. Continue other work, then call `get_run(run_id, wait: true)`. A `running` status means the run is still active. The wait budget and the run's optional timeout are separate. Use `cancel_run(run_id)` to stop it.
+4. Inspect the returned result and verify any changes before using them. Continue the same session with `resume_run` when a follow-up needs its context. Omitted options are inherited; explicit options apply to the new turn within the current permission ceiling.
 
-### How
+An optional `idempotency_key` makes identical retries return the same run. Use a new key if the request changes. Baton enforces the configured delegation depth and supported permission levels; `list_models` reports availability reasons.
 
-1. Call `list_models` when you are unsure what this machine can reach. It reports what is available in this environment, each model's live rating (observed evidence and seeded prior, kept apart), and estimated headroom for pooled accounts from runs Baton observed. It cannot see subscription limits or usage outside Baton. Trust its model roster and ratings over any static opinion, including the roster below and your own.
-2. Call `run_model(model, prompt, cwd?, wait?, category?, options?, idempotency_key?)`:
-   - `prompt` must be self-contained. The callee shares your filesystem and none of your context: no chat history, no earlier tool output, no user messages. State the task, the paths to read, the constraints, and the exact shape of the answer you want back.
-   - `cwd` defaults to your working directory. Set it to aim the callee at another checkout.
-   - `idempotency_key` is one stable string per logical task, bound to the payload. Reuse it only for a byte-identical retry of the same request. A changed prompt, `cwd` or `options` under the old key comes back as an error, so mint a new key whenever the request changed.
-   - Runs have no time limit. A blocking call returns after at most ten minutes; `status: "running"` means only that the wait ended, never that the run timed out. Call `get_run(run_id, wait: true)` to keep waiting, as many times as it takes. Never report a still-running run as having hit a time limit.
-   - `wait: false` for anything long-running, then poll `get_run(run_id)` and do something else meanwhile.
-   - Delegation depth is capped at two hops by default (`BATON_HOPS`): a callee may delegate onward once, and its callee is refused. Plan chains instead of discovering the refusal at runtime.
-3. The callee is a real agent with tools and it will edit files. Run one writer per checkout at a time, and give parallel delegations `options.autonomy: "readonly"` so reviews and analysis cannot collide. An adapter that cannot express the level you asked for refuses the run rather than quietly running at another one. `kimi` is non-interactive at `full` only, so readonly work goes to `codex`, `claude-code` or `cursor-agent`.
+When working as a callee, stay within the delegated task, return a standalone answer and stop. Delegate onward only when it helps with that task.
 
-### Models to start from
+### Optional ratings and comparisons
 
-- `gpt-5.6-sol`, codex's strong model. Reviews, design critique, tricky implementation. Slow.
-- `gpt-5.6-luna`, fast and cheap. Mechanical edits, boilerplate, summarising, anything with a spec tight enough to follow literally.
-- `kimi-k3`, a strong generalist with good taste. Second-opinion reviews, and implementation where code quality matters.
-- `opus-5` and `sonnet-5`, via Claude Code. Opus for hard reasoning, sonnet when speed matters more than depth.
-- `grok-4.6`, via cursor-agent. Quick, and a different family when two opinions have deadlocked.
-- `ox-alpha`, via opencode. A capable all-rounder from outside the other families.
+Baton works without ratings or a setup interview. After using an answer, `report_result(run_id, grade, notes?)` can record its usefulness on a 1–5 scale. Grade the answer, not the model's reputation or execution speed. A failure without an answer is already tracked as execution reliability. Re-reporting replaces the earlier grade.
 
-These are the user's starting priors. `list_models` reports what the evidence says instead, so believe it when the two disagree. It also lists every model each app reports it can serve, under the app's own slug (`gpt-6-astra`, `github-copilot/claude-opus-5`, `cursor-grok-4.6-xhigh`), and Claude Code takes any full `claude-*` id. A newly released model needs no Baton change: name it as its app does.
+Use `run_duel([a, b], prompt)` for a blind comparison of two models, then `report_duel(duel_id, "A" | "B" | "tie")` after judging the answers. Duels share a directory and must be non-mutating.
 
-### Afterwards
+If the user requests model preferences, `seed_ratings(profile_name, entries)` records them. Use canonical model IDs and distinguish quality from speed or cost. No extra confirmation is needed for an explicitly requested preference change. `baton profile import` imports a shared profile; `--dry-run` previews it. The first profile activates automatically.
 
-- Read what came back before you use it. Delegated answers can be confidently wrong or thinner than they look. Verify against the files, and say so plainly when a result was not good enough rather than passing it on as fact.
-- Grade it once you have used it: `report_result(run_id, grade, notes?)` on the 1-5 scale, scored on how useful the answer turned out to be. Not on how it read when it arrived, and not on the model's reputation. Those grades are the evidence `list_models` routes on; a run nobody grades teaches Baton nothing.
-- When two models are genuinely in contention, `run_duel([a, b], prompt)` runs both on the identical prompt and hands back answers labelled A and B with the models hidden. Judge on the answers alone, then `report_duel(duel_id, "A" | "B" | "tie")`, which reveals which was which. Both sides run in the same directory, so duels are for non-mutating work. Two agents editing one checkout is a race, not a comparison.
+`baton ratings` shows the evidence. `baton ratings export` writes a snapshot when needed. Account pools, spending preferences and shared profiles are optional configuration.
 
-### Orchestrating other agents
-
-When you are driving subagents or a multi-stage workflow, the workers should delegate too:
-
-- Give bulk stages to a cheap model through `run_model`, and keep the current conversation for decisions that need its context.
-- Route cross-model review through Baton as well. A worker that asks `gpt-5.6-sol` or `kimi-k3` to review what another model just wrote leaves a graded run behind, so the evidence accrues instead of evaporating with the subagent's transcript.
-- Tell workers to grade what they actually used. A workflow that fires off a hundred delegations and grades none leaves routing exactly where it started.
-
-When you are the callee, work within the delegated task, return a standalone answer, and stop. Do not assume access to the caller's conversation or permission to expand the task.
-
-### Grading what came back
-
-Baton routes on evidence, and the evidence is your grades. Grade a delegation after you have used its result, not when it arrives, and not on how the answer reads.
-
-- `report_result(run_id, grade, notes?)`, where `grade` is 1-5:
-  - 5: correct and directly usable
-  - 4: usable after small fixes
-  - 3: partly usable; half of it had to be redone
-  - 2: mostly wrong
-  - 1: useless or actively misleading
-- Grade the answer's usefulness to you, not the model's reputation, and not how long it took.
-- Only a run that produced an answer can be graded; Baton refuses the rest. A crashed CLI, a timeout or an unparseable answer is not a 1. Those count against the execution target as reliability on their own, so there is nothing for you to report.
-- `notes` is one line on why. That line is what makes a grade re-readable later.
-- Reports are upserts: re-reporting the same `run_id` replaces its grade, so a correction never double-counts.
-- From the shell: `baton grade <run_id> <1-5> [notes...]`, and `baton ratings` prints the current table (observed, prior, blended, and which profile the prior came from).
-- `report_duel` is an upsert too: a re-judged duel replaces its verdict instead of stacking a second one onto the pair.
-
-### Onboarding: seeding the user's priors
-
-Before there is local evidence, ratings are whatever the user already believes. Once, at setup, or whenever the user wants to revise their opinion of the models, interview them and submit the result with `seed_ratings(profile_name, entries)`:
-
-1. Ask for comparisons, not numbers: "who do you trust for a review?", "is kimi-k3 about as good as opus-5 for implementation?", "which one would you never hand a migration to?". People are calibrated on ordinal and pairwise judgments; invented 1-5 scores are noise.
-2. Split multi-axis prose. "Fast but sloppy" is two claims. Speed is routing metadata, not a quality prior, so only the quality claim becomes a seeded rating. Same for cost.
-3. Map each claim to an entry: `{ model, category?, mean, weight? }`. Canonical model ids only (`kimi-k3`, never `kimi:default/kimi-code/k3`), `mean` on the 1-5 grade scale, `category` omitted for a general opinion.
-4. Echo the normalized entries back and get an explicit yes before calling `seed_ratings`. You propose, the user approves. A seed they did not recognise is a seed that quietly misroutes work.
-5. Seed weight is capped at the worth of roughly 5-10 observations on purpose: a wrong seed fades as real grades arrive instead of steering routing for months.
-
-Ask about preciousness in the same conversation: how freely each account may be spent. Set it from the shell, where the trusted config lives: `baton set preciousness:<app>:<instance> burn|conserve|emergency`.
+<!-- baton:skill eval=true -->
