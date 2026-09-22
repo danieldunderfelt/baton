@@ -39,6 +39,7 @@ async function connect(
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined && key !== "BATON_CONFIG_DIR" && key !== "BATON_HOPS") env[key] = value;
   }
+  env.PATH = "/usr/bin:/bin";
   Object.assign(env, overrides);
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -167,6 +168,7 @@ describe("tools/list", () => {
   test("exposes the tool set with usable schemas", async () => {
     const { tools } = await session.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
+      "cancel_run",
       "discover_app",
       "get_ratings",
       "get_run",
@@ -178,6 +180,8 @@ describe("tools/list", () => {
       "run_duel",
       "run_model",
       "seed_ratings",
+      "set_app_enabled",
+      "test_app",
     ]);
 
     for (const tool of tools) {
@@ -209,8 +213,8 @@ describe("tools/list", () => {
 
     const listModels = tools.find((t) => t.name === "list_models")!;
     expect(listModels.description).toContain("degradedReason");
-    // ttlMs is a caller-side hint; nothing is cached server-side.
-    expect(listModels.description).toMatch(/Nothing is cached server-side/);
+    expect(listModels.description).toContain("account's environment");
+    expect(listModels.description).toContain("cache");
 
     const getRun = tools.find((t) => t.name === "get_run")!;
     expect((getRun.inputSchema.required as string[])).toEqual(["run_id"]);
@@ -227,8 +231,8 @@ describe("tools/list", () => {
 
     const seed = tools.find((t) => t.name === "seed_ratings")!;
     expect((seed.inputSchema.required as string[]).sort()).toEqual(["entries", "profile_name"]);
-    // Propose/approve, and the cap that keeps a wrong seed from steering routing.
-    expect(seed.description).toContain("approve");
+    expect(seed.description).toContain("Seeding is optional");
+    expect(seed.description).toContain("no separate confirmation or interview");
     expect(seed.description).toContain("capped at 10");
 
     const duel = tools.find((t) => t.name === "run_duel")!;
@@ -256,10 +260,14 @@ describe("tools/list", () => {
 
     const register = tools.find((t) => t.name === "register_app")!;
     expect((register.inputSchema.required as string[])).toEqual(["spec"]);
-    // The invariant an agent must not try to route around.
-    expect(register.description).toContain("QUARANTINED");
-    expect(register.description).toContain("baton adapters review");
-    expect(register.description).toContain("CLI-only");
+    expect(register.description).toContain("enabled immediately");
+    expect(register.description).toContain("optional diagnostic");
+    expect(register.description).not.toMatch(/approve|terminal|quarantined/i);
+    const cancel = tools.find((tool) => tool.name === "cancel_run")!;
+    expect(cancel.inputSchema.required).toEqual(["run_id"]);
+    const enabled = tools.find((tool) => tool.name === "set_app_enabled")!;
+    expect(enabled.inputSchema.required?.toSorted()).toEqual(["app", "enabled"]);
+    expect(tools.find((tool) => tool.name === "test_app")!.inputSchema.required).toEqual(["app"]);
 
     const discover = tools.find((t) => t.name === "discover_app")!;
     expect((discover.inputSchema.required as string[])).toEqual(["name"]);
@@ -340,7 +348,7 @@ describe("get_run", () => {
   });
 
   test("wait:true keeps waiting on a run that has no deadline of its own", async () => {
-    const host = await connect("0", { PATH: `${slowKimi(2)}:${process.env.PATH ?? ""}` });
+    const host = await connect("0", { PATH: `${slowKimi(2)}:/usr/bin:/bin` });
     try {
       const started = await callJson(host.client, "run_model", {
         model: "kimi-k3",
@@ -359,6 +367,58 @@ describe("get_run", () => {
       await host.close();
     }
   }, 30_000);
+});
+
+
+describe("cancel_run", () => {
+  test("unknown handles return a tool error", async () => {
+    const result = await call(session.client, "cancel_run", { run_id: "run_missing" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("run_missing");
+  });
+
+  test("one MCP process cancels another owner's run and waits for its descendants", async () => {
+    const { bin, pidfile } = fakeKimi();
+    const owner = await connect("0", { PATH: `${bin}:/usr/bin:/bin` });
+    const requester = await connect("0", {}, owner.dir);
+    let pids: number[] = [];
+    try {
+      const run = await callJson(owner.client, "run_model", { model: "kimi-k3", prompt: "wait", wait: false });
+      pids = await poll("callee and descendant", 5000, () => {
+        const found = readPids(pidfile);
+        return found.length >= 2 ? found : undefined;
+      });
+      const cancelled = await callJson(requester.client, "cancel_run", { run_id: run.run_id });
+      expect(cancelled).toMatchObject({ run_id: run.run_id, status: "cancelled" });
+      expect(pids.every(pid => !alive(pid))).toBe(true);
+      expect((await callJson(owner.client, "get_run", { run_id: run.run_id })).status).toBe("cancelled");
+      expect((await callJson(requester.client, "cancel_run", { run_id: run.run_id })).status).toBe("cancelled");
+    } finally {
+      await requester.close();
+      await owner.close();
+      for (const pid of pids) { if (alive(pid)) process.kill(pid, "SIGKILL"); }
+      rmSync(bin, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("cancelling a blind duel side does not disclose either model", async () => {
+    const bin = fakeSleeper("codex");
+    const host = await connect("0", { PATH: `${bin}:/usr/bin:/bin` });
+    const db = scopeDb(host.dir);
+    try {
+      await callJson(host.client, "run_duel", { models: ["gpt-5.6-sol", "gpt-5.6-luna"], prompt: "compare" });
+      const side = db.query<{ run_a: string }, []>("SELECT run_a FROM duels").get();
+      if (!side) throw new Error("duel was not recorded");
+      const cancelled = await callJson(host.client, "cancel_run", { run_id: side.run_a });
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.blind).toBe(true);
+      expectNamesNobody(cancelled);
+    } finally {
+      db.close();
+      await host.close();
+      rmSync(bin, { recursive: true, force: true });
+    }
+  }, 10000);
 });
 
 describe("run_model", () => {
@@ -395,7 +455,7 @@ describe("run_model", () => {
  * The scope's own database, opened from the test process. Real delegation needs
  * live CLIs, so the graded runs are inserted here directly: what is under test
  * is the tool layer — how a run_id resolves to evidence, what it commits, and
- * what it publishes — not the supervisor that would normally write these rows.
+ * what it reports, rather than the supervisor that would normally write these rows.
  */
 function scopeDb(dir: string): Database {
   return openStore(join(dir, "state", "baton.db"));
@@ -478,7 +538,7 @@ describe("report_result", () => {
     await evalSession?.close();
   });
 
-  test("grades a finished run, bumps the revision and republishes ratings.yaml", async () => {
+  test("grades a finished run and bumps the revision without an automatic export", async () => {
     insertRun(db, "run_graded", [{ target: KIMI_TARGET, status: "succeeded" }], {
       category: "implementation",
     });
@@ -509,10 +569,7 @@ describe("report_result", () => {
     });
     expect(revisionOf(db)).toBe(res.revision as number);
 
-    // The projection lands in the scope's config dir, stamped with the revision
-    // it was rendered from — that stamp is what makes a stale write refusable.
-    expect(ratingsYaml(evalSession.dir)).toContain(`# source_revision: ${res.revision}`);
-    expect(ratingsYaml(evalSession.dir)).toContain("model: kimi-k3");
+    expect(existsSync(join(evalSession.dir, "ratings.yaml"))).toBe(false);
   });
 
   test("re-reporting replaces the grade instead of stacking a second one", async () => {
@@ -528,7 +585,8 @@ describe("report_result", () => {
     expect(row.observed).toBeCloseTo(1, 6);
     expect(gradeRow(db, "run_graded")).toMatchObject({ grade: 1, notes: null });
     expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM grades").get()?.n).toBe(1);
-    expect(ratingsYaml(evalSession.dir)).toContain(`# source_revision: ${first.revision}`);
+    expect(revisionOf(db)).toBe(first.revision);
+    expect(existsSync(join(evalSession.dir, "ratings.yaml"))).toBe(false);
   });
 
   test("evidence attaches to the attempt that answered, not the one that was refused", async () => {
@@ -654,10 +712,11 @@ describe("seed_ratings / get_ratings", () => {
     expect(res.ratings).toEqual([]);
     // No duels here either — the two signals are empty independently.
     expect(res.bt).toEqual([]);
-    expect(res.ratingsFile).toBe(join(seedSession.dir, "ratings.yaml"));
+    expect(res.ratingsFile).toBeUndefined();
+    expect(existsSync(join(seedSession.dir, "ratings.yaml"))).toBe(false);
   });
 
-  test("echoes the entries as committed, activates the profile and publishes", async () => {
+  test("records provided preferences and activates the first profile without confirmation", async () => {
     const res = await callJson(seedSession.client, "seed_ratings", {
       profile_name: "daniel",
       entries: [
@@ -666,8 +725,7 @@ describe("seed_ratings / get_ratings", () => {
       ],
     });
 
-    // Echo semantics: defaults and the cap are applied in the answer, so the
-    // user approves what actually landed rather than what was proposed.
+    // The response reports the defaults and cap that were actually stored.
     expect(res.entries).toEqual([
       { model: "kimi-k3", category: "", mean: 4.5, weight: 10 },
       { model: "gpt-5.6-sol", category: "review", mean: 3, weight: 5 },
@@ -675,7 +733,7 @@ describe("seed_ratings / get_ratings", () => {
     expect(res.profile).toBe("daniel");
     expect(res.activeProfile).toBe("daniel");
     expect(res.revision).toBe(revisionOf(db));
-    expect(ratingsYaml(seedSession.dir)).toContain(`# source_revision: ${res.revision}`);
+    expect(existsSync(join(seedSession.dir, "ratings.yaml"))).toBe(false);
   });
 
   test("get_ratings reports prior and observed separately, in deterministic order", async () => {
@@ -703,7 +761,7 @@ describe("seed_ratings / get_ratings", () => {
       priorSource: "seeded",
       blended: 4.5,
     });
-    // The published weight is the prior's *decayed* weight, so a seed made
+    // The reported weight is the prior's *decayed* weight, so a seed made
     // seconds ago reports its cap minus an unmeasurable sliver, not the cap.
     expect(rows[1]!.priorWeight).toBeCloseTo(10, 6);
   });
@@ -728,6 +786,18 @@ describe("seed_ratings / get_ratings", () => {
         .query<{ mean: number }, []>("SELECT mean FROM priors WHERE model = 'kimi-k3'")
         .get()?.mean,
     ).toBe(4.5);
+  });
+
+  test("route fingerprints and app names cannot be seeded as canonical models", async () => {
+    const before = revisionOf(db);
+    for (const model of ["kimi:default/kimi-code/k3", "kimi"]) {
+      const result = await call(seedSession.client, "seed_ratings", {
+        profile_name: "daniel", entries: [{ model, mean: 5 }],
+      });
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain("canonical models");
+    }
+    expect(revisionOf(db)).toBe(before);
   });
 
   test("re-seeding a model replaces its prior in place", async () => {
@@ -805,7 +875,7 @@ describe("run_duel / report_duel", () => {
   beforeAll(async () => {
     // Both codex models, so one fake binary serves both sides of the duel.
     bin = fakeSleeper("codex");
-    duelSession = await connect("0", { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    duelSession = await connect("0", { PATH: `${bin}:/usr/bin:/bin` });
     db = scopeDb(duelSession.dir);
     started = await callJson(duelSession.client, "run_duel", {
       models: ["gpt-5.6-sol", "gpt-5.6-luna"],
@@ -1053,115 +1123,129 @@ describe("resume_run", () => {
 describe("discover_app / register_app", () => {
   let discoverySession: Session;
   let db: Database;
+  let binary: string;
+  let invocations: string;
 
-  const spec = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-    app: "fake-agent",
-    adapterVersion: 1,
-    binary: "/usr/local/bin/fake-agent",
-    identityEnv: "FAKE_AGENT_HOME",
+  const spec = (overrides: Record<string, unknown> = {}) => ({
+    app: "fake-agent", adapterVersion: 1, binary,
     models: [{ model: "fake-model", slug: "fake/slug" }],
-    invoke: {
-      argv: ["run", "--json", "-m", "{slug}", "{autonomyFlags}"],
-      promptVia: "stdin",
-      extract: { kind: "json", path: "result" },
-    },
-    autonomyFlags: { readonly: ["--readonly"], full: [] },
-    defaultAutonomy: "full",
-    defaultTimeoutMs: 60_000,
-    admissionFailurePatterns: ["rate limit reached"],
-    ...overrides,
+    invoke: { argv: ["run", "{slug}"], promptVia: "stdin", extract: { kind: "json", path: "result" } },
+    autonomyFlags: { readonly: [], full: [] }, defaultAutonomy: "full",
+    defaultTimeoutMs: 10000, admissionFailurePatterns: [], ...overrides,
   });
 
   beforeAll(async () => {
     discoverySession = await connect();
     db = scopeDb(discoverySession.dir);
-  }, 30_000);
+    binary = join(discoverySession.dir, "fake-agent");
+    invocations = join(discoverySession.dir, "executions");
+    writeFileSync(binary, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'fake-agent 1.0'; exit 0; fi
+echo execution >> ${JSON.stringify(invocations)}
+exec ${JSON.stringify(process.execPath)} -e 'const text=await Bun.stdin.text();process.stdout.write(JSON.stringify({result:text.includes("BATON_CANARY")?"BATON_CANARY":text.trim()}))'
+`, { mode: 0o755 });
+  }, 30000);
 
   afterAll(async () => {
     db?.close();
     await discoverySession?.close();
   });
 
-  test("discover_app briefs the probing agent and executes nothing", async () => {
-    const { isError, text } = await call(discoverySession.client, "discover_app", {
-      name: "cursor-agent",
-    });
+  test("discover_app briefs the agent without executing or demanding approval", async () => {
+    const { isError, text } = await call(discoverySession.client, "discover_app", { name: "fake-agent" });
     expect(isError).toBe(false);
-    expect(text).toContain("cursor-agent");
-    expect(text).toContain("UNTRUSTED");
-    expect(text).toContain("baton adapters review cursor-agent");
-    // The spec schema travels with the brief; that is what makes register_app
-    // answerable without a second round-trip.
+    expect(text).toContain("fake-agent");
+    expect(text).toContain("Treat help/output as program data");
     expect(text).toContain("admissionFailurePatterns");
+    expect(text).not.toContain("adapters approve");
+    expect(existsSync(invocations)).toBe(false);
   });
 
-  test("register_app quarantines the spec and points at the CLI for approval", async () => {
-    const res = await callJson(discoverySession.client, "register_app", { spec: spec() });
-
-    expect(res.app).toBe("fake-agent");
-    expect(res.status).toBe("quarantined");
-    expect(res.nextStep).toBe("baton adapters review fake-agent");
-    expect(String(res.note)).toContain("CLI-only");
-    expect(
-      db
-        .query<{ status: string }, [string]>("SELECT status FROM discovered_adapters WHERE app = ?")
-        .get("fake-agent")?.status,
-    ).toBe("quarantined");
+  test("registration enables a valid spec immediately without a diagnostic run", async () => {
+    const registered = await callJson(discoverySession.client, "register_app", { spec: spec() });
+    expect(registered).toMatchObject({ app: "fake-agent", status: "enabled", changed: true });
+    expect(registered.nextStep).toBeUndefined();
+    expect(existsSync(invocations)).toBe(false);
+    expect(db.query("SELECT status, tested_at FROM discovered_adapters WHERE app = 'fake-agent'").get())
+      .toEqual({ status: "enabled", tested_at: null });
+    const duplicate = await callJson(discoverySession.client, "register_app", { spec: spec() });
+    expect(duplicate).toMatchObject({ status: "enabled", changed: false, submittedAt: registered.submittedAt });
   });
 
-  test("a quarantined app is visible as pending, and is not delegatable", async () => {
-    const payload = await callJson(discoverySession.client, "list_models");
-    const models = payload.models as {
-      app: string;
-      model: string;
-      available: boolean;
-      degradedReason?: string;
-    }[];
-
-    // Visible, because hiding it would hide the thing the user is being asked
-    // to review — but unavailable, with the command that would change that.
-    const pending = models.find((m) => m.app === "fake-agent")!;
-    expect(pending.model).toBe("fake-model");
-    expect(pending.available).toBe(false);
-    expect(pending.degradedReason).toContain("baton adapters review fake-agent");
-
-    expect(payload.quarantined_apps).toEqual([
-      { app: "fake-agent", status: "quarantined", nextStep: "baton adapters review fake-agent" },
-    ]);
-
-    // And it really is inert: delegating to its model is refused.
-    const { isError, text } = await call(discoverySession.client, "run_model", {
-      model: "fake-model",
-      prompt: "hello",
-      wait: false,
-    });
-    expect(isError).toBe(true);
-    expect(text).toContain("fake-model");
+  test("the enabled app can run before any optional diagnostic", async () => {
+    const listing = await callJson(discoverySession.client, "list_models");
+    expect(listing.registered_apps).toContainEqual({ app: "fake-agent", status: "enabled" });
+    expect(listing.models).toContainEqual(expect.objectContaining({ model: "fake-model", app: "fake-agent", available: true }));
+    expect(existsSync(invocations)).toBe(false);
+    const run = await callJson(discoverySession.client, "run_model", { model: "fake-model", prompt: "answer now", wait: true });
+    expect(run).toMatchObject({ status: "succeeded", output: "answer now", options: { autonomy: "full", timeoutMs: 10000 } });
+    expect(readFileSync(invocations, "utf8").trim().split("\n")).toHaveLength(1);
   });
 
-  test("an invalid spec is refused with every problem at once, and stores nothing", async () => {
-    const { isError, text } = await call(discoverySession.client, "register_app", {
-      spec: spec({ app: "another-agent", binary: "./fake-agent", invoke: {
-        argv: ["run", "; rm -rf ~"],
-        promptVia: "stdin",
-        extract: { kind: "text" },
-      } }),
-    });
+  test("disable and enable control routing, and registration preserves the explicit block", async () => {
+    expect(await callJson(discoverySession.client, "set_app_enabled", { app: "fake-agent", enabled: false }))
+      .toEqual({ app: "fake-agent", enabled: false });
+    const duplicate = await callJson(discoverySession.client, "register_app", { spec: spec() });
+    expect(duplicate.status).toBe("disabled");
+    const refused = await call(discoverySession.client, "run_model", { model: "fake-model", prompt: "blocked", wait: true });
+    expect(refused.isError).toBe(true);
+    expect(readFileSync(invocations, "utf8").trim().split("\n")).toHaveLength(1);
+    await callJson(discoverySession.client, "set_app_enabled", { app: "fake-agent", enabled: true });
+    const run = await callJson(discoverySession.client, "run_model", { model: "fake-model", prompt: "enabled again", wait: true });
+    expect(run.output).toBe("enabled again");
+  });
 
-    expect(isError).toBe(true);
-    expect(text).toContain("absolute path");
-    expect(text).toContain("shell metacharacters");
-    expect(text).toContain("{slug}");
-    expect(
-      db
-        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM discovered_adapters WHERE app = ?")
-        .get("another-agent")?.n,
-    ).toBe(0);
+  test("an optional diagnostic records health while using the shared permission ceiling", async () => {
+    db.query("INSERT INTO settings VALUES ('max_autonomy:fake-agent', 'readonly')").run();
+    const result = await callJson(discoverySession.client, "test_app", { app: "fake-agent" });
+    expect(result).toMatchObject({ app: "fake-agent", passed: true });
+    const view = await callJson(discoverySession.client, "get_run", { run_id: result.runId });
+    expect(view.options).toMatchObject({ autonomy: "readonly" });
+    const listing = await callJson(discoverySession.client, "list_models");
+    expect(listing.registered_apps).toContainEqual(expect.objectContaining({ app: "fake-agent", status: "enabled", diagnostic: expect.objectContaining({ passed: true }) }));
+  });
+
+  test("a failed diagnostic records the failure without disabling the registration", async () => {
+    const failed = await callJson(discoverySession.client, "register_app", { spec: spec({
+      app: "fake-bad-diagnostic", models: [{ model: "bad-diagnostic-model", slug: "fake/bad" }],
+      invoke: { argv: ["run", "{slug}"], promptVia: "stdin", extract: { kind: "json", path: "missing" } },
+    }) });
+    expect(failed.status).toBe("enabled");
+    expect((await callJson(discoverySession.client, "test_app", { app: "fake-bad-diagnostic" })).passed).toBe(false);
+    const listing = await callJson(discoverySession.client, "list_models");
+    expect(listing.registered_apps).toContainEqual(expect.objectContaining({ app: "fake-bad-diagnostic", status: "enabled", diagnostic: expect.objectContaining({ passed: false }) }));
+    expect(listing.models).toContainEqual(expect.objectContaining({ model: "bad-diagnostic-model", available: true }));
+  });
+
+  test("built-in enable and disable uses the same tool and preserves unrelated blocks", async () => {
+    db.query("INSERT INTO route_blocks VALUES ('kimi:private/*', 'keep this account blocked', ?)").run(new Date().toISOString());
+    await callJson(discoverySession.client, "set_app_enabled", { app: "kimi", enabled: false });
+    expect(db.query("SELECT pattern FROM route_blocks ORDER BY pattern").all()).toContainEqual({ pattern: "kimi:*/*" });
+    await callJson(discoverySession.client, "set_app_enabled", { app: "kimi", enabled: true });
+    expect(db.query("SELECT pattern FROM route_blocks ORDER BY pattern").all()).toEqual([{ pattern: "kimi:private/*" }]);
+  });
+
+  test("invalid replacements preserve the working adapter and report actual argument errors", async () => {
+    const rejected = await call(discoverySession.client, "register_app", { spec: spec({
+      binary: "./fake-agent", invoke: { argv: ["run", "invalid\u0000value"], promptVia: "stdin", extract: { kind: "text" } },
+    }) });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toContain("NUL");
+    expect(rejected.text).toContain("{slug}");
+    const run = await callJson(discoverySession.client, "run_model", { model: "fake-model", prompt: "still works", wait: true });
+    expect(run.output).toBe("still works");
+  });
+
+  test("literal shell punctuation is accepted as a normal argument array element", async () => {
+    const registered = await callJson(discoverySession.client, "register_app", { spec: spec({
+      invoke: { argv: ["run", "{slug}", "--settings", '{"mode":"normal"}; $literal'], promptVia: "stdin", extract: { kind: "json", path: "result" } },
+    }) });
+    expect(registered.status).toBe("enabled");
   });
 });
 
 describe("startup", () => {
-  test("repairs a stale ratings.yaml when the server comes up", async () => {
+  test("startup leaves an existing ratings export untouched and reads live database ratings", async () => {
     const dir = mkdtempSync(join(tmpdir(), "baton-mcp-repair-"));
     try {
       const first = await connect("0", {}, dir);
@@ -1171,16 +1255,17 @@ describe("startup", () => {
       });
       await first.close();
 
-      // What a publisher that died mid-flight leaves behind: a projection of an
-      // older state that no later write would ever be triggered to correct.
+      // An explicit export belongs to its caller and is not a live projection.
       writeFileSync(join(dir, "ratings.yaml"), "# source_revision: 0\nratings: []\n");
       expect(existsSync(join(dir, "ratings.yaml"))).toBe(true);
 
       const second = await connect("0", {}, dir);
       try {
         const text = ratingsYaml(dir);
-        expect(text).toContain(`# source_revision: ${seeded.revision}`);
-        expect(text).toContain("model: kimi-k3");
+        expect(text).toBe("# source_revision: 0\nratings: []\n");
+        const current = await callJson(second.client, "get_ratings");
+        expect(current.revision).toBe(seeded.revision);
+        expect(current.ratings).toContainEqual(expect.objectContaining({ model: "kimi-k3", prior: 4 }));
       } finally {
         await second.close();
       }
@@ -1193,7 +1278,7 @@ describe("startup", () => {
 describe("shutdown", () => {
   test("the transport going away kills the callee's process group", async () => {
     const { bin, pidfile } = fakeKimi();
-    const host = await connect("0", { PATH: `${bin}:${process.env.PATH ?? ""}` });
+    const host = await connect("0", { PATH: `${bin}:/usr/bin:/bin` });
 
     const started = await callJson(host.client, "run_model", {
       model: "kimi-k3",
