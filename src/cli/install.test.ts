@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installHost } from "./install.ts";
+import { installHost as install, refreshInstalledSkills, skillText } from "./install.ts";
 
 const dirs: string[] = [];
 function temp(): string {
@@ -21,6 +21,47 @@ function temp(): string {
   return dir;
 }
 afterAll(() => dirs.forEach((dir) => rmSync(dir, { recursive: true, force: true })));
+const manifestScope = temp();
+function installHost(host: Parameters<typeof install>[0], opts: Parameters<typeof install>[1] = {}) {
+  return install(host, { ...opts, env: { ...process.env, BATON_CONFIG_DIR: manifestScope, ...opts.env } });
+}
+
+describe("refresh installed skills", () => {
+  test("refreshes recorded projects from another directory and preserves configs and no-eval", () => {
+    const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
+    const project = temp();
+    const installation = install("codex", { dir: project, env, withEval: false });
+    const config = readFileSync(installation.mcpPath, "utf8");
+    const instructions = join(project, "AGENTS.md");
+    writeFileSync(instructions, "Project-specific instructions.\n");
+    writeFileSync(installation.skillPath, skillText(false).replace("Delegate a task", "Old instructions"));
+
+    expect(refreshInstalledSkills({ dir: temp(), env })).toEqual([installation.skillPath]);
+    expect(readFileSync(installation.skillPath, "utf8")).toBe(skillText(false));
+    expect(readFileSync(installation.mcpPath, "utf8")).toBe(config);
+    expect(readFileSync(instructions, "utf8")).toBe("Project-specific instructions.\n");
+    expect(refreshInstalledSkills({ dir: temp(), env })).toEqual([]);
+  });
+
+  test("finds an old generated skill, but never creates or replaces unrelated skills", () => {
+    const env = { HOME: temp(), BATON_CONFIG_DIR: temp() };
+    const dir = temp();
+    const legacy = join(dir, ".agents/skills/baton/SKILL.md");
+    const unrelated = join(env.HOME, ".claude/skills/baton/SKILL.md");
+    mkdirSync(join(dir, ".agents/skills/baton"), { recursive: true });
+    mkdirSync(join(env.HOME, ".claude/skills/baton"), { recursive: true });
+    writeFileSync(legacy, "---\nname: baton\ndescription: Delegate a self-contained task to another CLI.\n---\n## Delegating with Baton\nThe tools come from the MCP server `baton`\n### Grading what came back\nOld instructions.\n");
+    writeFileSync(unrelated, "My own baton skill.\n");
+
+    expect(refreshInstalledSkills({ dir, env })).toEqual([legacy]);
+    expect(readFileSync(legacy, "utf8")).toBe(skillText(true));
+    expect(readFileSync(unrelated, "utf8")).toBe("My own baton skill.\n");
+    expect(existsSync(join(dir, ".claude/skills/baton/SKILL.md"))).toBe(false);
+    expect(existsSync(join(env.HOME, ".agents/skills/baton/SKILL.md"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(env.BATON_CONFIG_DIR, "installed-skills.json"), "utf8"))).toEqual([legacy]);
+  });
+});
+
 
 describe("config preservation", () => {
   test("installs the identical skill at every project's discovery path", () => {

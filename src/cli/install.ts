@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { applyEdits, modify } from "jsonc-parser";
+import { resolvePaths } from "../config/paths.ts";
 
 // Bundled, not read from disk: the compiled single-file binary ships without
 // the source tree, and install must work from any cwd.
@@ -50,7 +51,7 @@ export interface InstallOptions {
   scope?: InstallScope;
   /** Project directory; ignored for the user scope. Defaults to cwd. */
   dir?: string;
-  /** Append the grading + onboarding-interview section. On unless refused. */
+  /** Include optional ratings and comparison guidance. */
   withEval?: boolean;
   /** Environment to resolve home directories from. For tests. */
   env?: Record<string, string | undefined>;
@@ -235,6 +236,7 @@ export function installHost(host: InstallHost, opts: InstallOptions = {}): Insta
   const registration = installer.merge(location.mcpPath, command, args);
   mkdirSync(dirname(location.skillPath), { recursive: true });
   atomicWrite(location.skillPath, body);
+  rememberSkill(location.skillPath, env);
   if (legacy) {
     if (legacy.content === "" && !lstatSync(legacy.path).isSymbolicLink()) unlinkSync(legacy.path);
     else atomicWrite(legacy.path, legacy.content);
@@ -261,7 +263,59 @@ export function skillText(withEval: boolean): string {
     throw new Error(`The skill template lost its ${CORE_PLACEHOLDER} placeholder.`);
   }
   const body = SKILL_TEMPLATE.replace(CORE_PLACEHOLDER, CORE_TEMPLATE.trim()).trimEnd();
-  return withEval ? `${body}\n\n${EVAL_TEMPLATE.trimEnd()}\n` : `${body}\n`;
+  const marker = `<!-- baton:skill eval=${withEval ? "true" : "false"} -->`;
+  return withEval ? `${body}\n\n${EVAL_TEMPLATE.trimEnd()}\n\n${marker}\n` : `${body}\n\n${marker}\n`;
+}
+
+function manifestPath(env: Env): string {
+  return join(resolvePaths(env).configDir, "installed-skills.json");
+}
+
+function rememberedSkills(env: Env): string[] {
+  const path = manifestPath(env);
+  if (!existsSync(path)) return [];
+  const paths: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (!Array.isArray(paths) || !paths.every((value): value is string => typeof value === "string")) {
+    throw new Error(`Invalid installed skill manifest: ${path}`);
+  }
+  return paths;
+}
+
+function rememberSkill(path: string, env: Env): void {
+  const paths = rememberedSkills(env);
+  if (paths.includes(path)) return;
+  const manifest = manifestPath(env);
+  mkdirSync(dirname(manifest), { recursive: true });
+  atomicWrite(manifest, `${JSON.stringify([...paths, path], null, 2)}\n`);
+}
+
+/** Refresh recorded and legacy installations without touching host configuration. */
+export function refreshInstalledSkills(opts: Pick<InstallOptions, "dir" | "env"> = {}): string[] {
+  const env = opts.env ?? process.env;
+  const dir = resolve(opts.dir ?? process.cwd());
+  const roots = new Set([dir, projectRoot(dir)]);
+  const candidates = new Set(rememberedSkills(env));
+  for (const host of INSTALL_HOSTS) {
+    candidates.add(HOSTS[host].locate("user", dir, env).skillPath);
+    for (const root of roots) candidates.add(HOSTS[host].locate("project", root, env).skillPath);
+  }
+  const refreshed: string[] = [];
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    const previous = readFileSync(path, "utf8");
+    const marker = /<!-- baton:skill eval=(true|false) -->/.exec(previous);
+    const legacy = previous.startsWith("---\nname: baton\ndescription: Delegate a self-contained task")
+      && previous.includes("## Delegating with Baton")
+      && previous.includes("The tools come from the MCP server `baton`");
+    if (!marker && !legacy) continue;
+    const withEval = marker ? marker[1] === "true" : previous.includes("### Grading what came back");
+    const next = skillText(withEval);
+    rememberSkill(path, env);
+    if (next === previous) continue;
+    atomicWrite(path, next);
+    refreshed.push(path);
+  }
+  return refreshed;
 }
 
 const CORE_PLACEHOLDER = "{core}";
